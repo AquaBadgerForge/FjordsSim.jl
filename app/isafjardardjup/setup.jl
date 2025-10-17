@@ -1,15 +1,13 @@
 using Oceananigans
+using Oceananigans.Units
+using Oceananigans.Advection
 using Oceananigans.Architectures: GPU, CPU
-using Oceananigans.Advection: WENO
 using Oceananigans.BuoyancyFormulations: SeawaterBuoyancy, g_Earth
 using Oceananigans.Coriolis: HydrostaticSphericalCoriolis, BetaPlane, Ω_Earth
 using Oceananigans.TurbulenceClosures: TKEDissipationVerticalDiffusivity, ConvectiveAdjustmentVerticalDiffusivity, ScalarDiffusivity
-using Oceananigans.OutputReaders: InMemory
-using Oceananigans.Units: day
 using ClimaOcean
-using ClimaOcean: Radiation
-using ClimaOcean.OceanSimulations: default_momentum_advection, default_tracer_advection
-using ClimaOcean.OceanSeaIceModels.InterfaceComputations: edson_stability_functions, LogarithmicSimilarityProfile
+using ClimaOcean.DataWrangling.JRA55
+using ClimaOcean.OceanSeaIceModels.InterfaceComputations
 using SeawaterPolynomials.TEOS10: TEOS10EquationOfState
 using FjordsSim:
     SetupModel,
@@ -20,17 +18,111 @@ using FjordsSim:
     bgh_oxydep_boundary_conditions,
     bc_ocean,
     PAR⁰,
-    regional_roughness_lengths,
     free_surface_default,
-    JRA55PrescribedAtmosphere,
-    ComponentInterfaces,
     biogeochemistry_LOBSTER,
     biogeochemistry_OXYDEP,
     biogeochemistry_ref
 
+const FT = Oceananigans.defaults.FloatType
 const bottom_drag_coefficient = 0.003
 const reference_density = 1030
-FT = Oceananigans.defaults.FloatType
+
+function setup_region(;
+    # Grid
+    grid_callable = grid_from_bathymetry_file,
+    grid_args = (
+        arch = GPU(),
+        halo = (7, 7, 7),
+        filepath = joinpath(homedir(), "FjordsSim_data", "isafjardardjup", "Isf_topo299x320.jld2"),
+        latitude = (65.76, 66.399),
+        longitude = (-23.492, -22.3),
+    ),
+    # Buoyancy
+    buoyancy = SeawaterBuoyancy(FT,
+                                equation_of_state = TEOS10EquationOfState(FT,
+                                reference_density = reference_density)),
+    # Closure
+    closure = (
+        TKEDissipationVerticalDiffusivity(minimum_tke = 7e-6),
+        Oceananigans.TurbulenceClosures.HorizontalScalarBiharmonicDiffusivity(ν = 15, κ = 10),
+    ),
+    # Tracer advection
+    tracer_advection = (T = WENO(), S = WENO(), e = nothing, ϵ = nothing),
+    # Momentum advection
+    momentum_advection = WENOVectorInvariant(FT),
+    # Tracers
+    tracers = (:T, :S, :e, :ϵ),
+    initial_conditions = (T = 5.0, S = 33.0),
+    # Free surface
+    free_surface_callable = free_surface_default,
+    free_surface_args = (grid_ref,),
+    # Coriolis
+    coriolis = HydrostaticSphericalCoriolis(FT, rotation_rate = Ω_Earth),
+    # Forcing
+    forcing_callable = forcing_from_file,
+    forcing_args = (
+        grid_ref = grid_ref,
+        filepath = joinpath(homedir(), "FjordsSim_data", "isafjardardjup", "Isf_bry_299x320.nc"),
+        tracers = tracers,
+    ),
+    # Boundary conditions
+    bc_callable = bc_ocean,
+    bc_args = (grid_ref, bottom_drag_coefficient),
+    # Atmosphere
+    atmosphere = JRA55PrescribedAtmosphere(
+        grid_args.arch,
+        FT,
+        latitude = (65.76, 66.399),
+        longitude = (-23.492, -22.3)
+    ),
+    # Ocean emissivity from https://link.springer.com/article/10.1007/BF02233853
+    # With suspended matter 0.96 https://www.sciencedirect.com/science/article/abs/pii/0034425787900095
+    radiation = ClimaOcean.Radiation(grid_args.arch, ocean_emissivity = 0.96, ocean_albedo = 0.1),
+    # coupled model different interfaces
+    interfaces = ComponentInterfaces,
+    interfaces_kwargs = (
+        radiation = radiation,
+        freshwater_density = 1000,
+        atmosphere_ocean_fluxes = SimilarityTheoryFluxes(FT),
+    ),
+
+    # Biogeochemistry
+    biogeochemistry_callable = nothing,
+    biogeochemistry_args = (nothing,),
+
+    # Output folder
+    results_dir = joinpath(homedir(), "FjordsSim_results", "isafjardardjup"),
+)
+
+    return SetupModel(
+        grid_callable,
+        grid_args,
+        grid_ref,
+        buoyancy,
+        closure,
+        tracer_advection,
+        momentum_advection,
+        tracers,
+        initial_conditions,
+        free_surface_callable,
+        free_surface_args,
+        coriolis,
+        forcing_callable,
+        forcing_args,
+        bc_callable,
+        bc_args,
+        atmosphere,
+        radiation,
+        interfaces,
+        interfaces_kwargs,
+        biogeochemistry_callable,
+        biogeochemistry_args,
+        biogeochemistry_ref,
+        results_dir,
+    )
+end
+
+setup_region_3d() = setup_region()
 
 args_oxydep = (
     initial_photosynthetic_slope = 0.1953 / day, # 1/(W/m²)/s
@@ -63,111 +155,6 @@ args_oxydep = (
     NtoB = 0.016, # (nd)
     sinking_speeds = (P = 0.15 / day, HET = 4.0 / day, POM = 10.0 / day),
 )
-
-
-function setup_region(;
-    # Grid
-    grid_callable = grid_from_bathymetry_file,
-    grid_args = (
-        arch = GPU(),
-        halo = (7, 7, 7),
-        filepath = joinpath(homedir(), "FjordsSim_data", "isafjardardjup", "Isf_topo299x320.jld2"),
-        latitude = (65.76, 66.399),
-        longitude = (-23.492, -22.3),
-    ),
-    # Buoyancy
-    buoyancy = SeawaterBuoyancy(;
-        equation_of_state = TEOS10EquationOfState(; reference_density),
-    ),
-    # Closure
-    #closure = ConvectiveAdjustmentVerticalDiffusivity(convective_κz = 5e-4, background_κz = 1e-5),
-    closure = TKEDissipationVerticalDiffusivity(),
-
-    # Tracer advection
-    tracer_advection = (T = WENO(), S = WENO(), e = nothing, ϵ = nothing),
-    # Momentum advection
-    momentum_advection = default_momentum_advection(),
-    # Tracers
-    tracers = (:T, :S, :e, :ϵ),
-    initial_conditions = (T = 5, S = 33),
-    # Free surface
-    free_surface_callable = free_surface_default,
-    free_surface_args = (grid_ref,),
-    # Coriolis
-    coriolis = HydrostaticSphericalCoriolis(rotation_rate = Ω_Earth),
-    # Forcing
-    forcing_callable = forcing_from_file,
-    # forcing_callable = NamedTuple,
-    forcing_args = (
-        grid_ref = grid_ref,
-        filepath = joinpath(homedir(), "FjordsSim_data", "isafjardardjup", "Isf_bry_299x320.nc"),
-        tracers = tracers,
-    ),
-    # Boundary conditions
-    bc_callable = bc_ocean,
-    bc_args = (grid_ref, bottom_drag_coefficient),
-    # Atmosphere
-    atmosphere_callable = JRA55PrescribedAtmosphere,
-    atmosphere_args = (
-        arch = grid_args.arch,
-        latitude = (65.76, 66.399),
-        longitude = (-23.492, -22.3),
-    ),
-    component_interfaces_callable = ComponentInterfaces,
-    component_interfaces_args = (),
-
-    # Ocean emissivity from https://link.springer.com/article/10.1007/BF02233853
-    # With suspended matter 0.96 https://www.sciencedirect.com/science/article/abs/pii/0034425787900095
-    radiation = Radiation(grid_args.arch; ocean_emissivity = 0.96),
-    atmosphere_ocean_flux_formulation = SimilarityTheoryFluxes(
-        FT;
-        gravitational_acceleration = g_Earth,
-        von_karman_constant = 0.4,
-        turbulent_prandtl_number = 1,
-        gustiness_parameter = 6.5,
-        stability_functions = edson_stability_functions(FT),
-        roughness_lengths = regional_roughness_lengths(FT),
-        similarity_form = LogarithmicSimilarityProfile(),
-        solver_stop_criteria = nothing,
-        solver_tolerance = 1e-8,
-        solver_maxiter = 100,
-    ),
-    # Biogeochemistry
-    biogeochemistry_callable = nothing,
-    biogeochemistry_args = (nothing,),
-    # Output folder
-    results_dir = joinpath(homedir(), "FjordsSim_results", "isafjardardjup"),
-)
-
-    return SetupModel(
-        grid_callable,
-        grid_args,
-        grid_ref,
-        buoyancy,
-        closure,
-        tracer_advection,
-        momentum_advection,
-        tracers,
-        initial_conditions,
-        free_surface_callable,
-        free_surface_args,
-        coriolis,
-        forcing_callable,
-        forcing_args,
-        bc_callable,
-        bc_args,
-        atmosphere_callable,
-        atmosphere_args,
-        radiation,
-        atmosphere_ocean_flux_formulation,
-        biogeochemistry_callable,
-        biogeochemistry_args,
-        biogeochemistry_ref;
-        results_dir,
-    )
-end
-
-setup_region_3d() = setup_region()
 
 setup_region_3d_OXYDEP() = setup_region(
     tracers = (:T, :S, :e, :ϵ, :C, :NUT, :P, :HET, :POM, :DOM, :O₂),
