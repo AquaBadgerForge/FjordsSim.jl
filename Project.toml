@@ -1,7 +1,27 @@
+authors = ["limash <yakubov.sha@gmail.com>"]
 name = "FjordsSim"
 uuid = "0c33e1da-db83-441e-bdcc-232a98675987"
-authors = ["limash <yakubov.sha@gmail.com>"]
 version = "0.1.0"
+
+[compat]
+Adapt = "4"
+CSV = "0.10"
+CUDA = "4, 5"
+CairoMakie = "0.10"
+ClimaOcean = "0.8"
+DataFrames = "1"
+Downloads = "1.6"
+FileIO = "1"
+GPUArrays = "9"
+Interpolations = "0.14"
+JLD2 = "0.4, 0.5, 0.6"
+NCDatasets = "0.12, 0.13, 0.14"
+OceanBioME = "0.1"
+Oceananigans = "0.100.4, 0.100.5"
+Oceanostics = "0.1"
+Scratch = "1"
+SeawaterPolynomials = "0.3.5"
+julia = "1.10"
 
 [deps]
 Adapt = "79e6a3ab-5dfb-504d-930d-738a2a938a0e"
@@ -24,3 +44,6 @@ Printf = "de0858da-6303-5e67-8744-51eddeeeb8d7"
 Scratch = "6c6a2e73-6563-6170-7368-637461726353"
 SeawaterPolynomials = "d496a93d-167e-4197-9f49-d3af4ff8fe40"
 Statistics = "10745b16-79ce-11e8-11f9-7d13ad32a3b2"
+
+[extras]
+CUDA_Runtime_jll = "76a88914-d11a-5bdc-97e0-2f5a05c973a2"
