@@ -29,3 +29,5 @@ docs/site/
 # Manifest.toml
 
 output
+LocalPreferences.toml
+simulation.log
