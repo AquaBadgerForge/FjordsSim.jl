@@ -2,8 +2,8 @@ using Oceananigans
 using Oceananigans.Units
 using Oceananigans.Advection
 using Oceananigans.Architectures: GPU, CPU
-using Oceananigans.BuoyancyFormulations: SeawaterBuoyancy, g_Earth
-using Oceananigans.Coriolis: HydrostaticSphericalCoriolis, BetaPlane, Ω_Earth
+using Oceananigans.BuoyancyFormulations: SeawaterBuoyancy
+using Oceananigans.Coriolis: HydrostaticSphericalCoriolis, BetaPlane
 using Oceananigans.TurbulenceClosures: TKEDissipationVerticalDiffusivity, ConvectiveAdjustmentVerticalDiffusivity, ScalarDiffusivity
 using ClimaOcean
 using ClimaOcean.DataWrangling.JRA55
@@ -57,7 +57,7 @@ function setup_region(;
     free_surface_callable = free_surface_default,
     free_surface_args = (grid_ref,),
     # Coriolis
-    coriolis = HydrostaticSphericalCoriolis(FT, rotation_rate = Ω_Earth),
+    coriolis = HydrostaticSphericalCoriolis(FT),
     # Forcing
     forcing_callable = forcing_from_file,
     forcing_args = (

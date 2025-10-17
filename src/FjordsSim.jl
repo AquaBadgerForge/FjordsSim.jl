@@ -2,6 +2,7 @@ __precompile__(false)  # Disable precompilation to allow method overwriting
 
 module FjordsSim
 
+using OpenSSL_jll
 using Oceananigans.Models: HydrostaticFreeSurfaceModel, update_model_field_time_series!
 using Oceananigans.Models.HydrostaticFreeSurfaceModels: SplitExplicitFreeSurface
 using Oceananigans.Simulations: Simulation

@@ -193,7 +193,7 @@ function forcing_get_tuple(filepath, var_name, grid, time_indices_in_memory, bac
     data, times = load_from_netcdf(; path = filepath, var_name, grid_size, time_indices_in_memory)
     dataλ, timesλ =
         load_from_netcdf(; path = filepath, var_name = var_name * "_lambda", grid_size, time_indices_in_memory)
-    boundary_conditions = FieldBoundaryConditions(grid, (LX, LY, LZ))
+    boundary_conditions = FieldBoundaryConditions(grid, (LX(), LY(), LZ()))
 
     fts = FieldTimeSeries{LX,LY,LZ}(
         grid,

@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+using OpenSSL_jll
 using CUDA
 CUDA.set_runtime_version!(v"12.2")
 
@@ -60,7 +61,7 @@ log_message("Output file prefix: $prefix")
 
 ocean_sim.output_writers[:nc_writer] = NetCDFWriter(
     ocean_model, merge(ocean_model.tracers, ocean_model.velocities);
-    schedule = TimeInterval(1hours),
+    schedule = TimeInterval(6hours),
     filename = "$prefix.nc",
     overwrite_existing = true,
 )
