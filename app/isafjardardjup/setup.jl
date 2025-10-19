@@ -4,7 +4,7 @@ using Oceananigans.Advection
 using Oceananigans.Architectures: GPU, CPU
 using Oceananigans.BuoyancyFormulations: SeawaterBuoyancy
 using Oceananigans.Coriolis: HydrostaticSphericalCoriolis, BetaPlane
-using Oceananigans.TurbulenceClosures: TKEDissipationVerticalDiffusivity, ConvectiveAdjustmentVerticalDiffusivity, ScalarDiffusivity
+using Oceananigans.TurbulenceClosures: TKEDissipationVerticalDiffusivity, ScalarDiffusivity, HorizontalScalarBiharmonicDiffusivity
 using ClimaOcean
 using ClimaOcean.DataWrangling.JRA55
 using ClimaOcean.OceanSeaIceModels.InterfaceComputations
@@ -14,6 +14,7 @@ using FjordsSim:
     grid_from_bathymetry_file,
     grid_ref,
     forcing_from_file,
+    regional_ocean_closure,
     bc_varna_bgh_oxydep,
     bgh_oxydep_boundary_conditions,
     bc_ocean,
@@ -24,8 +25,8 @@ using FjordsSim:
     biogeochemistry_ref
 
 const FT = Oceananigans.defaults.FloatType
-const bottom_drag_coefficient = 0.003
-const reference_density = 1030
+const bottom_drag_coefficient = 0.0
+const reference_density = 1020
 
 function setup_region(;
     # Grid
@@ -38,18 +39,20 @@ function setup_region(;
         longitude = (-23.492, -22.3),
     ),
     # Buoyancy
-    buoyancy = SeawaterBuoyancy(FT,
-                                equation_of_state = TEOS10EquationOfState(FT,
-                                reference_density = reference_density)),
+    buoyancy = SeawaterBuoyancy(
+        equation_of_state = TEOS10EquationOfState(
+            reference_density = reference_density
+            )
+        ),
     # Closure
     closure = (
         TKEDissipationVerticalDiffusivity(minimum_tke = 7e-6),
-        Oceananigans.TurbulenceClosures.HorizontalScalarBiharmonicDiffusivity(ν = 15, κ = 10),
+        HorizontalScalarBiharmonicDiffusivity(ν = 15, κ = 10),
     ),
     # Tracer advection
     tracer_advection = (T = WENO(), S = WENO(), e = nothing, ϵ = nothing),
     # Momentum advection
-    momentum_advection = WENOVectorInvariant(FT),
+    momentum_advection = WENOVectorInvariant(),
     # Tracers
     tracers = (:T, :S, :e, :ϵ),
     initial_conditions = (T = 5.0, S = 33.0),
@@ -57,21 +60,16 @@ function setup_region(;
     free_surface_callable = free_surface_default,
     free_surface_args = (grid_ref,),
     # Coriolis
-    coriolis = HydrostaticSphericalCoriolis(FT),
-    # Forcing
-    forcing_callable = forcing_from_file,
-    forcing_args = (
-        grid_ref = grid_ref,
-        filepath = joinpath(homedir(), "FjordsSim_data", "isafjardardjup", "Isf_bry_299x320.nc"),
-        tracers = tracers,
-    ),
+    coriolis = HydrostaticSphericalCoriolis(),
+    # Forcing (disabled)
+    forcing_callable = NamedTuple,
+    forcing_args = (),
     # Boundary conditions
     bc_callable = bc_ocean,
     bc_args = (grid_ref, bottom_drag_coefficient),
     # Atmosphere
     atmosphere = JRA55PrescribedAtmosphere(
         grid_args.arch,
-        FT,
         latitude = (65.76, 66.399),
         longitude = (-23.492, -22.3)
     ),
@@ -83,7 +81,7 @@ function setup_region(;
     interfaces_kwargs = (
         radiation = radiation,
         freshwater_density = 1000,
-        atmosphere_ocean_fluxes = SimilarityTheoryFluxes(FT),
+        atmosphere_ocean_fluxes = SimilarityTheoryFluxes(),
     ),
 
     # Biogeochemistry

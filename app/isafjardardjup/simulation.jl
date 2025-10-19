@@ -33,7 +33,7 @@ sim_setup = setup_region_3d()
 mkpath(sim_setup.results_dir)
 
 coupled_simulation = coupled_hydrostatic_simulation(sim_setup)
-coupled_simulation.callbacks[:progress] = Callback(progress, TimeInterval(3hours))
+coupled_simulation.callbacks[:progress] = Callback(progress, TimeInterval(1seconds))
 
 ## Set up output writers
 ocean_sim = coupled_simulation.model.ocean

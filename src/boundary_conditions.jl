@@ -1,4 +1,5 @@
-using Oceananigans.BoundaryConditions: FluxBoundaryCondition, FieldBoundaryConditions
+using Oceananigans.BoundaryConditions: FluxBoundaryCondition, FieldBoundaryConditions, fill_halo_regions!
+using Oceananigans.Fields: Field, set!
 using Oceananigans.ImmersedBoundaries: ImmersedBoundaryCondition
 using Oceananigans.Operators: ℑxyᶜᶠᵃ, ℑxyᶠᶜᵃ
 using Oceananigans.Units: days
@@ -14,6 +15,12 @@ function bc_ocean(grid_ref, bottom_drag_coefficient)
     top_meridional_momentum_flux = τy = Field{Center,Face,Nothing}(grid)
     top_ocean_heat_flux = Jᵀ = Field{Center,Center,Nothing}(grid)
     top_salt_flux = Jˢ = Field{Center,Center,Nothing}(grid)
+
+    # Initialize flux fields to zero and fill halos to prevent garbage values
+    set!(τx, 0.0); fill_halo_regions!(τx)
+    set!(τy, 0.0); fill_halo_regions!(τy)
+    set!(Jᵀ, 0.0); fill_halo_regions!(Jᵀ)
+    set!(Jˢ, 0.0); fill_halo_regions!(Jˢ)
 
     u_bot_bc =
         FluxBoundaryCondition(u_quadratic_bottom_drag, discrete_form = true, parameters = bottom_drag_coefficient)

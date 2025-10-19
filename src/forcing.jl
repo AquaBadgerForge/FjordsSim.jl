@@ -1,5 +1,5 @@
 using Oceananigans.OutputReaders: FieldTimeSeries, Cyclical, AbstractInMemoryBackend, FlavorOfFTS, time_indices
-using Oceananigans.BoundaryConditions: fill_halo_regions!
+using Oceananigans.BoundaryConditions: fill_halo_regions!, FieldBoundaryConditions
 using Oceananigans.Fields: interior
 using Oceananigans.Forcings: Forcing
 using Oceananigans.Grids: Center, Face, nodes
@@ -101,17 +101,36 @@ on_architecture(to, forcing::ForcingFromFile) = ForcingFromFile(
 
 """ x direction """
 function forcing_term_u(λ, flux, i, j, k, grid, args...)
-    return flux * Ax(i, j, k, grid, Center(), Center(), Center()) / volume(i, j, k, grid, Center(), Center(), Center())
+    FT = eltype(grid)
+    vol = volume(i, j, k, grid, Center(), Center(), Center())
+    # Avoid division by zero in land/masked cells
+    if vol == 0
+        return zero(FT)
+    end
+    area = Ax(i, j, k, grid, Center(), Center(), Center())
+    return convert(FT, flux) * convert(FT, area) / convert(FT, vol)
 end
 
 """ y direction """
 function forcing_term_v(λ, flux, i, j, k, grid, args...)
-    return flux * Ay(i, j, k, grid, Center(), Center(), Center()) / volume(i, j, k, grid, Center(), Center(), Center())
+    FT = eltype(grid)
+    vol = volume(i, j, k, grid, Center(), Center(), Center())
+    # Avoid division by zero in land/masked cells
+    if vol == 0
+        return zero(FT)
+    end
+    area = Ay(i, j, k, grid, Center(), Center(), Center())
+    return convert(FT, flux) * convert(FT, area) / convert(FT, vol)
 end
 
 """ relaxation term """
 function forcing_term_relax(λ, value, i, j, k, grid, field)
-    return -λ * (field - value)
+    FT = eltype(grid)
+    vol = volume(i, j, k, grid, Center(), Center(), Center())
+    if vol == 0
+        return zero(FT)
+    end
+    return -convert(FT, λ) * (field - convert(FT, value))
 end
 
 """ 
@@ -120,21 +139,22 @@ Result will be added to the tendency contributions (a kernel function).
 @inline function (p::ForcingFromFile{FTS,V})(i, j, k, grid, clock, fields) where {FTS,V}
     value = @inbounds p.fts_value[i, j, k, Time(clock.time)]
     λ = @inbounds p.fts_λ[i, j, k, Time(clock.time)]
-    result = 0.0
+    FT = eltype(grid)
+    result = zero(FT)
     result += @inbounds ifelse(
         λ > 1 && value > -990,
         forcing_term_u(λ, value, i, j, k, grid, fields[i, j, k, p.fieldname]),
-        0,
+        zero(FT),
     )
     result += @inbounds ifelse(
         λ < -1 && value > -990,
         forcing_term_v(λ, value, i, j, k, grid, fields[i, j, k, p.fieldname]),
-        0,
+        zero(FT),
     )
     result += @inbounds ifelse(
         -1 < λ < 1 && value > -990,
         forcing_term_relax(λ, value, i, j, k, grid, fields[i, j, k, p.fieldname]),
-        0,
+        zero(FT),
     )
     return result
 end

@@ -10,7 +10,7 @@ using Oceananigans.Fields: set!
 using Oceananigans.TimeSteppers: tick!, Time
 using Oceananigans.OutputReaders: extract_field_time_series, update_field_time_series!
 using Oceananigans.Forcings: DiscreteForcing
-using Oceananigans.Units: second, seconds
+using Oceananigans.Units: second, seconds, day, days
 using ClimaOcean.OceanSeaIceModels: OceanSeaIceModel
 using OceanBioME: LOBSTER
 
@@ -183,7 +183,7 @@ end
 # to allow time step adjusting in OceanSeaIceModel
 cell_advection_timescale(model::OceanSeaIceModel) = cell_advection_timescale(model.ocean.model)
 
-free_surface_default(grid_ref) = SplitExplicitFreeSurface(grid_ref[]; cfl = 0.7)
+free_surface_default(grid_ref) = SplitExplicitFreeSurface(grid_ref[]; cfl = 0.3)
 
 biogeochemistry_LOBSTER(grid_ref) = LOBSTER(;
     grid = grid_ref[],
