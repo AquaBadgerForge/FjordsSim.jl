@@ -160,14 +160,37 @@ function coupled_hydrostatic_simulation(sim_setup::SetupModel)
     )
     println("Done compiling HydrostaticFreeSurfaceModel")
 
-    ## Simulation
+    # ## Simulation
     Δt = 1second
     ocean_sim = Simulation(ocean_model; Δt)
     println("Initialized simulation")
 
     ## Set initial conditions
     set!(ocean_model; sim_setup.initial_conditions...)
+    # Ensure TKE-related tracers have small positive values if present to avoid zero-divide/NaN
+    if hasproperty(ocean_model.tracers, :e)
+        try
+            set!(ocean_model.tracers.e, 1e-8)
+        catch err
+            @info "Could not initialize tracer e" exception = err
+        end
+    end
+    if hasproperty(ocean_model.tracers, :ϵ)
+        try
+            set!(ocean_model.tracers.ϵ, 1e-9)
+        catch err
+            @info "Could not initialize tracer ϵ" exception = err
+        end
+    end
     println("Set initial conditions")
+    try
+        T = ocean_model.tracers.T
+        S = ocean_model.tracers.S
+        println("Initial extrema T: (", minimum(Oceananigans.Fields.interior(T)), ", ", maximum(Oceananigans.Fields.interior(T)), ") °C")
+        println("Initial extrema S: (", minimum(Oceananigans.Fields.interior(S)), ", ", maximum(Oceananigans.Fields.interior(S)), ") psu")
+    catch err
+        @info "Could not print initial extrema for T/S" exception = err
+    end
 
     ## Coupled model / simulation
     sea_ice = FreezingLimitedOceanTemperature(eltype(ocean_sim.model))
@@ -183,7 +206,7 @@ end
 # to allow time step adjusting in OceanSeaIceModel
 cell_advection_timescale(model::OceanSeaIceModel) = cell_advection_timescale(model.ocean.model)
 
-free_surface_default(grid_ref) = SplitExplicitFreeSurface(grid_ref[]; cfl = 0.3)
+free_surface_default(grid_ref) = SplitExplicitFreeSurface(grid_ref[]; cfl = 0.7)
 
 biogeochemistry_LOBSTER(grid_ref) = LOBSTER(;
     grid = grid_ref[],

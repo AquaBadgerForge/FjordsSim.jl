@@ -4,6 +4,7 @@ using Oceananigans.Utils: prettytime, pretty_filesize
 using NCDatasets: Dataset
 using JLD2: @save
 using Printf: @sprintf
+using Logging: @warn
 
 wall_time = Ref(time_ns())
 
@@ -81,5 +82,44 @@ function save_fts(; jld2_filepath, fts_name, fts, grid, times, boundary_conditio
     for i = 1:size(fts)[end]
         set!(on_disk_fts, fts[i], i, times[i])
     end
+end
+
+"""
+Check ocean state for NaN/Inf and abort early with a helpful message.
+
+Checks u, v, w and all tracers on the ocean model inside a coupled simulation.
+Attach as a Simulation callback, e.g.
+    coupled_simulation.callbacks[:nan_guard] = Callback(check_for_nans, IterationInterval(1))
+"""
+function check_for_nans(sim)
+    ocean_sim = sim.model.ocean
+    ocean_model = ocean_sim.model
+
+    # Check velocities
+    for (nm, fld) in ((:u, ocean_model.velocities.u), (:v, ocean_model.velocities.v), (:w, ocean_model.velocities.w))
+        A = interior(fld)
+        if !all(isfinite, A)
+            lin = findfirst(x -> !isfinite(x), A)
+            val = isnothing(lin) ? NaN : A[lin]
+            I = isnothing(lin) ? (missing, missing, missing) : ind2sub(size(A), lin)
+            @warn "Detected non-finite value in field" field = nm value = val index = I iteration = iteration(sim) time = ocean_model.clock.time
+            error("NaN/Inf detected in $(nm); aborting simulation to prevent corrupt outputs.")
+        end
+    end
+
+    # Check tracers
+    for nm in propertynames(ocean_model.tracers)
+        fld = getproperty(ocean_model.tracers, nm)
+        A = interior(fld)
+        if !all(isfinite, A)
+            lin = findfirst(x -> !isfinite(x), A)
+            val = isnothing(lin) ? NaN : A[lin]
+            I = isnothing(lin) ? (missing, missing, missing) : ind2sub(size(A), lin)
+            @warn "Detected non-finite value in tracer" tracer = nm value = val index = I iteration = iteration(sim) time = ocean_model.clock.time
+            error("NaN/Inf detected in tracer $(nm); aborting simulation to prevent corrupt outputs.")
+        end
+    end
+
+    return nothing
 end
 

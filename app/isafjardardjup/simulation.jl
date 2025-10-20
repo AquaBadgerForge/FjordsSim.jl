@@ -20,7 +20,7 @@ using Oceananigans.Utils: TimeInterval, IterationInterval
 using Oceananigans.Simulations: Callback, conjure_time_step_wizard!, run!
 using Oceananigans.OutputWriters: NetCDFWriter
 using Oceanostics
-using FjordsSim: coupled_hydrostatic_simulation, progress
+using FjordsSim: coupled_hydrostatic_simulation, progress, check_for_nans
 using Printf
 
 
@@ -33,7 +33,9 @@ sim_setup = setup_region_3d()
 mkpath(sim_setup.results_dir)
 
 coupled_simulation = coupled_hydrostatic_simulation(sim_setup)
-coupled_simulation.callbacks[:progress] = Callback(progress, TimeInterval(1seconds))
+coupled_simulation.callbacks[:progress] = Callback(progress, TimeInterval(1hours))
+# Abort early if NaNs/Infs appear in state
+# coupled_simulation.callbacks[:nan_guard] = Callback(check_for_nans, IterationInterval(1))
 
 ## Set up output writers
 ocean_sim = coupled_simulation.model.ocean
@@ -43,7 +45,7 @@ prefix = joinpath(sim_setup.results_dir, "snapshots")
 
 ocean_sim.output_writers[:nc_writer] = NetCDFWriter(
     ocean_model, merge(ocean_model.tracers, ocean_model.velocities);
-    schedule = TimeInterval(6hours),
+    schedule = TimeInterval(3days),
     filename = "$prefix.nc",
     overwrite_existing = true,
 )
@@ -53,7 +55,8 @@ ocean_sim.output_writers[:nc_writer] = NetCDFWriter(
 ocean_sim.stop_time = 10days
 coupled_simulation.stop_time = 10days
 
-conjure_time_step_wizard!(ocean_sim; cfl=0.1, max_Δt=1.5minutes, max_change=1.01)
+conjure_time_step_wizard!(ocean_sim; cfl=0.2, max_Δt=1.5minutes, max_change=1.01)
+conjure_time_step_wizard!(coupled_simulation; cfl=0.2, max_Δt=1.5minutes, max_change=1.01)
 run!(coupled_simulation)
 
 ## Running the simulation
@@ -62,5 +65,6 @@ run!(coupled_simulation)
 ocean_sim.stop_time = 355days
 coupled_simulation.stop_time = 355days
 
-conjure_time_step_wizard!(ocean_sim; cfl=0.25, max_Δt=10minutes, max_change=1.01)
+conjure_time_step_wizard!(ocean_sim; cfl=0.4, max_Δt=10minutes, max_change=1.01)
+conjure_time_step_wizard!(coupled_simulation; cfl=0.4, max_Δt=10minutes, max_change=1.01)
 run!(coupled_simulation)
