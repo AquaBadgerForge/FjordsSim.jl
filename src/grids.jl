@@ -44,7 +44,7 @@ function grid_from_bathymetry_file(arch, halo, filepath, latitude, longitude)
     @load filepath depth z_faces
     Nx, Ny = size(depth)
     # Sanitize z_faces: finite, sorted, strictly increasing
-    zf = collect(Float64.(z_faces))
+    zf = collect(Float64.(-z_faces))
     zf = filter(isfinite, zf)
     sort!(zf)
     # Enforce strict monotonicity by nudging duplicates by a tiny epsilon
@@ -59,6 +59,12 @@ function grid_from_bathymetry_file(arch, halo, filepath, latitude, longitude)
     bathymetry = Field{Center, Center, Nothing}(underlying_grid)
     # Ensure bathymetry has no NaNs/Infs and is non-negative
     _depth = map(x -> (isfinite(x) && x > 0) ? x : 0.0, depth)
+    # Basic diagnostics
+    wet = count(>(0.0), _depth)
+    dry = length(_depth) - wet
+    if wet == 0
+        @warn "Bathymetry has zero wet cells; the domain is entirely masked (all depths <= 0). This can cause NaNs or stagnation." filepath = filepath
+    end
     set!(bathymetry, _depth)
     fill_halo_regions!(bathymetry)
     grid = ImmersedBoundaryGrid(underlying_grid, GridFittedBottom(bathymetry); active_cells_map = true)
