@@ -62,8 +62,12 @@ function setup_region(;
     # Coriolis
     coriolis = HydrostaticSphericalCoriolis(),
     # Forcing (disabled)
-    forcing_callable = NamedTuple,
-    forcing_args = (),
+    forcing_callable = forcing_from_file,
+    forcing_args = (
+        grid_ref = grid_ref,
+        filepath = joinpath(homedir(), "FjordsSim_data", "isafjardardjup", "Isf_bry_299x320.nc"),
+        tracers = tracers,
+    ),
     # Boundary conditions
     bc_callable = bc_ocean,
     bc_args = (grid_ref, bottom_drag_coefficient),
