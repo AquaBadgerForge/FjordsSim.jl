@@ -30,4 +30,4 @@ docs/site/
 
 output
 LocalPreferences.toml
-simulation.log
+*.log
