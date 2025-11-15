@@ -11,7 +11,7 @@ using ClimaOcean.OceanSeaIceModels.InterfaceComputations
 using SeawaterPolynomials.TEOS10: TEOS10EquationOfState
 using FjordsSim:
     SetupModel,
-    grid_from_bathymetry_file,
+    grid_from_nc,
     grid_ref,
     forcing_from_file,
     regional_ocean_closure,
@@ -30,13 +30,12 @@ const reference_density = 1020
 
 function setup_region(;
     # Grid
-    grid_callable = grid_from_bathymetry_file,
+    grid_callable = grid_from_nc,
     grid_args = (
         arch = GPU(),
         halo = (7, 7, 7),
-        filepath = joinpath(homedir(), "FjordsSim_data", "isafjardardjup", "Isf_topo299x320.jld2"),
-        latitude = (65.76, 66.399),
-        longitude = (-23.492, -22.3),
+        filepath = joinpath(homedir(), "FjordsSim_data",
+        "isafjardardjup", "Isafjardardjup_bathymetry304x320.nc"),
     ),
     # Buoyancy
     buoyancy = SeawaterBuoyancy(
@@ -61,12 +60,12 @@ function setup_region(;
     free_surface_args = (grid_ref,),
     # Coriolis
     coriolis = HydrostaticSphericalCoriolis(),
-    # Forcing (disabled)
-    forcing_callable = forcing_from_file,
+    # Forcing (disable)
+    forcing_callable = NamedTuple,   # forcing_from_file,
     forcing_args = (
-        grid_ref = grid_ref,
-        filepath = joinpath(homedir(), "FjordsSim_data", "isafjardardjup", "Isf_bry_299x320.nc"),
-        tracers = tracers,
+        #grid_ref = grid_ref,
+        #filepath = joinpath(homedir(), "FjordsSim_data", "isafjardardjup", "Isf_bry_299x320.nc"),
+        #tracers = tracers,
     ),
     # Boundary conditions
     bc_callable = bc_ocean,
@@ -74,8 +73,8 @@ function setup_region(;
     # Atmosphere
     atmosphere = JRA55PrescribedAtmosphere(
         grid_args.arch,
-        latitude = (65.76, 66.399),
-        longitude = (-23.492, -22.3)
+        latitude = (65.8, 66.41),
+        longitude = (-23.58, -22.3)
     ),
     # Ocean emissivity from https://link.springer.com/article/10.1007/BF02233853
     # With suspended matter 0.96 https://www.sciencedirect.com/science/article/abs/pii/0034425787900095

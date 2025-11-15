@@ -26,6 +26,7 @@ include("turbulence.jl")
 include("initial_conditions.jl")
 include("boundary_conditions.jl")
 include("forcing.jl")
+include("forcing_separate.jl")
 include("atmosphere.jl")
 include("output.jl")
 

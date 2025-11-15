@@ -11,9 +11,10 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-using OpenSSL_jll
-using CUDA
-CUDA.set_runtime_version!(v"12.2")
+
+#using OpenSSL_jll
+#using CUDA
+#CUDA.set_runtime_version!(v"12.2")
 
 using Oceananigans.Units: second, seconds, minute, minutes, hour, hours, day, days
 using Oceananigans.Utils: TimeInterval, IterationInterval
@@ -33,7 +34,7 @@ sim_setup = setup_region_3d()
 mkpath(sim_setup.results_dir)
 
 coupled_simulation = coupled_hydrostatic_simulation(sim_setup)
-coupled_simulation.callbacks[:progress] = Callback(progress, TimeInterval(1hours))
+coupled_simulation.callbacks[:progress] = Callback(progress, TimeInterval(60minutes))
 # Abort early if NaNs/Infs appear in state
 # coupled_simulation.callbacks[:nan_guard] = Callback(check_for_nans, IterationInterval(1))
 
@@ -45,7 +46,7 @@ prefix = joinpath(sim_setup.results_dir, "snapshots")
 
 ocean_sim.output_writers[:nc_writer] = NetCDFWriter(
     ocean_model, merge(ocean_model.tracers, ocean_model.velocities);
-    schedule = TimeInterval(3days),
+    schedule = TimeInterval(2days),
     filename = "$prefix.nc",
     overwrite_existing = true,
 )
