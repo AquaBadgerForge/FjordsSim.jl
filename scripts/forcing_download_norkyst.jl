@@ -1,13 +1,11 @@
 #!/usr/bin/env julia
 
 using Downloads
-using FjordSim.SetupConfig: DEFAULT_SETUP_CONFIG_PATH, expand_user, load_setup_config
+using FjordSim.SetupConfig: DEFAULT_SETUP_CONFIG_PATH, load_setup_config
 using NCDatasets
 
 function parse_args(args = ARGS)
     config_path = DEFAULT_SETUP_CONFIG_PATH
-    years = Int[]
-    output_dir = nothing
 
     i = 1
     while i <= length(args)
@@ -18,20 +16,6 @@ function parse_args(args = ARGS)
             i += 2
         elseif startswith(arg, "--config=")
             config_path = split(arg, "=", limit = 2)[2]
-            i += 1
-        elseif arg == "--year"
-            i == length(args) && error("--year requires a value")
-            push!(years, parse(Int, args[i + 1]))
-            i += 2
-        elseif startswith(arg, "--year=")
-            push!(years, parse(Int, split(arg, "=", limit = 2)[2]))
-            i += 1
-        elseif arg == "--output-dir"
-            i == length(args) && error("--output-dir requires a value")
-            output_dir = args[i + 1]
-            i += 2
-        elseif startswith(arg, "--output-dir=")
-            output_dir = split(arg, "=", limit = 2)[2]
             i += 1
         elseif arg in ("-h", "--help")
             print_usage()
@@ -45,8 +29,6 @@ function parse_args(args = ARGS)
     return (
         config = config,
         config_path = config.path,
-        years = isempty(years) ? config.norkyst.years : Tuple(years),
-        output_dir = isnothing(output_dir) ? config.norkyst.output_dir : expand_user(output_dir),
     )
 end
 
@@ -55,12 +37,10 @@ function print_usage()
     Download and combine NorKyst-800m monthly data for configured years.
 
     Usage:
-      julia --project scripts/forcing_download_norkyst.jl [--config PATH] [--year YEAR] [--output-dir DIR]
+      julia --project scripts/forcing_download_norkyst.jl [--config PATH]
 
     Options:
       --config PATH      Setup config. Default: configs/drammensfjorden.toml
-      --year YEAR        Year to download. Can be repeated. Default: configured NorKyst years
-      --output-dir DIR   Output directory. Default: data_root/name from the setup config
     """)
 end
 
@@ -364,21 +344,21 @@ end
 
 function main()
     args = parse_args()
-    mkpath(args.output_dir)
     config = args.config
     norkyst = config.norkyst
+    mkpath(norkyst.output_dir)
 
-    println("Processing years: $(join(args.years, ", "))")
+    println("Processing years: $(join(norkyst.years, ", "))")
     println("Config: $(args.config_path)")
-    println("Output directory: $(args.output_dir)\n")
+    println("Output directory: $(norkyst.output_dir)\n")
 
     files = list_opendap_files(catalog_url = norkyst.catalog_url)
-    for year in args.years
+    for year in norkyst.years
         for month in 1:12
             process_month(
                 year,
                 month,
-                args.output_dir;
+                norkyst.output_dir;
                 files,
                 catalog_url = norkyst.catalog_url,
                 opendap_url = norkyst.opendap_url,
