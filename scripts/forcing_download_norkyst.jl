@@ -1,28 +1,31 @@
 #!/usr/bin/env julia
 
 using Downloads
+using FjordSim.SetupConfig: DEFAULT_SETUP_CONFIG_PATH, expand_user, load_setup_config
 using NCDatasets
 
-const CATALOG_URL = "https://thredds.met.no/thredds/catalog/fou-hi/norkyst800m/catalog.xml"
-const OPENDAP_URL = "https://thredds.met.no/thredds/dodsC/fou-hi/norkyst800m/"
-const PARAMETERS = ("temperature", "salinity", "u_eastward", "v_northward")
-const LATITUDE_RANGE = (59.58, 59.75)
-const LONGITUDE_RANGE = (10.20, 10.45)
-
-function expand_user(path)
-    path == "~" && return homedir()
-    startswith(path, "~/") && return joinpath(homedir(), path[3:end])
-    return path
-end
+const DEFAULT_NORKYST_CATALOG_URL = "https://thredds.met.no/thredds/catalog/fou-hi/norkyst800m/catalog.xml"
+const DEFAULT_NORKYST_OPENDAP_URL = "https://thredds.met.no/thredds/dodsC/fou-hi/norkyst800m/"
+const DEFAULT_NORKYST_PARAMETERS = ("temperature", "salinity", "u_eastward", "v_northward")
+const DEFAULT_LATITUDE_RANGE = (59.58, 59.75)
+const DEFAULT_LONGITUDE_RANGE = (10.20, 10.45)
 
 function parse_args(args = ARGS)
-    year = 2020
-    output_dir = joinpath(homedir(), "FjordSim_data")
+    config_path = DEFAULT_SETUP_CONFIG_PATH
+    year = nothing
+    output_dir = nothing
 
     i = 1
     while i <= length(args)
         arg = args[i]
-        if arg == "--year"
+        if arg == "--config"
+            i == length(args) && error("--config requires a value")
+            config_path = args[i + 1]
+            i += 2
+        elseif startswith(arg, "--config=")
+            config_path = split(arg, "=", limit = 2)[2]
+            i += 1
+        elseif arg == "--year"
             i == length(args) && error("--year requires a value")
             year = parse(Int, args[i + 1])
             i += 2
@@ -44,7 +47,13 @@ function parse_args(args = ARGS)
         end
     end
 
-    return (; year, output_dir = expand_user(output_dir))
+    config = load_setup_config(config_path)
+    return (
+        config = config,
+        config_path = config.path,
+        year = isnothing(year) ? config.norkyst.default_year : year,
+        output_dir = isnothing(output_dir) ? config.norkyst.output_dir : expand_user(output_dir),
+    )
 end
 
 function print_usage()
@@ -52,15 +61,16 @@ function print_usage()
     Download and combine NorKyst-800m monthly data for an entire year.
 
     Usage:
-      julia --project scripts/forcing_download_norkyst.jl [--year YEAR] [--output-dir DIR]
+      julia --project scripts/forcing_download_norkyst.jl [--config PATH] [--year YEAR] [--output-dir DIR]
 
     Options:
-      --year YEAR        Year to download, for example 2020. Default: 2020
-      --output-dir DIR   Output directory. Default: ~/FjordSim_data
+      --config PATH      Setup config. Default: configs/drammensfjorden.toml
+      --year YEAR        Year to download. Default: configured NorKyst default_year
+      --output-dir DIR   Output directory. Default: configured NorKyst output_dir
     """)
 end
 
-function list_opendap_files(; catalog_url = CATALOG_URL)
+function list_opendap_files(; catalog_url = DEFAULT_NORKYST_CATALOG_URL)
     catalog_path = Downloads.download(catalog_url)
     catalog = read(catalog_path, String)
 
@@ -80,15 +90,15 @@ function bounding_range(mask, dimension)
     return first(indices):last(indices)
 end
 
-function subset_ranges(ds)
+function subset_ranges(ds; latitude_range = DEFAULT_LATITUDE_RANGE, longitude_range = DEFAULT_LONGITUDE_RANGE)
     latitude_variable = variable(ds, "lat")
     longitude_variable = variable(ds, "lon")
     latitude = Array(latitude_variable[ntuple(_ -> :, ndims(latitude_variable))...])
     longitude = Array(longitude_variable[ntuple(_ -> :, ndims(longitude_variable))...])
-    mask = (latitude .>= LATITUDE_RANGE[1]) .&
-           (latitude .<= LATITUDE_RANGE[2]) .&
-           (longitude .>= LONGITUDE_RANGE[1]) .&
-           (longitude .<= LONGITUDE_RANGE[2])
+    mask = (latitude .>= latitude_range[1]) .&
+           (latitude .<= latitude_range[2]) .&
+           (longitude .>= longitude_range[1]) .&
+           (longitude .<= longitude_range[2])
 
     ranges = Dict{String,UnitRange{Int}}()
     for (i, dimension) in enumerate(dimnames(latitude_variable))
@@ -171,13 +181,13 @@ function define_subset_variable(output, source, name, ranges; deflatelevel = 5)
     return output_variable
 end
 
-function copy_auxiliary_variable(name, variable, time_dim)
-    name in PARAMETERS && return false
+function copy_auxiliary_variable(name, variable, time_dim, parameters)
+    name in parameters && return false
     dimensions = dimnames(variable)
     return name == time_dim || time_dim ∉ dimensions
 end
 
-function define_output_file(output_path, template, ranges, total_time)
+function define_output_file(output_path, template, ranges, total_time; parameters = DEFAULT_NORKYST_PARAMETERS)
     time_dim = time_dimension(template)
     isfile(output_path) && rm(output_path; force = true)
 
@@ -196,15 +206,15 @@ function define_output_file(output_path, template, ranges, total_time)
 
         for name in keys(template)
             variable = NCDatasets.variable(template, name)
-            copy_auxiliary_variable(name, variable, time_dim) || continue
+            copy_auxiliary_variable(name, variable, time_dim, parameters) || continue
             all(dimension -> dimension in dimnames(output), dimnames(variable)) || continue
             define_subset_variable(output, template, name, ranges; deflatelevel = 0)
         end
 
-        for name in PARAMETERS
+        for name in parameters
             variable = template[name]
             variable_type = nonmissingtype(eltype(variable))
-            output_variable = defVar(
+            defVar(
                 output,
                 name,
                 variable_type,
@@ -270,11 +280,11 @@ function write_parameter_chunk!(output, source, name, ranges, mask, spatial_dime
     return size(data, findfirst(==(time_dimension(source)), dimnames(variable)))
 end
 
-function write_time_dependent_coordinates!(output, source, ranges, time_start)
+function write_time_dependent_coordinates!(output, source, ranges, time_start; parameters = DEFAULT_NORKYST_PARAMETERS)
     time_dim = time_dimension(source)
 
     for name in keys(source)
-        name in PARAMETERS && continue
+        name in parameters && continue
         variable = NCDatasets.variable(source, name)
         time_index = findfirst(==(time_dim), dimnames(variable))
         time_index === nothing && continue
@@ -294,7 +304,18 @@ function write_time_dependent_coordinates!(output, source, ranges, time_start)
     end
 end
 
-function process_month(year, month, output_dir; files = list_opendap_files())
+function process_month(
+    year,
+    month,
+    output_dir;
+    files = nothing,
+    catalog_url = DEFAULT_NORKYST_CATALOG_URL,
+    opendap_url = DEFAULT_NORKYST_OPENDAP_URL,
+    parameters = DEFAULT_NORKYST_PARAMETERS,
+    latitude_range = DEFAULT_LATITUDE_RANGE,
+    longitude_range = DEFAULT_LONGITUDE_RANGE,
+)
+    files = isnothing(files) ? list_opendap_files(catalog_url = catalog_url) : files
     month_string = ".$(year)$(lpad(month, 2, '0'))"
     year_month = month_string[2:end]
     output_path = joinpath(output_dir, "NorKyst-800m_ZDEPTHS_avg_$(year_month).nc")
@@ -312,7 +333,7 @@ function process_month(year, month, output_dir; files = list_opendap_files())
         return nothing
     end
 
-    urls = [joinpath(OPENDAP_URL, file) for file in monthly_files]
+    urls = [joinpath(opendap_url, file) for file in monthly_files]
     println("  Opening $(length(urls)) datasets...")
 
     datasets = NCDataset[]
@@ -322,16 +343,16 @@ function process_month(year, month, output_dir; files = list_opendap_files())
             println("    Opened: $url")
         end
 
-        ranges, mask, spatial_dimensions = subset_ranges(first(datasets))
+        ranges, mask, spatial_dimensions = subset_ranges(first(datasets); latitude_range, longitude_range)
         total_time = sum(time_length, datasets)
 
         println("  Writing output to: $output_path")
-        output = define_output_file(output_path, first(datasets), ranges, total_time)
+        output = define_output_file(output_path, first(datasets), ranges, total_time; parameters)
         try
             time_start = 1
             for ds in datasets
-                write_time_dependent_coordinates!(output, ds, ranges, time_start)
-                for name in PARAMETERS
+                write_time_dependent_coordinates!(output, ds, ranges, time_start; parameters)
+                for name in parameters
                     write_parameter_chunk!(output, ds, name, ranges, mask, spatial_dimensions, time_start)
                 end
                 time_start += time_length(ds)
@@ -350,13 +371,26 @@ end
 function main()
     args = parse_args()
     mkpath(args.output_dir)
+    config = args.config
+    norkyst = config.norkyst
 
     println("Processing year: $(args.year)")
+    println("Config: $(args.config_path)")
     println("Output directory: $(args.output_dir)\n")
 
-    files = list_opendap_files()
+    files = list_opendap_files(catalog_url = norkyst.catalog_url)
     for month in 1:12
-        process_month(args.year, month, args.output_dir; files)
+        process_month(
+            args.year,
+            month,
+            args.output_dir;
+            files,
+            catalog_url = norkyst.catalog_url,
+            opendap_url = norkyst.opendap_url,
+            parameters = norkyst.parameters,
+            latitude_range = config.grid.latitude,
+            longitude_range = config.grid.longitude,
+        )
     end
 
     println("All done.")

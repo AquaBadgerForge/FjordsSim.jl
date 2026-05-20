@@ -50,6 +50,7 @@ end
 
 include("FDatasets.jl")
 include("Utils.jl")
+include("SetupConfig.jl")
 include("Bathymetry.jl")
 include("Atmospheres/Atmospheres.jl")
 include("Forcing.jl")
@@ -58,6 +59,7 @@ include("Grids.jl")
 
 using .FDatasets
 using .Utils
+using .SetupConfig
 using .Bathymetry
 using .Atmospheres
 using .Forcing

@@ -7,6 +7,7 @@ using Printf
 using Statistics
 using FjordSim
 using FjordSim.Bathymetry
+using FjordSim.SetupConfig: DEFAULT_SETUP_CONFIG_PATH, load_setup_config
 using Oceananigans.Architectures: on_architecture
 using Oceananigans.Fields: interior
 using Oceananigans.Grids: x_domain, y_domain
@@ -60,72 +61,92 @@ function plot_bathymetry(grid, bathymetry; plot_path, title = "Bathymetry", figu
 end
 ##
 
-##
-arch = CPU()
+function parse_args(args = ARGS)
+    config_path = DEFAULT_SETUP_CONFIG_PATH
 
-z_faces = [
-    -100.0,
-    -75.0,
-    -50.0,
-    -25.0,
-    -15.0,
-    -10.0,
-    -7.5,
-    -5.0,
-    -3.0,
-    -2.0,
-    -1.0,
-    0.0,
-]
+    i = 1
+    while i <= length(args)
+        arg = args[i]
+        if arg == "--config"
+            i == length(args) && error("--config requires a value")
+            config_path = args[i + 1]
+            i += 2
+        elseif startswith(arg, "--config=")
+            config_path = split(arg, "=", limit = 2)[2]
+            i += 1
+        elseif arg in ("-h", "--help")
+            print_usage()
+            exit(0)
+        else
+            error("Unknown argument: $arg")
+        end
+    end
 
-grid = LatitudeLongitudeGrid(
-    arch,
-    size = (150, 200, 11),
-    halo = (7, 7, 7),
-    longitude = (10.20, 10.45),
-    latitude = (59.58, 59.75),
-    z = z_faces,
-)
-##
+    return (; config_path)
+end
 
-##
-dx = xspacings(grid)
-dy = yspacings(grid)
-dz = zspacings(grid)
+function print_usage()
+    println("""
+    Prepare Geonorge bathymetry for a configured FjordSim setup.
 
-println("Grid cell side extents (m):")
-@printf("  N = (%d, %d, %d)\n", grid.Nx, grid.Ny, grid.Nz)
-@printf("  Δx min/max/mean = %.3f / %.3f / %.3f\n", minimum(dx), maximum(dx), mean(dx))
-@printf("  Δy min/max/mean = %.3f / %.3f / %.3f\n", minimum(dy), maximum(dy), mean(dy))
-@printf("  Δz min/max/mean = %.3f / %.3f / %.3f\n", minimum(dz), maximum(dz), mean(dz))
-##
+    Usage:
+      julia --project scripts/bathymetry_prepare.jl [--config PATH]
 
-##
-name = "drammensfjorden"
-bathymetry_name = "bathymetry_$(name)"
-output_path = joinpath(homedir(), "FjordSim_data", name, "$(bathymetry_name).nc")
-geodatabase_path = joinpath(homedir(), "FjordSim_data", "Basisdata_0000_Norge_25833_Dybdedata_FGDB.gdb")
+    Options:
+      --config PATH   Setup config. Default: configs/drammensfjorden.toml
+    """)
+end
 
-result = prepare_geonorge_bathymetry(
-    grid;
-    output_path,
-    geodatabase_path,
-    raw_resolution_factor = 2,
-    padding_cells = 2,
-    include_contours = false,
-    interpolation_passes = 1,
-    major_basins = 1,
-    cache = false,
-)
-##
+function build_grid(config; arch = CPU())
+    return LatitudeLongitudeGrid(
+        arch,
+        size = config.grid.size,
+        halo = config.grid.halo,
+        longitude = config.grid.longitude,
+        latitude = config.grid.latitude,
+        z = config.grid.z_faces,
+    )
+end
 
-##
-bathymetry = result.bottom_height
+function print_grid_extents(grid)
+    dx = xspacings(grid)
+    dy = yspacings(grid)
+    dz = zspacings(grid)
 
-plot_path = joinpath(homedir(), "FjordSim_data", name, "$(bathymetry_name).png")
-plot_bathymetry(grid, bathymetry; plot_path)
+    println("Grid cell side extents (m):")
+    @printf("  N = (%d, %d, %d)\n", grid.Nx, grid.Ny, grid.Nz)
+    @printf("  Δx min/max/mean = %.3f / %.3f / %.3f\n", minimum(dx), maximum(dx), mean(dx))
+    @printf("  Δy min/max/mean = %.3f / %.3f / %.3f\n", minimum(dy), maximum(dy), mean(dy))
+    @printf("  Δz min/max/mean = %.3f / %.3f / %.3f\n", minimum(dz), maximum(dz), mean(dz))
+end
 
-@info "Raw Geonorge bathymetry saved to $(result.raw_path)"
-@info "Processed FjordSim bathymetry saved to $(result.output_path)"
-@info "Bathymetry plot saved to $plot_path"
-##
+function main()
+    args = parse_args()
+    config = load_setup_config(args.config_path)
+    grid = build_grid(config)
+    bathymetry_config = config.bathymetry
+
+    print_grid_extents(grid)
+
+    result = prepare_geonorge_bathymetry(
+        grid;
+        output_path = bathymetry_config.output_path,
+        geodatabase_path = bathymetry_config.geodatabase_path,
+        raw_resolution_factor = bathymetry_config.raw_resolution_factor,
+        padding_cells = bathymetry_config.padding_cells,
+        include_contours = bathymetry_config.include_contours,
+        interpolation_passes = bathymetry_config.interpolation_passes,
+        major_basins = bathymetry_config.major_basins,
+        cache = bathymetry_config.cache,
+    )
+
+    plot_bathymetry(grid, result.bottom_height; plot_path = bathymetry_config.plot_path)
+
+    @info "Raw Geonorge bathymetry saved to $(result.raw_path)"
+    @info "Processed FjordSim bathymetry saved to $(result.output_path)"
+    @info "Bathymetry plot saved to $(bathymetry_config.plot_path)"
+end
+
+if abspath(PROGRAM_FILE) == @__FILE__() || get(ENV, "FJORDSIM_RUN_MAIN", "") == "1"
+    main()
+end
