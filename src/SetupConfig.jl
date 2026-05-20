@@ -49,27 +49,29 @@ function load_setup_config(path::AbstractString = DEFAULT_SETUP_CONFIG_PATH)
         z_faces = vector_value(grid, "z_faces", "grid config", Float64),
     )
 
-    bathymetry_name = String(get(bathymetry, "name", "bathymetry_$name"))
     setup_data_dir = joinpath(data_root, name)
+    bathymetry_name = "bathymetry_$name"
     bathymetry_config = (
         name = bathymetry_name,
+        output_dir = setup_data_dir,
         output_path = joinpath(setup_data_dir, "$bathymetry_name.nc"),
         plot_path = joinpath(setup_data_dir, "$bathymetry_name.png"),
         geodatabase_path = path_from_config(String(require_key(bathymetry, "geodatabase_path", "bathymetry config")), data_root),
-        raw_resolution_factor = convert(Int, get(bathymetry, "raw_resolution_factor", 2)),
-        padding_cells = convert(Int, get(bathymetry, "padding_cells", 2)),
-        include_contours = convert(Bool, get(bathymetry, "include_contours", false)),
-        interpolation_passes = convert(Int, get(bathymetry, "interpolation_passes", 1)),
-        major_basins = convert(Int, get(bathymetry, "major_basins", 1)),
-        cache = convert(Bool, get(bathymetry, "cache", false)),
+        raw_resolution_factor = convert(Int, require_key(bathymetry, "raw_resolution_factor", "bathymetry config")),
+        padding_cells = convert(Int, require_key(bathymetry, "padding_cells", "bathymetry config")),
+        include_contours = convert(Bool, require_key(bathymetry, "include_contours", "bathymetry config")),
+        interpolation_passes = convert(Int, require_key(bathymetry, "interpolation_passes", "bathymetry config")),
+        major_basins = convert(Int, require_key(bathymetry, "major_basins", "bathymetry config")),
+        cache = convert(Bool, require_key(bathymetry, "cache", "bathymetry config")),
     )
 
     norkyst_config = (
+        name = "forcing_$name",
         catalog_url = String(require_key(norkyst, "catalog_url", "NorKyst config")),
         opendap_url = String(require_key(norkyst, "opendap_url", "NorKyst config")),
         parameters = Tuple(vector_value(norkyst, "parameters", "NorKyst config", String)),
-        default_year = convert(Int, get(norkyst, "default_year", 2020)),
-        output_dir = path_from_config(String(get(norkyst, "output_dir", data_root)), data_root),
+        years = Tuple(vector_value(norkyst, "years", "NorKyst config", Int)),
+        output_dir = setup_data_dir,
     )
 
     return (

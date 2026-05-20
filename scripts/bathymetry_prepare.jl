@@ -1,4 +1,3 @@
-##
 using Oceananigans
 using Oceananigans.Units
 using CUDA
@@ -59,7 +58,6 @@ function plot_bathymetry(grid, bathymetry; plot_path, title = "Bathymetry", figu
 
     return plot_path
 end
-##
 
 function parse_args(args = ARGS)
     config_path = DEFAULT_SETUP_CONFIG_PATH
@@ -126,6 +124,7 @@ function main()
     grid = build_grid(config)
     bathymetry_config = config.bathymetry
 
+    mkpath(bathymetry_config.output_dir)
     print_grid_extents(grid)
 
     result = prepare_geonorge_bathymetry(

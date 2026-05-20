@@ -4,15 +4,9 @@ using Downloads
 using FjordSim.SetupConfig: DEFAULT_SETUP_CONFIG_PATH, expand_user, load_setup_config
 using NCDatasets
 
-const DEFAULT_NORKYST_CATALOG_URL = "https://thredds.met.no/thredds/catalog/fou-hi/norkyst800m/catalog.xml"
-const DEFAULT_NORKYST_OPENDAP_URL = "https://thredds.met.no/thredds/dodsC/fou-hi/norkyst800m/"
-const DEFAULT_NORKYST_PARAMETERS = ("temperature", "salinity", "u_eastward", "v_northward")
-const DEFAULT_LATITUDE_RANGE = (59.58, 59.75)
-const DEFAULT_LONGITUDE_RANGE = (10.20, 10.45)
-
 function parse_args(args = ARGS)
     config_path = DEFAULT_SETUP_CONFIG_PATH
-    year = nothing
+    years = Int[]
     output_dir = nothing
 
     i = 1
@@ -27,10 +21,10 @@ function parse_args(args = ARGS)
             i += 1
         elseif arg == "--year"
             i == length(args) && error("--year requires a value")
-            year = parse(Int, args[i + 1])
+            push!(years, parse(Int, args[i + 1]))
             i += 2
         elseif startswith(arg, "--year=")
-            year = parse(Int, split(arg, "=", limit = 2)[2])
+            push!(years, parse(Int, split(arg, "=", limit = 2)[2]))
             i += 1
         elseif arg == "--output-dir"
             i == length(args) && error("--output-dir requires a value")
@@ -51,26 +45,26 @@ function parse_args(args = ARGS)
     return (
         config = config,
         config_path = config.path,
-        year = isnothing(year) ? config.norkyst.default_year : year,
+        years = isempty(years) ? config.norkyst.years : Tuple(years),
         output_dir = isnothing(output_dir) ? config.norkyst.output_dir : expand_user(output_dir),
     )
 end
 
 function print_usage()
     println("""
-    Download and combine NorKyst-800m monthly data for an entire year.
+    Download and combine NorKyst-800m monthly data for configured years.
 
     Usage:
       julia --project scripts/forcing_download_norkyst.jl [--config PATH] [--year YEAR] [--output-dir DIR]
 
     Options:
       --config PATH      Setup config. Default: configs/drammensfjorden.toml
-      --year YEAR        Year to download. Default: configured NorKyst default_year
-      --output-dir DIR   Output directory. Default: configured NorKyst output_dir
+      --year YEAR        Year to download. Can be repeated. Default: configured NorKyst years
+      --output-dir DIR   Output directory. Default: data_root/name from the setup config
     """)
 end
 
-function list_opendap_files(; catalog_url = DEFAULT_NORKYST_CATALOG_URL)
+function list_opendap_files(; catalog_url)
     catalog_path = Downloads.download(catalog_url)
     catalog = read(catalog_path, String)
 
@@ -90,7 +84,7 @@ function bounding_range(mask, dimension)
     return first(indices):last(indices)
 end
 
-function subset_ranges(ds; latitude_range = DEFAULT_LATITUDE_RANGE, longitude_range = DEFAULT_LONGITUDE_RANGE)
+function subset_ranges(ds; latitude_range, longitude_range)
     latitude_variable = variable(ds, "lat")
     longitude_variable = variable(ds, "lon")
     latitude = Array(latitude_variable[ntuple(_ -> :, ndims(latitude_variable))...])
@@ -187,7 +181,7 @@ function copy_auxiliary_variable(name, variable, time_dim, parameters)
     return name == time_dim || time_dim ∉ dimensions
 end
 
-function define_output_file(output_path, template, ranges, total_time; parameters = DEFAULT_NORKYST_PARAMETERS)
+function define_output_file(output_path, template, ranges, total_time; parameters)
     time_dim = time_dimension(template)
     isfile(output_path) && rm(output_path; force = true)
 
@@ -280,7 +274,7 @@ function write_parameter_chunk!(output, source, name, ranges, mask, spatial_dime
     return size(data, findfirst(==(time_dimension(source)), dimnames(variable)))
 end
 
-function write_time_dependent_coordinates!(output, source, ranges, time_start; parameters = DEFAULT_NORKYST_PARAMETERS)
+function write_time_dependent_coordinates!(output, source, ranges, time_start; parameters)
     time_dim = time_dimension(source)
 
     for name in keys(source)
@@ -309,11 +303,11 @@ function process_month(
     month,
     output_dir;
     files = nothing,
-    catalog_url = DEFAULT_NORKYST_CATALOG_URL,
-    opendap_url = DEFAULT_NORKYST_OPENDAP_URL,
-    parameters = DEFAULT_NORKYST_PARAMETERS,
-    latitude_range = DEFAULT_LATITUDE_RANGE,
-    longitude_range = DEFAULT_LONGITUDE_RANGE,
+    catalog_url,
+    opendap_url,
+    parameters,
+    latitude_range,
+    longitude_range,
 )
     files = isnothing(files) ? list_opendap_files(catalog_url = catalog_url) : files
     month_string = ".$(year)$(lpad(month, 2, '0'))"
@@ -374,23 +368,25 @@ function main()
     config = args.config
     norkyst = config.norkyst
 
-    println("Processing year: $(args.year)")
+    println("Processing years: $(join(args.years, ", "))")
     println("Config: $(args.config_path)")
     println("Output directory: $(args.output_dir)\n")
 
     files = list_opendap_files(catalog_url = norkyst.catalog_url)
-    for month in 1:12
-        process_month(
-            args.year,
-            month,
-            args.output_dir;
-            files,
-            catalog_url = norkyst.catalog_url,
-            opendap_url = norkyst.opendap_url,
-            parameters = norkyst.parameters,
-            latitude_range = config.grid.latitude,
-            longitude_range = config.grid.longitude,
-        )
+    for year in args.years
+        for month in 1:12
+            process_month(
+                year,
+                month,
+                args.output_dir;
+                files,
+                catalog_url = norkyst.catalog_url,
+                opendap_url = norkyst.opendap_url,
+                parameters = norkyst.parameters,
+                latitude_range = config.grid.latitude,
+                longitude_range = config.grid.longitude,
+            )
+        end
     end
 
     println("All done.")

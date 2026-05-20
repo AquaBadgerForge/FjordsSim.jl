@@ -1,12 +1,19 @@
-name = "drammensfjorden"
+name = "oslofjorden"
 data_root = "~/FjordSim_data"
 
 [grid]
-size = [150, 200, 11]
+size = [232, 105, 18]
 halo = [7, 7, 7]
-longitude = [10.20, 10.45]
-latitude = [59.58, 59.75]
+longitude = [10.2, 11.02]
+latitude = [59.0, 59.93]
 z_faces = [
+    -450.0,
+    -400.0,
+    -350.0,
+    -300.0,
+    -250.0,
+    -200.0,
+    -150.0,
     -100.0,
     -75.0,
     -50.0,

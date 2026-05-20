@@ -29,7 +29,10 @@
             "stopOnEntry": false,
             "juliaAdditionalArgs": [
                 "-O0"
-            ]
+            ],
+            "env": {
+                "FJORDSIM_RUN_MAIN": "1"
+            },
         },
         {
             "type": "julia",
