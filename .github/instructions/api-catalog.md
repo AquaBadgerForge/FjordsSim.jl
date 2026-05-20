@@ -103,7 +103,7 @@
 | Symbol | Type | Signature | Purpose |
 |--------|------|-----------|---------|
 | `GeonorgeBathymetry` | Struct | `GeonorgeBathymetry(metadata_filename::String, default_download_directory::String, longitude_interfaces::NTuple{2,Float64}, latitude_interfaces::NTuple{2,Float64}, size::NTuple{3,Int})` | Metadata wrapper for generated raw Geonorge bathymetry |
-| `prepare_geonorge_bathymetry` | Function | `prepare_geonorge_bathymetry(target_grid; output_path, raw_dir=download_bathymetry_cache, raw_resolution_factor=4, padding_cells=2, include_contours=true, cache=true, regrid_kw...) -> NamedTuple` | Build a regional raw bathymetry dataset from the local Geonorge FileGDB, regrid it, and write a FjordSim bathymetry NetCDF |
+| `prepare_geonorge_bathymetry` | Function | `prepare_geonorge_bathymetry(target_grid; output_path, geodatabase_path, raw_dir=download_bathymetry_cache, raw_resolution_factor=4, padding_cells=2, include_contours=true, contour_stride=1, cache=true, regrid_kw...) -> NamedTuple` | Build a regional raw bathymetry dataset from the local Geonorge FileGDB, regrid it, and write a FjordSim bathymetry NetCDF |
 | `write_bathymetry_file` | Function | `write_bathymetry_file(filepath::String, target_grid, bottom_height) -> String` | Write a processed NetCDF bathymetry file compatible with `ImmersedBoundaryGrid` |
 
 ---

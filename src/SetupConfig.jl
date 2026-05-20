@@ -24,6 +24,8 @@ function vector_value(table, key, context, T)
     return [convert(T, value) for value in values]
 end
 
+optional_value(table, key, default, T) = convert(T, get(table, key, default))
+
 function path_from_config(path::AbstractString, data_root::AbstractString)
     expanded = expand_user(path)
     return isabspath(expanded) ? expanded : joinpath(data_root, expanded)
@@ -60,6 +62,7 @@ function load_setup_config(path::AbstractString = DEFAULT_SETUP_CONFIG_PATH)
         raw_resolution_factor = convert(Int, require_key(bathymetry, "raw_resolution_factor", "bathymetry config")),
         padding_cells = convert(Int, require_key(bathymetry, "padding_cells", "bathymetry config")),
         include_contours = convert(Bool, require_key(bathymetry, "include_contours", "bathymetry config")),
+        contour_stride = optional_value(bathymetry, "contour_stride", 1, Int),
         interpolation_passes = convert(Int, require_key(bathymetry, "interpolation_passes", "bathymetry config")),
         major_basins = convert(Int, require_key(bathymetry, "major_basins", "bathymetry config")),
         cache = convert(Bool, require_key(bathymetry, "cache", "bathymetry config")),

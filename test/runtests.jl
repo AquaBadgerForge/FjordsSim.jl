@@ -186,5 +186,7 @@ end
         close(ds)
 
         @test_nowarn ImmersedBoundaryGrid(bathymetry_path, arch, (1, 1, 1))
+        @test FjordSim.Bathymetry.contour_point_indices(10, 3) == [0, 3, 6, 9]
+        @test FjordSim.Bathymetry.contour_point_indices(5, 3) == [0, 3, 4]
     end
 end

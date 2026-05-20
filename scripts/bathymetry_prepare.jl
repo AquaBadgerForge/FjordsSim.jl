@@ -134,6 +134,7 @@ function main()
         raw_resolution_factor = bathymetry_config.raw_resolution_factor,
         padding_cells = bathymetry_config.padding_cells,
         include_contours = bathymetry_config.include_contours,
+        contour_stride = bathymetry_config.contour_stride,
         interpolation_passes = bathymetry_config.interpolation_passes,
         major_basins = bathymetry_config.major_basins,
         cache = bathymetry_config.cache,

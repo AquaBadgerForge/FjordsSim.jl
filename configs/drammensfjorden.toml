@@ -26,6 +26,7 @@ geodatabase_path = "Basisdata_0000_Norge_25833_Dybdedata_FGDB.gdb"
 raw_resolution_factor = 2
 padding_cells = 2
 include_contours = false
+contour_stride = 10
 interpolation_passes = 1
 major_basins = 1
 cache = false

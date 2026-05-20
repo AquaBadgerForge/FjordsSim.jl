@@ -80,7 +80,7 @@ end
 """
     prepare_geonorge_bathymetry(target_grid; output_path, geodatabase_path, raw_dir=download_bathymetry_cache,
                                 raw_resolution_factor=4, padding_cells=2,
-                                include_contours=true, cache=true, regrid_kw...)
+                                include_contours=true, contour_stride=1, cache=true, regrid_kw...)
 
 Read the local Geonorge Sjøkart FileGDB bathymetry dataset, build a regional
 NumericalEarth-style raw bathymetry dataset in scratch storage, regrid it onto
@@ -100,6 +100,8 @@ NetCDF file compatible with `FjordSim.Grids.ImmersedBoundaryGrid`.
 - `include_contours`: If `true` (default), sample both `dybdepunkt` and
     `dybdekurve`. Set to `false` to grid only depth points, which is usually much
     faster for dense local datasets.
+- `contour_stride`: Sample every `contour_stride`-th contour vertex when
+    `include_contours=true`. Larger values reduce raw bathymetry build time.
 - `cache`: If `true` (default), reuse both the generated regional raw NetCDF and
     NumericalEarth's on-disk bathymetry cache. Set to `false` to rebuild the raw
     NetCDF from the local FileGDB and force regridding.
@@ -116,18 +118,29 @@ function prepare_geonorge_bathymetry(
     raw_resolution_factor::Int = 4,
     padding_cells::Int = 2,
     include_contours::Bool = true,
+    contour_stride::Int = 1,
     cache::Bool = true,
     regrid_kw...,
 )
     raw_resolution_factor >= 1 || throw(ArgumentError("raw_resolution_factor must be >= 1"))
     padding_cells >= 0 || throw(ArgumentError("padding_cells must be >= 0"))
+    contour_stride >= 1 || throw(ArgumentError("contour_stride must be >= 1"))
     :cache in keys(regrid_kw) &&
         throw(ArgumentError("Pass `cache` directly to prepare_geonorge_bathymetry, not via `regrid_kw...`."))
     isdir(geodatabase_path) ||
         error("Local Geonorge bathymetry geodatabase not found at $geodatabase_path.")
 
     @info "Preparing Geonorge bathymetry"
-    dataset = geonorge_dataset(target_grid; raw_dir, raw_resolution_factor, padding_cells, include_contours, cache, geodatabase_path)
+    dataset = geonorge_dataset(
+        target_grid;
+        raw_dir,
+        raw_resolution_factor,
+        padding_cells,
+        include_contours,
+        contour_stride,
+        cache,
+        geodatabase_path,
+    )
 
     metadata = Metadatum(:bottom_height; dataset)
     @info "Regridding Geonorge bathymetry onto target grid"
@@ -209,7 +222,16 @@ end
 Construct the regional raw bathymetry dataset wrapper used as input to
 `NumericalEarth.regrid_bathymetry`.
 """
-function geonorge_dataset(target_grid; raw_dir, raw_resolution_factor, padding_cells, include_contours, cache, geodatabase_path)
+function geonorge_dataset(
+    target_grid;
+    raw_dir,
+    raw_resolution_factor,
+    padding_cells,
+    include_contours,
+    contour_stride,
+    cache,
+    geodatabase_path,
+)
     isdir(raw_dir) || mkpath(raw_dir)
 
     Nx, Ny, _ = size(target_grid)
@@ -221,12 +243,20 @@ function geonorge_dataset(target_grid; raw_dir, raw_resolution_factor, padding_c
         1,
     )
 
-    raw_filename = geonorge_raw_filename(longitude, latitude, raw_size; include_contours)
+    raw_filename = geonorge_raw_filename(longitude, latitude, raw_size; include_contours, contour_stride)
     raw_path = joinpath(raw_dir, raw_filename)
 
     if !cache || !isfile(raw_path)
         @info "Building raw Geonorge bathymetry at $raw_path"
-        write_native_bathymetry(raw_path, geodatabase_path; longitude, latitude, size = raw_size, include_contours)
+        write_native_bathymetry(
+            raw_path,
+            geodatabase_path;
+            longitude,
+            latitude,
+            size = raw_size,
+            include_contours,
+            contour_stride,
+        )
     else
         @info "Using cached raw Geonorge bathymetry at $raw_path"
     end
@@ -243,12 +273,28 @@ Create the regional raw bathymetry NetCDF consumed by `GeonorgeBathymetry`.
 The native raster is built from Sjøkart depth points and depth contours,
 combined with land polygons and skerries so that land cells remain `h >= 0`.
 """
-function write_native_bathymetry(filepath, geodatabase_path; longitude, latitude, size, include_contours::Bool = true)
+function write_native_bathymetry(
+    filepath,
+    geodatabase_path;
+    longitude,
+    latitude,
+    size,
+    include_contours::Bool = true,
+    contour_stride::Int = 1,
+)
     Nx, Ny, _ = size
     @info "Writing native bathymetry grid with size ($Nx, $Ny)"
     longitude_centers = center_coordinates(longitude, Nx)
     latitude_centers = center_coordinates(latitude, Ny)
-    z_data = build_native_bathymetry_data(geodatabase_path; longitude, latitude, Nx, Ny, include_contours)
+    z_data = build_native_bathymetry_data(
+        geodatabase_path;
+        longitude,
+        latitude,
+        Nx,
+        Ny,
+        include_contours,
+        contour_stride,
+    )
     validate_land_representation(z_data; context = "raw")
     @info "Validated raw Geonorge bathymetry"
 
@@ -281,7 +327,15 @@ Create the raw regional bathymetry array by sampling Sjøkart depth features,
 gridding them onto a regular WGS84 longitude-latitude raster, and then burning
 land features back to `0 m`.
 """
-function build_native_bathymetry_data(geodatabase_path; longitude, latitude, Nx, Ny, include_contours::Bool = true)
+function build_native_bathymetry_data(
+    geodatabase_path;
+    longitude,
+    latitude,
+    Nx,
+    Ny,
+    include_contours::Bool = true,
+    contour_stride::Int = 1,
+)
     @info "Native bathymetry build: transforming bounds"
     filter_bounds = transformed_filter_bounds(longitude, latitude)
 
@@ -294,6 +348,7 @@ function build_native_bathymetry_data(geodatabase_path; longitude, latitude, Nx,
                     filter_bounds,
                     target_srs;
                     include_contours,
+                    contour_stride,
                 ) do point_dataset
                     @info "Native bathymetry build: gridding sampled depths"
                     grid_point_dataset(point_dataset; longitude, latitude, Nx, Ny)
@@ -345,6 +400,7 @@ function create_point_dataset(
     filter_bounds,
     target_srs;
     include_contours::Bool = true,
+    contour_stride::Int = 1,
 )
     @info "Creating native bathymetry point dataset"
     ArchGDAL.create(ArchGDAL.getdriver("Memory")) do point_dataset
@@ -356,7 +412,14 @@ function create_point_dataset(
         ) do point_layer
             ArchGDAL.addfielddefn!(point_layer, "z", ArchGDAL.OFTReal)
             point_count =
-                sample_bathymetry_points!(point_layer, geodatabase_path, transform, filter_bounds; include_contours)
+                sample_bathymetry_points!(
+                    point_layer,
+                    geodatabase_path,
+                    transform,
+                    filter_bounds;
+                    include_contours,
+                    contour_stride,
+                )
             point_count > 0 || error("No Geonorge bathymetry features intersect the requested region.")
             @info "Created native bathymetry point dataset with $point_count sampled points"
             return f(point_dataset)
@@ -465,6 +528,7 @@ function sample_bathymetry_points!(
     transform,
     filter_bounds;
     include_contours::Bool = true,
+    contour_stride::Int = 1,
 )
     xmin, ymin, xmax, ymax = filter_bounds
     point_count = 0
@@ -493,6 +557,7 @@ function sample_bathymetry_points!(
                 xmax,
                 ymax;
                 geometry = :line,
+                contour_stride,
             )
         )
     end
@@ -540,7 +605,18 @@ end
 
 Sample one depth-bearing layer from the Sjøkart geodatabase.
 """
-function sample_depth_layer!(point_layer, dataset, layer_name, transform, xmin, ymin, xmax, ymax; geometry)
+function sample_depth_layer!(
+    point_layer,
+    dataset,
+    layer_name,
+    transform,
+    xmin,
+    ymin,
+    xmax,
+    ymax;
+    geometry,
+    contour_stride::Int = 1,
+)
     layer = find_layer(dataset, layer_name)
     isnothing(layer) && return 0
 
@@ -565,7 +641,13 @@ function sample_depth_layer!(point_layer, dataset, layer_name, transform, xmin, 
         geometry == :point &&
             (point_count += add_point_geometry!(point_layer, ArchGDAL.getgeom(feature), transform, bottom_height))
         geometry == :line &&
-            (point_count += add_linestring_points!(point_layer, ArchGDAL.getgeom(feature), transform, bottom_height))
+            (point_count += add_linestring_points!(
+                point_layer,
+                ArchGDAL.getgeom(feature),
+                transform,
+                bottom_height;
+                stride = contour_stride,
+            ))
 
         processed_features % progress_interval == 0 &&
             @info "Sampling $layer_name: $processed_features / $total_features features processed, $(total_features - processed_features) remaining"
@@ -600,12 +682,18 @@ end
 Append each vertex of a contour line to `point_layer` with a constant
 `bottom_height` attribute.
 """
-function add_linestring_points!(point_layer, line, transform, bottom_height)
+function add_linestring_points!(point_layer, line, transform, bottom_height; stride::Int = 1)
     if ArchGDAL.geomname(line) == "MULTILINESTRING"
         added = 0
         for geometry_index = 0:ArchGDAL.ngeom(line)-1
             added +=
-                add_linestring_points!(point_layer, ArchGDAL.getgeom(line, geometry_index), transform, bottom_height)
+                add_linestring_points!(
+                    point_layer,
+                    ArchGDAL.getgeom(line, geometry_index),
+                    transform,
+                    bottom_height;
+                    stride,
+                )
         end
         return added
     end
@@ -613,7 +701,7 @@ function add_linestring_points!(point_layer, line, transform, bottom_height)
     npoints = ArchGDAL.ngeom(line)
     added = 0
 
-    for point_index = 0:npoints-1
+    for point_index in contour_point_indices(npoints, stride)
         x, y, _ = ArchGDAL.getpoint(line, point_index)
         point = ArchGDAL.createpoint(x, y)
         ArchGDAL.transform!(point, transform)
@@ -629,6 +717,13 @@ function add_linestring_points!(point_layer, line, transform, bottom_height)
     end
 
     return added
+end
+
+function contour_point_indices(npoints, stride)
+    last_index = npoints - 1
+    indices = collect(0:stride:last_index)
+    isempty(indices) || last(indices) == last_index || push!(indices, last_index)
+    return indices
 end
 
 """
@@ -745,13 +840,13 @@ end
 
 Build a deterministic filename for a regional raw bathymetry cache file.
 """
-function geonorge_raw_filename(longitude, latitude, size; include_contours::Bool = true)
+function geonorge_raw_filename(longitude, latitude, size; include_contours::Bool = true, contour_stride::Int = 1)
     Nx, Ny, _ = size
     lon1 = replace(string(round(longitude[1], digits = 3)), '.' => 'p')
     lon2 = replace(string(round(longitude[2], digits = 3)), '.' => 'p')
     lat1 = replace(string(round(latitude[1], digits = 3)), '.' => 'p')
     lat2 = replace(string(round(latitude[2], digits = 3)), '.' => 'p')
-    contour_suffix = include_contours ? "" : "_points_only"
+    contour_suffix = include_contours ? "_contour_stride_$(contour_stride)" : "_points_only"
 
     return "geonorge_sjokart_bathymetry_$(lon1)_$(lon2)_$(lat1)_$(lat2)_$(Nx)x$(Ny)$(contour_suffix).nc"
 end
