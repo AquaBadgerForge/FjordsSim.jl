@@ -451,6 +451,7 @@ function sample_bathymetry_points!(
 )
     xmin, ymin, xmax, ymax = filter_bounds
     point_count = 0
+    @info "Sampling Geonorge bathymetry points"
 
     ArchGDAL.read(geodatabase_path) do dataset
         point_count += sample_depth_layer!(
@@ -479,6 +480,7 @@ function sample_bathymetry_points!(
         )
     end
 
+    @info "Finished sampling Geonorge bathymetry points: $point_count points"
     return point_count
 end
 
@@ -523,19 +525,32 @@ function sample_depth_layer!(point_layer, dataset, layer_name, transform, xmin, 
 
     ArchGDAL.setspatialfilter!(layer, xmin, ymin, xmax, ymax)
     depth_index = ArchGDAL.findfieldindex(layer, "dybde", false)
+    total_features = ArchGDAL.nfeature(layer, true)
+    processed_features = 0
+    progress_interval = max(cld(total_features, 20), 1)
     point_count = 0
+    @info "Sampling $layer_name: 0 / $total_features features processed"
 
     for feature in layer
+        processed_features += 1
         depth = ArchGDAL.getfield(feature, depth_index)
-        ismissing(depth) && continue
+        if ismissing(depth)
+            processed_features % progress_interval == 0 &&
+                @info "Sampling $layer_name: $processed_features / $total_features features processed, $(total_features - processed_features) remaining"
+            continue
+        end
 
         bottom_height = -abs(Float64(depth))
         geometry == :point &&
             (point_count += add_point_geometry!(point_layer, ArchGDAL.getgeom(feature), transform, bottom_height))
         geometry == :line &&
             (point_count += add_linestring_points!(point_layer, ArchGDAL.getgeom(feature), transform, bottom_height))
+
+        processed_features % progress_interval == 0 &&
+            @info "Sampling $layer_name: $processed_features / $total_features features processed, $(total_features - processed_features) remaining"
     end
 
+    @info "Finished sampling $layer_name: $processed_features / $total_features features processed, $point_count points added"
     return point_count
 end
 
