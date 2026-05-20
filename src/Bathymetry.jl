@@ -126,15 +126,18 @@ function prepare_geonorge_bathymetry(
     isdir(geodatabase_path) ||
         error("Local Geonorge bathymetry geodatabase not found at $geodatabase_path.")
 
+    @info "Preparing Geonorge bathymetry"
     dataset = geonorge_dataset(target_grid; raw_dir, raw_resolution_factor, padding_cells, include_contours, cache, geodatabase_path)
 
     metadata = Metadatum(:bottom_height; dataset)
+    @info "Regridding Geonorge bathymetry onto target grid"
     bottom_height = NumericalEarth.regrid_bathymetry(target_grid, metadata; cache, regrid_kw...)
     try
         validate_land_representation(
             Array(interior(on_architecture(CPU(), bottom_height), :, :, 1));
             context = "regridded",
         )
+        @info "Validated regridded Geonorge bathymetry"
     catch err
         if cache
             @info "Cached Geonorge bathymetry lacks land cells; recomputing without NumericalEarth cache."
@@ -147,7 +150,9 @@ function prepare_geonorge_bathymetry(
             rethrow(err)
         end
     end
+    @info "Writing processed bathymetry file to $output_path"
     write_bathymetry_file(output_path, target_grid, bottom_height)
+    @info "Finished preparing Geonorge bathymetry"
 
     return (; dataset, raw_path = metadata_path(metadata), output_path, bottom_height)
 end
@@ -220,7 +225,10 @@ function geonorge_dataset(target_grid; raw_dir, raw_resolution_factor, padding_c
     raw_path = joinpath(raw_dir, raw_filename)
 
     if !cache || !isfile(raw_path)
+        @info "Building raw Geonorge bathymetry at $raw_path"
         write_native_bathymetry(raw_path, geodatabase_path; longitude, latitude, size = raw_size, include_contours)
+    else
+        @info "Using cached raw Geonorge bathymetry at $raw_path"
     end
 
     return GeonorgeBathymetry(raw_filename, raw_dir, longitude, latitude, raw_size)
@@ -237,10 +245,12 @@ combined with land polygons and skerries so that land cells remain `h >= 0`.
 """
 function write_native_bathymetry(filepath, geodatabase_path; longitude, latitude, size, include_contours::Bool = true)
     Nx, Ny, _ = size
+    @info "Writing native bathymetry grid with size ($Nx, $Ny)"
     longitude_centers = center_coordinates(longitude, Nx)
     latitude_centers = center_coordinates(latitude, Ny)
     z_data = build_native_bathymetry_data(geodatabase_path; longitude, latitude, Nx, Ny, include_contours)
     validate_land_representation(z_data; context = "raw")
+    @info "Validated raw Geonorge bathymetry"
 
     isfile(filepath) && rm(filepath; force = true)
 
@@ -260,6 +270,7 @@ function write_native_bathymetry(filepath, geodatabase_path; longitude, latitude
         close(ds)
     end
 
+    @info "Finished writing native bathymetry file to $filepath"
     return filepath
 end
 
@@ -271,6 +282,7 @@ gridding them onto a regular WGS84 longitude-latitude raster, and then burning
 land features back to `0 m`.
 """
 function build_native_bathymetry_data(geodatabase_path; longitude, latitude, Nx, Ny, include_contours::Bool = true)
+    @info "Native bathymetry build: transforming bounds"
     filter_bounds = transformed_filter_bounds(longitude, latitude)
 
     return ArchGDAL.importEPSG(25833; order = :trad) do source_srs
@@ -283,14 +295,17 @@ function build_native_bathymetry_data(geodatabase_path; longitude, latitude, Nx,
                     target_srs;
                     include_contours,
                 ) do point_dataset
+                    @info "Native bathymetry build: gridding sampled depths"
                     grid_point_dataset(point_dataset; longitude, latitude, Nx, Ny)
                 end
 
                 land_mask = create_land_dataset(geodatabase_path, transform, filter_bounds, target_srs) do land_dataset
+                    @info "Native bathymetry build: rasterizing land"
                     rasterize_land_dataset(land_dataset; longitude, latitude, Nx, Ny)
                 end
 
                 bathymetry[land_mask] .= 0.0f0
+                @info "Native bathymetry build complete"
                 bathymetry
             end
         end
@@ -331,6 +346,7 @@ function create_point_dataset(
     target_srs;
     include_contours::Bool = true,
 )
+    @info "Creating native bathymetry point dataset"
     ArchGDAL.create(ArchGDAL.getdriver("Memory")) do point_dataset
         ArchGDAL.createlayer(
             name = "bathymetry_points",
@@ -342,6 +358,7 @@ function create_point_dataset(
             point_count =
                 sample_bathymetry_points!(point_layer, geodatabase_path, transform, filter_bounds; include_contours)
             point_count > 0 || error("No Geonorge bathymetry features intersect the requested region.")
+            @info "Created native bathymetry point dataset with $point_count sampled points"
             return f(point_dataset)
         end
     end
@@ -491,6 +508,7 @@ Append transformed land-related features to `land_layer`.
 """
 function sample_land_features!(land_layer, geodatabase_path, transform, filter_bounds)
     xmin, ymin, xmax, ymax = filter_bounds
+    @info "Sampling Geonorge land features"
 
     ArchGDAL.read(geodatabase_path) do dataset
         for layer_name in GEONORGE_LAND_LAYERS
@@ -498,6 +516,8 @@ function sample_land_features!(land_layer, geodatabase_path, transform, filter_b
             isnothing(layer) && continue
 
             ArchGDAL.setspatialfilter!(layer, xmin, ymin, xmax, ymax)
+            feature_count = ArchGDAL.nfeature(layer, true)
+            @info "Sampling $layer_name: $feature_count land features"
 
             for source_feature in layer
                 geometry = ArchGDAL.clone(ArchGDAL.getgeom(source_feature))
@@ -511,6 +531,7 @@ function sample_land_features!(land_layer, geodatabase_path, transform, filter_b
         end
     end
 
+    @info "Finished sampling Geonorge land features"
     return nothing
 end
 
