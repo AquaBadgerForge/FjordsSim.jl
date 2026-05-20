@@ -33,6 +33,10 @@
             "env": {
                 "FJORDSIM_RUN_MAIN": "1"
             },
+            "args":[
+                "--config",
+                "configs/oslofjorden.toml",
+            ]
         },
         {
             "type": "julia",
@@ -48,10 +52,8 @@
                 "FJORDSIM_RUN_MAIN": "1"
             },
             "args":[
-                "--year",
-                "2020",
-                "--output-dir",
-                "~/FjordSim_data/drammensfjorden"
+                "--config",
+                "configs/oslofjorden.toml",
             ]
         },
     ]
