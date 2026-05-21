@@ -25,26 +25,25 @@ import NumericalEarth.DataWrangling:
     retrieve_data,
     default_inpainting
 
-struct DSForcing
+struct DSForcing{D, Z}
     metadata_filename::String
     default_download_directory::String
-    reversed_vertical_axis::Any
-    longitude_interfaces::Any
-    latitude_interfaces::Any
-    size::Any
-    all_dates::Any
-    first_date::Any
-    last_date::Any
-    z_interfaces::Any
+    reversed_vertical_axis::Bool
+    longitude_interfaces::Tuple{Float64, Float64}
+    latitude_interfaces::Tuple{Float64, Float64}
+    size::NTuple{3, Int}
+    all_dates::Vector{D}
+    first_date::D
+    last_date::D
+    z_interfaces::Vector{Z}
 end
 
 function DSForcing(metadata_filename, default_download_directory)
-    reversed_vertical_axis = false
     filepath = joinpath(default_download_directory, metadata_filename)
     ds = NCDataset(filepath)
-    longitude_interfaces = (ds["Nx"][1], ds["Nx"][end])
-    latitude_interfaces = (ds["Ny"][1], ds["Ny"][end])
-    size = (ds.dim["Nx"], ds.dim["Ny"], ds.dim["Nz"])
+    longitude_interfaces = (Float64(ds["Nx"][1]), Float64(ds["Nx"][end]))
+    latitude_interfaces = (Float64(ds["Ny"][1]), Float64(ds["Ny"][end]))
+    sz = NTuple{3, Int}((ds.dim["Nx"], ds.dim["Ny"], ds.dim["Nz"]))
     all_dates = ds["time"][:]
     first_date = ds["time"][1]
     last_date = ds["time"][end]
@@ -54,10 +53,10 @@ function DSForcing(metadata_filename, default_download_directory)
     return DSForcing(
         metadata_filename,
         default_download_directory,
-        reversed_vertical_axis,
+        false,
         longitude_interfaces,
         latitude_interfaces,
-        size,
+        sz,
         all_dates,
         first_date,
         last_date,
@@ -65,17 +64,17 @@ function DSForcing(metadata_filename, default_download_directory)
     )
 end  # function
 
-struct DSResults
+struct DSResults{D, Z}
     metadata_filename::String
     default_download_directory::String
-    reversed_vertical_axis::Any
-    longitude_interfaces::Any
-    latitude_interfaces::Any
-    size::Any
-    all_dates::Any
-    first_date::Any
-    last_date::Any
-    z_interfaces::Any
+    reversed_vertical_axis::Bool
+    longitude_interfaces::Tuple{Float64, Float64}
+    latitude_interfaces::Tuple{Float64, Float64}
+    size::NTuple{3, Int}
+    all_dates::Vector{D}
+    first_date::D
+    last_date::D
+    z_interfaces::Vector{Z}
 end
 
 """
@@ -84,15 +83,15 @@ end
 Load and save info from a NetCDF file.
 
 # Arguments
-- `metadata_filename::String`  
+- `metadata_filename::String`
     Name of the NetCDF file.
 
-- `default_download_directory::String`  
+- `default_download_directory::String`
     Directory where the file is stored.
 
 # Keyword Arguments
-- `start_date_time::DateTime`  
-    DateTime of the first record in the file at  
+- `start_date_time::DateTime`
+    DateTime of the first record in the file at
     `joinpath(default_download_directory, metadata_filename)`.
 
 """
@@ -101,12 +100,11 @@ function DSResults(
     default_download_directory::String;
     start_date_time::DateTime
 )
-    reversed_vertical_axis = false
     filepath = joinpath(default_download_directory, metadata_filename)
     ds = NCDataset(filepath)
-    longitude_interfaces = (ds["λ_faa"][1], ds["λ_faa"][end])
-    latitude_interfaces = (ds["φ_afa"][1], ds["φ_afa"][end])
-    array_size = size(ds["T"])[1:3]  # that is for a grid, so size should be for tracers
+    longitude_interfaces = (Float64(ds["λ_faa"][1]), Float64(ds["λ_faa"][end]))
+    latitude_interfaces = (Float64(ds["φ_afa"][1]), Float64(ds["φ_afa"][end]))
+    sz = NTuple{3, Int}(size(ds["T"])[1:3])  # that is for a grid, so size should be for tracers
     all_dates = start_date_time .+ Millisecond.(round.(Int, ds["time"][:] .* 1000))
     first_date = all_dates[1]
     last_date = all_dates[end]
@@ -116,10 +114,10 @@ function DSResults(
     return DSResults(
         metadata_filename,
         default_download_directory,
-        reversed_vertical_axis,
+        false,
         longitude_interfaces,
         latitude_interfaces,
-        array_size,
+        sz,
         all_dates,
         first_date,
         last_date,

@@ -35,21 +35,21 @@ NORA3_variable_names = (
     :northward_velocity,
 )
 
-struct MultiYearNORA3
+struct MultiYearNORA3{D}
     metadata_filename::String
     default_download_directory::String
-    size::Any
-    all_dates::Any
+    size::NTuple{2, Int}
+    all_dates::Vector{D}
 end
 
 function MultiYearNORA3(metadata_filename::String, default_download_directory::String)
     filepath = joinpath(default_download_directory, metadata_filename)
     ds = NCDataset(filepath)
-    array_size = size(ds["air_temperature_2m"])[1:2]
+    sz = NTuple{2, Int}(size(ds["air_temperature_2m"])[1:2])
     all_dates = ds["time"][:]
     close(ds)
 
-    return MultiYearNORA3(metadata_filename, default_download_directory, array_size, all_dates)
+    return MultiYearNORA3(metadata_filename, default_download_directory, sz, all_dates)
 end  # function
 
 available_variables(::MultiYearNORA3) = NORA3_variable_names
@@ -102,7 +102,7 @@ new_backend(b::NORA3NetCDFBackend, start, length) = NORA3NetCDFBackend(start, le
 
 function NORA3_time_indices(ds::MultiYearNORA3, dates, name)
     nora3_all_dates = all_dates(ds, name)
-    indices = Int[]
+    indices = sizehint!(Int[], length(dates))
 
     for date in dates
         index = findfirst(x -> x == date, nora3_all_dates)

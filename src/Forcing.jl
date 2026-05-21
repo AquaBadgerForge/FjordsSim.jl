@@ -111,13 +111,7 @@ end
 regularize_forcing(forcing::ForcingFromFile, field, field_name, model_field_names) = forcing
 
 function native_times_to_seconds(native_times, start_time = native_times[1])
-    times = []
-    for native_time in native_times
-        time = native_time - start_time
-        time = Second(time).value
-        push!(times, time)
-    end
-    return times
+    return [Second(t - start_time).value for t in native_times]
 end
 
 function load_from_netcdf(; path::String, var_name::String, grid_size::Tuple, time_indices_in_memory::Tuple)
@@ -128,7 +122,7 @@ function load_from_netcdf(; path::String, var_name::String, grid_size::Tuple, ti
     data = zeros(Float64, (grid_size[1:end]..., length(time_indices_in_memory)))
     j = 1
     for i in time_indices_in_memory
-        data[:, :, :, j] .= var[:, :, :, i]
+        @views data[:, :, :, j] .= var[:, :, :, i]
         j += 1
     end
     times = convert.(Int64, native_times_to_seconds(native_times))

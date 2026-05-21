@@ -25,7 +25,7 @@ function compute_faces(centers)
     return faces
 end
 
-wall_time = Ref(time_ns())
+const wall_time = Ref(time_ns())
 
 function progress(sim)
     ocean = sim.model.ocean
@@ -73,7 +73,7 @@ function extract_z_faces(grid)
         start_index = max(1, zero_index - n)
         z = bar[start_index:zero_index-1]
     else
-        z = []
+        z = Float64[]
     end
     return z
 end
@@ -82,8 +82,9 @@ function netcdf_to_jld2(netcdf_file::String, jld2_file::String)
     ds = NCDataset(netcdf_file, "r")
     data_dict = Dict()
     for varname in keys(ds)
-        data_dict[varname] = convert(Array, ds[varname])
-        print(size(convert(Array, ds[varname])))
+        arr = convert(Array, ds[varname])
+        data_dict[varname] = arr
+        print(size(arr))
     end
 
     @save jld2_file data_dict
