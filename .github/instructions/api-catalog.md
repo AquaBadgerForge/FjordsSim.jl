@@ -103,7 +103,7 @@
 | Symbol | Type | Signature | Purpose |
 |--------|------|-----------|---------|
 | `GeonorgeBathymetry` | Struct | `GeonorgeBathymetry(metadata_filename::String, default_download_directory::String, longitude_interfaces::NTuple{2,Float64}, latitude_interfaces::NTuple{2,Float64}, size::NTuple{3,Int})` | Metadata wrapper for generated raw Geonorge bathymetry |
-| `prepare_geonorge_bathymetry` | Function | `prepare_geonorge_bathymetry(target_grid; output_path, geodatabase_path, raw_dir=download_bathymetry_cache, raw_resolution_factor=4, padding_cells=2, include_contours=true, contour_stride=1, cache=true, regrid_kw...) -> NamedTuple` | Build a regional raw bathymetry dataset from the local Geonorge FileGDB, regrid it, and write a FjordSim bathymetry NetCDF |
+| `prepare_geonorge_bathymetry` | Function | `prepare_geonorge_bathymetry(target_grid; output_path, geodatabase_path, raw_dir=download_bathymetry_cache, raw_resolution_factor=4, padding_cells=0, include_contours=true, contour_stride=1, geonorge_cache=true, regrid_cache=true, regrid_kw...) -> NamedTuple` | Build a regional raw bathymetry dataset from the local Geonorge FileGDB, regrid it, and write a FjordSim bathymetry NetCDF |
 | `write_bathymetry_file` | Function | `write_bathymetry_file(filepath::String, target_grid, bottom_height) -> String` | Write a processed NetCDF bathymetry file compatible with `ImmersedBoundaryGrid` |
 
 ---
@@ -162,20 +162,6 @@ If you must change an existing exported interface:
    - Migration path for users
    - Deprecation timeline (if applicable)
 3. **Implement a deprecation wrapper** if removing old behavior; do not silently break.
-
----
-
-## Changelog
-
-### Version Tracking
-
-This section is reserved for documenting any breaking changes, removals, or significant API evolution:
-
-#### May 6, 2026 — NumericalEarth 0.4 compatibility update
-
-- **New export `NORA3PrescribedRadiation`**: downwelling shortwave/longwave radiation is now a separate top-level component (`PrescribedRadiation`) following the NumericalEarth 0.4 API. Previously `TwoBandDownwellingRadiation` was constructed inside `NORA3PrescribedAtmosphere` and passed as a `PrescribedAtmosphere` keyword; that API was removed upstream.
-- **`NORA3PrescribedAtmosphere` internal change** (non-breaking): no longer constructs radiation internally. Users must now also call `NORA3PrescribedRadiation(arch)` and pass the result as the `radiation` argument to `OceanSeaIceModel` / `coupled_hydrostatic_simulation`.
-- **`coupled_hydrostatic_simulation` internal change** (non-breaking): removed manual `ComponentInterfaces` construction; fixed `OceanSeaIceModel(sea_ice, ocean; ...)` argument order per NumericalEarth 0.4.
 
 ---
 

@@ -137,7 +137,8 @@ function main()
         contour_stride = bathymetry_config.contour_stride,
         interpolation_passes = bathymetry_config.interpolation_passes,
         major_basins = bathymetry_config.major_basins,
-        cache = bathymetry_config.cache,
+        geonorge_cache = bathymetry_config.geonorge_cache,
+        regrid_cache = bathymetry_config.regrid_cache,
     )
 
     plot_bathymetry(grid, result.bottom_height; plot_path = bathymetry_config.plot_path)

@@ -79,8 +79,9 @@ end
 
 """
     prepare_geonorge_bathymetry(target_grid; output_path, geodatabase_path, raw_dir=download_bathymetry_cache,
-                                raw_resolution_factor=4, padding_cells=2,
-                                include_contours=true, contour_stride=1, cache=true, regrid_kw...)
+                                raw_resolution_factor=4, padding_cells=0,
+                                include_contours=true, contour_stride=1,
+                                geonorge_cache=true, regrid_cache=true, regrid_kw...)
 
 Read the local Geonorge Sjøkart FileGDB bathymetry dataset, build a regional
 NumericalEarth-style raw bathymetry dataset in scratch storage, regrid it onto
@@ -102,9 +103,11 @@ NetCDF file compatible with `FjordSim.Grids.ImmersedBoundaryGrid`.
     faster for dense local datasets.
 - `contour_stride`: Sample every `contour_stride`-th contour vertex when
     `include_contours=true`. Larger values reduce raw bathymetry build time.
-- `cache`: If `true` (default), reuse both the generated regional raw NetCDF and
-    NumericalEarth's on-disk bathymetry cache. Set to `false` to rebuild the raw
-    NetCDF from the local FileGDB and force regridding.
+- `geonorge_cache`: If `true` (default), reuse the generated regional raw NetCDF.
+    Set to `false` to rebuild it from the local FileGDB.
+- `regrid_cache`: If `true` (default), use NumericalEarth's on-disk bathymetry
+    cache. Set to `false` to force regridding while still allowing
+    `geonorge_cache=true`.
 - `regrid_kw...`: Forwarded directly to `NumericalEarth.regrid_bathymetry`.
 
 # Returns
@@ -116,17 +119,16 @@ function prepare_geonorge_bathymetry(
     geodatabase_path::String,
     raw_dir::String = download_bathymetry_cache,
     raw_resolution_factor::Int = 4,
-    padding_cells::Int = 2,
+    padding_cells::Int = 0,
     include_contours::Bool = true,
     contour_stride::Int = 1,
-    cache::Bool = true,
+    geonorge_cache::Bool = true,
+    regrid_cache::Bool = true,
     regrid_kw...,
 )
     raw_resolution_factor >= 1 || throw(ArgumentError("raw_resolution_factor must be >= 1"))
     padding_cells >= 0 || throw(ArgumentError("padding_cells must be >= 0"))
     contour_stride >= 1 || throw(ArgumentError("contour_stride must be >= 1"))
-    :cache in keys(regrid_kw) &&
-        throw(ArgumentError("Pass `cache` directly to prepare_geonorge_bathymetry, not via `regrid_kw...`."))
     isdir(geodatabase_path) ||
         error("Local Geonorge bathymetry geodatabase not found at $geodatabase_path.")
 
@@ -138,13 +140,13 @@ function prepare_geonorge_bathymetry(
         padding_cells,
         include_contours,
         contour_stride,
-        cache,
+        geonorge_cache,
         geodatabase_path,
     )
 
     metadata = Metadatum(:bottom_height; dataset)
     @info "Regridding Geonorge bathymetry onto target grid"
-    bottom_height = NumericalEarth.regrid_bathymetry(target_grid, metadata; cache, regrid_kw...)
+    bottom_height = NumericalEarth.regrid_bathymetry(target_grid, metadata; cache = regrid_cache, regrid_kw...)
     try
         validate_land_representation(
             Array(interior(on_architecture(CPU(), bottom_height), :, :, 1));
@@ -152,7 +154,7 @@ function prepare_geonorge_bathymetry(
         )
         @info "Validated regridded Geonorge bathymetry"
     catch err
-        if cache
+        if regrid_cache
             @info "Cached Geonorge bathymetry lacks land cells; recomputing without NumericalEarth cache."
             bottom_height = NumericalEarth.regrid_bathymetry(target_grid, metadata; cache = false, regrid_kw...)
             validate_land_representation(
@@ -217,7 +219,7 @@ function write_bathymetry_file(filepath::String, target_grid, bottom_height)
 end
 
 """
-    geonorge_dataset(target_grid; raw_dir, raw_resolution_factor, padding_cells, include_contours, cache, geodatabase_path)
+    geonorge_dataset(target_grid; raw_dir, raw_resolution_factor, padding_cells, include_contours, geonorge_cache, geodatabase_path)
 
 Construct the regional raw bathymetry dataset wrapper used as input to
 `NumericalEarth.regrid_bathymetry`.
@@ -229,7 +231,7 @@ function geonorge_dataset(
     padding_cells,
     include_contours,
     contour_stride,
-    cache,
+    geonorge_cache,
     geodatabase_path,
 )
     isdir(raw_dir) || mkpath(raw_dir)
@@ -246,7 +248,7 @@ function geonorge_dataset(
     raw_filename = geonorge_raw_filename(longitude, latitude, raw_size; include_contours, contour_stride)
     raw_path = joinpath(raw_dir, raw_filename)
 
-    if !cache || !isfile(raw_path)
+    if !geonorge_cache || !isfile(raw_path)
         @info "Building raw Geonorge bathymetry at $raw_path"
         write_native_bathymetry(
             raw_path,

@@ -29,7 +29,8 @@ include_contours = false
 contour_stride = 10
 interpolation_passes = 1
 major_basins = 1
-cache = false
+geonorge_cache = true
+regrid_cache = false
 
 [forcing.norkyst]
 catalog_url = "https://thredds.met.no/thredds/catalog/fou-hi/norkyst800m/catalog.xml"

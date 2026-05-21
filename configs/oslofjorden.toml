@@ -30,13 +30,14 @@ z_faces = [
 
 [bathymetry]
 geodatabase_path = "Basisdata_0000_Norge_25833_Dybdedata_FGDB.gdb"
-raw_resolution_factor = 1
-padding_cells = 2
-include_contours = true
-contour_stride = 10
-interpolation_passes = 1
+raw_resolution_factor = 3
+padding_cells = 0
+include_contours = false
+contour_stride = 1
+interpolation_passes = 3
 major_basins = 1
-cache = false
+geonorge_cache = false
+regrid_cache = false
 
 [forcing.norkyst]
 catalog_url = "https://thredds.met.no/thredds/catalog/fou-hi/norkyst800m/catalog.xml"

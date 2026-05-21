@@ -65,7 +65,8 @@ function load_setup_config(path::AbstractString = DEFAULT_SETUP_CONFIG_PATH)
         contour_stride = optional_value(bathymetry, "contour_stride", 1, Int),
         interpolation_passes = convert(Int, require_key(bathymetry, "interpolation_passes", "bathymetry config")),
         major_basins = convert(Int, require_key(bathymetry, "major_basins", "bathymetry config")),
-        cache = convert(Bool, require_key(bathymetry, "cache", "bathymetry config")),
+        geonorge_cache = convert(Bool, require_key(bathymetry, "geonorge_cache", "bathymetry config")),
+        regrid_cache = convert(Bool, require_key(bathymetry, "regrid_cache", "bathymetry config")),
     )
 
     norkyst_config = (
