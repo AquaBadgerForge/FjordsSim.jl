@@ -1,7 +1,5 @@
 # CLAUDE.md
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
-
 ## Commands
 
 ```bash
@@ -40,11 +38,56 @@ A simulation is assembled from three components:
 
 7. **Dataset adapters** (`src/FDatasets.jl`) — `DSForcing` and `DSResults` are NumericalEarth dataset wrappers for local FjordSim NetCDF files (forcing inputs and simulation outputs), used for initial conditions and restart.
 
-8. **Configs** (`configs/*.toml`) — TOML files describing grid dimensions, bathymetry prep parameters, and forcing download URLs for each fjord setup.
+## GPU & Kernel Compatibility
+
+Forcing callables (e.g. `ForcingFromFile`) and any function called inside an Oceananigans
+kernel must follow these rules:
+
+- Mark with `@inline`
+- Use `ifelse` — never short-circuiting `&&`/`||` or ternary `?:` inside kernels
+- Must be type-stable and allocation-free
+- Never loop over grid points outside kernels — use `launch!` via KernelAbstractions
+- Use literal zeros: `max(0, a)` not `max(zero(FT), a)`
+- Never hardcode `Float64` literals (`0.0`, `1.0`) in kernels or constructors — use `zero(grid)`,
+  `one(grid)`, `convert(FT, val)`, or rational literals like `1//2`
+- Use `on_architecture` for CPU↔GPU data transfers — never call `Array()` or `CuArray()` directly
+- Always index fields with three indices: `field[i, j, k]` — 2D indexing appears to work on some
+  fields by coincidence but is unsupported and will break
+
+`src/Forcing.jl` already demonstrates the correct pattern; match it when adding new forcings.
+
+## Type Stability
+
+- All structs must have concrete field types — no `Any`, no abstract field types
+- User-facing constructors may accept flexible arguments, but the returned struct must be
+  fully typed (follow the materialization pattern from NumericalEarth if needed)
+- Type annotations are for dispatch only, not documentation
+- Profile with `@code_warntype` when touching GPU-executed paths
+
+## Import Conventions
+
+- Extend functions via `function Mod.foo(...) ... end` — never `import Mod: foo` to extend
+- Exports go at the top of each module file, before other code
+- Keep imports explicit so the dependency surface stays auditable
+
+## Code Style
+
+- Avoid abbreviations: `latitude` not `lat`, `temperature` not `temp` (exception: physics
+  symbols `T`, `S`, `u`, `v`, `λ`, `φ` are conventional)
+- Keyword args: no-space inline `f(x=1)`, single-space multiline `f(\n    a = 1,\n    b = 2\n)`
+- No trailing whitespace, no trailing blank lines; files end with exactly one newline
+- Always use explicit `return` in functions longer than one expression
+- Delete commented-out code — git is the history; no debugging artifacts or stale copy-paste
+- Prefer dispatch over conditionals: multiple dispatch instead of `if`/`else` branching on types
+
+## Common Pitfalls
+
+- Never extend `getproperty` to fix undefined-property bugs — fix the caller instead
+- A variable named the same as a function produces "type is not callable" — rename the variable
+- Never add/remove/change `[deps]` in `Project.toml` unless the task requires it; only touch
+  `[compat]` when explicitly asked
 
 ## Key conventions
 
-- Bathymetry convention: `h < 0` = below sea level (bottom height), `h >= 0` = land. `ImmersedBoundaryGrid` loader detects and converts legacy files where `h` was stored as positive depth.
-- `recursive_merge` (Utils) deep-merges named tuples; used to combine `top_bottom_boundary_conditions` output with open boundary conditions before `FieldBoundaryConditions`.
-- `SetupConfig` module (referenced from scripts but currently deleted per git status) handled TOML config loading; its absence may affect `bathymetry_prepare.jl`.
+- Bathymetry convention: `h < 0` = below sea level (bottom height), `h >= 0` = land.
 - Data files default to `~/FjordSim_data/` and results to `~/FjordSim_results/`.
