@@ -1,11 +1,13 @@
 #!/usr/bin/env julia
 
 using Downloads
-using FjordSim.SetupConfig: DEFAULT_SETUP_CONFIG_PATH, load_setup_config
+using FjordSim
 using NCDatasets
 
+const DEFAULT_CONFIG_PATH = joinpath(@__DIR__, "..", "configs", "drammensfjorden.jl")
+
 function parse_args(args = ARGS)
-    config_path = DEFAULT_SETUP_CONFIG_PATH
+    config_path = DEFAULT_CONFIG_PATH
 
     i = 1
     while i <= length(args)
@@ -25,10 +27,10 @@ function parse_args(args = ARGS)
         end
     end
 
-    config = load_setup_config(config_path)
+    config = include(abspath(config_path))
     return (
         config = config,
-        config_path = config.path,
+        config_path = abspath(config_path),
     )
 end
 
@@ -40,7 +42,7 @@ function print_usage()
       julia --project scripts/forcing_download_norkyst.jl [--config PATH]
 
     Options:
-      --config PATH      Setup config. Default: configs/drammensfjorden.toml
+      --config PATH      Setup config (Julia file). Default: configs/drammensfjorden.jl
     """)
 end
 

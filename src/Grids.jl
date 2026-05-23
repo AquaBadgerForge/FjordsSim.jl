@@ -1,13 +1,45 @@
 module Grids
 
-export ImmersedBoundaryGrid
+export ImmersedBoundaryGrid, GridConfig
 
 using Oceananigans
 using Oceananigans.BoundaryConditions: fill_halo_regions!
 using NCDatasets
 
 import Oceananigans.ImmersedBoundaries: ImmersedBoundaryGrid
+import Oceananigans: LatitudeLongitudeGrid
 using ..Utils: compute_faces
+
+"""
+    GridConfig
+
+Configuration for a `LatitudeLongitudeGrid` used in FjordSim simulations.
+
+# Fields
+- `size`: `(Nx, Ny, Nz)` number of cells.
+- `halo`: `(Hx, Hy, Hz)` number of halo cells.
+- `longitude`: `(west, east)` longitude bounds in degrees.
+- `latitude`: `(south, north)` latitude bounds in degrees.
+- `z_faces`: Vertical face coordinates in increasing order (bottom to top).
+"""
+Base.@kwdef struct GridConfig
+    size::NTuple{3,Int}
+    halo::NTuple{3,Int}
+    longitude::NTuple{2,Float64}
+    latitude::NTuple{2,Float64}
+    z_faces::Vector{Float64}
+end
+
+function LatitudeLongitudeGrid(arch, config::GridConfig)
+    return LatitudeLongitudeGrid(
+        arch;
+        size      = config.size,
+        halo      = config.halo,
+        longitude = config.longitude,
+        latitude  = config.latitude,
+        z         = config.z_faces,
+    )
+end
 
 """
         ImmersedBoundaryGrid(filepath::String, arch, halo)

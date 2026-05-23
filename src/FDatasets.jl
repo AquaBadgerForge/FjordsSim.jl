@@ -162,15 +162,15 @@ last_date(ds::Union{DSResults, DSForcing}, args...) = ds.last_date
 
 z_interfaces(metadata::Union{MetadatumResults, MetadatumForcing}) = metadata.dataset.z_interfaces
 
-function dataset_variable_name(metadata::Union{MetadatumResults, MetadatumForcing}) 
-    if haskey(Variable_names, metadata.name) 
+function dataset_variable_name(metadata::Union{MetadatumResults, MetadatumForcing})
+    if haskey(Variable_names, metadata.name)
         return Variable_names[metadata.name]
     end
     return metadata.name
 end
 
 function location(metadata::Union{MetadatumResults, MetadatumForcing})
-    if haskey(Variable_location, metadata.name) 
+    if haskey(Variable_location, metadata.name)
         return Variable_location[metadata.name]
     end
     # assume a tracer
@@ -193,7 +193,7 @@ inpainted_metadata_path(metadata::Union{MetadatumResults, MetadatumForcing}) = j
 
 """
     retrieve_data(metadata)
-    
+
 Retrieve data from netcdf file according to `metadata`.
 """
 function retrieve_data(metadata::Union{Metadatum{V} where V<:DSResults, Metadatum{V} where V<:DSForcing})

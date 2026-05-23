@@ -1,15 +1,14 @@
 using Oceananigans
 using Oceananigans.Units
-using CUDA
 using CairoMakie
 using Printf
 using Statistics
 using FjordSim
-using FjordSim.Bathymetry
-using FjordSim.SetupConfig: DEFAULT_SETUP_CONFIG_PATH, load_setup_config
 using Oceananigans.Architectures: on_architecture
 using Oceananigans.Fields: interior
 using Oceananigans.Grids: x_domain, y_domain
+
+const DEFAULT_CONFIG_PATH = joinpath(@__DIR__, "..", "configs", "drammensfjorden.jl")
 
 function plot_bathymetry(grid, bathymetry; plot_path, title = "Bathymetry", figure_size = (1000, 700))
     isdir(dirname(plot_path)) || mkpath(dirname(plot_path))
@@ -60,7 +59,7 @@ function plot_bathymetry(grid, bathymetry; plot_path, title = "Bathymetry", figu
 end
 
 function parse_args(args = ARGS)
-    config_path = DEFAULT_SETUP_CONFIG_PATH
+    config_path = DEFAULT_CONFIG_PATH
 
     i = 1
     while i <= length(args)
@@ -91,19 +90,8 @@ function print_usage()
       julia --project scripts/bathymetry_prepare.jl [--config PATH]
 
     Options:
-      --config PATH   Setup config. Default: configs/drammensfjorden.toml
+      --config PATH   Setup config (Julia file). Default: configs/drammensfjorden.jl
     """)
-end
-
-function build_grid(config; arch = CPU())
-    return LatitudeLongitudeGrid(
-        arch,
-        size = config.grid.size,
-        halo = config.grid.halo,
-        longitude = config.grid.longitude,
-        latitude = config.grid.latitude,
-        z = config.grid.z_faces,
-    )
 end
 
 function print_grid_extents(grid)
@@ -120,32 +108,19 @@ end
 
 function main()
     args = parse_args()
-    config = load_setup_config(args.config_path)
-    grid = build_grid(config)
-    bathymetry_config = config.bathymetry
+    config = include(abspath(args.config_path))
 
-    mkpath(bathymetry_config.output_dir)
+    grid = LatitudeLongitudeGrid(CPU(), config.grid)
+    mkpath(dirname(config.bathymetry.output_path))
     print_grid_extents(grid)
 
-    result = prepare_geonorge_bathymetry(
-        grid;
-        output_path = bathymetry_config.output_path,
-        geodatabase_path = bathymetry_config.geodatabase_path,
-        raw_resolution_factor = bathymetry_config.raw_resolution_factor,
-        padding_cells = bathymetry_config.padding_cells,
-        include_contours = bathymetry_config.include_contours,
-        contour_stride = bathymetry_config.contour_stride,
-        interpolation_passes = bathymetry_config.interpolation_passes,
-        major_basins = bathymetry_config.major_basins,
-        geonorge_cache = bathymetry_config.geonorge_cache,
-        regrid_cache = bathymetry_config.regrid_cache,
-    )
+    result = prepare_geonorge_bathymetry(grid, config.bathymetry)
 
-    plot_bathymetry(grid, result.bottom_height; plot_path = bathymetry_config.plot_path)
+    plot_bathymetry(grid, result.bottom_height; plot_path = config.bathymetry.plot_path)
 
     @info "Raw Geonorge bathymetry saved to $(result.raw_path)"
     @info "Processed FjordSim bathymetry saved to $(result.output_path)"
-    @info "Bathymetry plot saved to $(bathymetry_config.plot_path)"
+    @info "Bathymetry plot saved to $(config.bathymetry.plot_path)"
 end
 
 if abspath(PROGRAM_FILE) == @__FILE__() || get(ENV, "FJORDSIM_RUN_MAIN", "") == "1"

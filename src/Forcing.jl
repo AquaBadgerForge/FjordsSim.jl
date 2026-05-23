@@ -13,7 +13,27 @@ import Oceananigans: on_architecture
 import Oceananigans.Fields: set!
 import Oceananigans.OutputReaders: new_backend
 
-export forcing_from_file
+export forcing_from_file, NorKystConfig
+
+"""
+    NorKystConfig
+
+Configuration for downloading and subsetting NorKyst-800m reanalysis data.
+
+# Fields
+- `output_dir`: Directory where monthly NetCDF files are written.
+- `catalog_url`: THREDDS catalog URL listing available files.
+- `opendap_url`: OPeNDAP base URL for streaming data.
+- `parameters`: Variable names to extract (e.g. `["temperature", "salinity"]`).
+- `years`: Calendar years to download.
+"""
+Base.@kwdef struct NorKystConfig
+    output_dir::String
+    catalog_url::String
+    opendap_url::String
+    parameters::Vector{String}
+    years::Vector{Int}
+end
 
 """ Custom backend for FieldTimeSeries """
 struct NetCDFBackend <: AbstractInMemoryBackend{Int}

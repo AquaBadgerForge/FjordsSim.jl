@@ -3,6 +3,13 @@ module FjordSim
 export
     # oceananigans methods
     ImmersedBoundaryGrid,
+    LatitudeLongitudeGrid,
+    # configs
+    GridConfig,
+    BathymetryConfig,
+    NorKystConfig,
+    # bathymetry
+    prepare_geonorge_bathymetry,
     # forcings
     forcing_from_file,
     # boundary conditions
