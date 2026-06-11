@@ -4,7 +4,9 @@ export BathymetryConfig, prepare_geonorge_bathymetry
 
 using Scratch
 using ArchGDAL
+using Downloads
 using NCDatasets
+using p7zip_jll
 using NumericalEarth
 using Oceananigans
 using Oceananigans.Architectures: on_architecture
@@ -57,6 +59,10 @@ Base.@kwdef struct BathymetryConfig
 end
 
 const GEONORGE_LAND_LAYERS = ("landareal", "skjer")
+# Geonorge serves complete-dataset FileGDB archives as static zip files. The archive
+# basename matches the `.gdb` directory basename with a `.zip` extension, so the download
+# URL is derivable from the configured `geodatabase_path`.
+const GEONORGE_FGDB_BASE_URL = "https://nedlasting.geonorge.no/geonorge/Basisdata/Dybdedata/FGDB"
 # NumericalEarth bathymetry regridding constructs a native grid with halo = (10, 10, 1).
 # Keep the generated raw dataset comfortably larger than that minimum.
 const MIN_NATIVE_BATHYMETRY_SIZE = 24
@@ -112,6 +118,69 @@ function download_dataset(metadata::GeonorgeBathymetryMetadatum)
 end
 
 """
+    geonorge_geodatabase_url(geodatabase_path)
+
+Derive the Geonorge complete-dataset download URL for a local FileGDB path. The remote
+zip archive shares the `.gdb` directory basename with a `.zip` extension.
+"""
+function geonorge_geodatabase_url(geodatabase_path)
+    stem = replace(basename(geodatabase_path), r"\.gdb$" => "")
+    return "$(GEONORGE_FGDB_BASE_URL)/$(stem).zip"
+end
+
+"""
+    ensure_geodatabase(geodatabase_path)
+
+Ensure a Geonorge FileGDB directory exists at `geodatabase_path`, downloading and
+extracting it from Geonorge's public file server when absent. Returns `geodatabase_path`.
+"""
+function ensure_geodatabase(geodatabase_path)
+    isdir(geodatabase_path) && return geodatabase_path
+
+    url = geonorge_geodatabase_url(geodatabase_path)
+    destination_directory = dirname(geodatabase_path)
+    mkpath(destination_directory)
+
+    stem = replace(basename(geodatabase_path), r"\.gdb$" => "")
+    zip_path = joinpath(destination_directory, "$(stem).zip")
+    staging_directory = joinpath(destination_directory, "$(stem)_staging")
+
+    @info "Local Geonorge geodatabase not found at $geodatabase_path"
+    @info "Downloading Geonorge geodatabase from $url (this is a large file, ~2.3 GB)"
+
+    try
+        Downloads.download(url, zip_path)
+
+        isdir(staging_directory) && rm(staging_directory; recursive = true, force = true)
+        mkpath(staging_directory)
+
+        @info "Extracting Geonorge geodatabase to $geodatabase_path"
+        run(`$(p7zip()) x $zip_path -o$staging_directory -y`)
+
+        extracted = find_geodatabase_directory(staging_directory)
+        isnothing(extracted) && error("No .gdb directory found in Geonorge archive $url")
+
+        isdir(geodatabase_path) && rm(geodatabase_path; recursive = true, force = true)
+        mv(extracted, geodatabase_path)
+    finally
+        rm(zip_path; force = true)
+        rm(staging_directory; recursive = true, force = true)
+    end
+
+    @info "Finished preparing Geonorge geodatabase at $geodatabase_path"
+    return geodatabase_path
+end
+
+function find_geodatabase_directory(root)
+    for (directory, subdirectories, _) in walkdir(root)
+        for subdirectory in subdirectories
+            endswith(subdirectory, ".gdb") && return joinpath(directory, subdirectory)
+        end
+    end
+    return nothing
+end
+
+"""
     prepare_geonorge_bathymetry(target_grid; output_path, geodatabase_path, raw_dir=download_bathymetry_cache,
                                 raw_resolution_factor=4, padding_cells=0,
                                 include_contours=true, contour_stride=1,
@@ -154,7 +223,7 @@ function prepare_geonorge_bathymetry(
     raw_resolution_factor >= 1 || throw(ArgumentError("raw_resolution_factor must be >= 1"))
     padding_cells >= 0 || throw(ArgumentError("padding_cells must be >= 0"))
     contour_stride >= 1 || throw(ArgumentError("contour_stride must be >= 1"))
-    isdir(geodatabase_path) || error("Local Geonorge bathymetry geodatabase not found at $geodatabase_path.")
+    ensure_geodatabase(geodatabase_path)
 
     @info "Preparing Geonorge bathymetry"
     dataset = geonorge_dataset(
