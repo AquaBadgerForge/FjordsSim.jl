@@ -4,7 +4,7 @@ _data_root = expanduser("~/FjordSim_data/oslofjorden")
 
 (
     grid = GridConfig(
-        size      = (232, 105, 18),
+        size      = (240, 520, 18),
         halo      = (7, 7, 7),
         longitude = (10.2, 11.02),
         latitude  = (59.0, 59.93),
@@ -18,10 +18,10 @@ _data_root = expanduser("~/FjordSim_data/oslofjorden")
         plot_path             = joinpath(_data_root, "bathymetry.png"),
         geodatabase_path      = joinpath(expanduser("~/FjordSim_data"), "Basisdata_0000_Norge_25833_Dybdedata_FGDB.gdb"),
         raw_resolution_factor = 2,
-        padding_cells         = 0,
+        padding_cells         = 2,
         include_contours      = false,
-        contour_stride        = 1,
-        interpolation_passes  = 3,
+        contour_stride        = 10,
+        interpolation_passes  = 1,
         major_basins          = 1,
         geonorge_cache        = false,
         regrid_cache          = false,

@@ -20,7 +20,7 @@ _data_root = expanduser("~/FjordSim_data/drammensfjorden")
         contour_stride        = 10,
         interpolation_passes  = 1,
         major_basins          = 1,
-        geonorge_cache        = true,
+        geonorge_cache        = false,
         regrid_cache          = false,
     ),
     norkyst = NorKystConfig(
