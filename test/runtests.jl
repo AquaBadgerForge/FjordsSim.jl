@@ -4,6 +4,39 @@ using Test
 using NCDatasets
 using Oceananigans
 using Oceananigans.BoundaryConditions: FluxBoundaryCondition
+import Oceananigans: iteration
+import Oceananigans.Fields: interior
+import Oceananigans.Utils: prettytime
+
+struct MockProgressField
+    values
+end
+
+interior(field::MockProgressField) = field.values
+
+struct MockProgressSimulation
+    model
+    Δt
+end
+
+iteration(::MockProgressSimulation) = 7
+prettytime(::MockProgressSimulation) = "12 hours"
+
+function mock_progress_simulation()
+    u = MockProgressField([1.0, -2.0])
+    v = MockProgressField([0.5, -0.25])
+    w = MockProgressField([0.01, -0.02])
+    T = MockProgressField([3.0, 5.0])
+    NUT = MockProgressField([1.0, 2.5])
+    HET = MockProgressField([0.1, 0.4])
+
+    ocean_model = (
+        velocities = (u, v, w),
+        tracers = (T = T, NUT = NUT, HET = HET),
+    )
+
+    return MockProgressSimulation((ocean = (model = ocean_model,),), 1.0)
+end
 
 @testset "Backward Compatibility — API Exports" begin
     # Verify all exported symbols are present in the public interface
@@ -14,6 +47,7 @@ using Oceananigans.BoundaryConditions: FluxBoundaryCondition
         :coupled_hydrostatic_simulation,
         :recursive_merge,
         :progress,
+        :progress_callback,
         :cell_advection_timescale_coupled_model,
         :NORA3PrescribedAtmosphere,
         :NORA3PrescribedRadiation,
@@ -31,6 +65,7 @@ using Oceananigans.BoundaryConditions: FluxBoundaryCondition
         (:Utils, :extract_z_faces),
         (:Utils, :netcdf_to_jld2),
         (:Utils, :save_fts),
+        (:Utils, :progress_callback),
         (:FDatasets, :DSForcing),
         (:FDatasets, :DSResults),
         (:FDatasets, :last_date),
@@ -42,6 +77,22 @@ using Oceananigans.BoundaryConditions: FluxBoundaryCondition
     end
 
     @test isdefined(FjordSim, :Bathymetry)
+end
+
+@testset "Configurable progress logging" begin
+    sim = mock_progress_simulation()
+
+    @test_logs (:info, r"max\|u\|: .*extrema\(T\): \(5\.00, 3\.00\) ᵒC, extrema\(NUT\): \(2\.50, 1\.00\), wall time:") progress(
+        sim;
+        tracers = (:T, :NUT),
+        wall_time_reference = Ref(time_ns()),
+    )
+
+    callback = progress_callback(; tracers = (:HET,))
+    @test callback isa Function
+    @test_logs (:info, r"extrema\(HET\): \(0\.40, 0\.10\), wall time:") callback(sim)
+
+    @test_throws ArgumentError progress(sim; tracers = (:POM,), wall_time_reference = Ref(time_ns()))
 end
 
 @testset "Backward Compatibility — Function Signatures" begin

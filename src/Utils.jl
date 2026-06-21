@@ -2,6 +2,7 @@ module Utils
 
 export compute_faces,
     progress,
+    progress_callback,
     safe_execute,
     extract_z_faces,
     netcdf_to_jld2,
@@ -27,30 +28,55 @@ end
 
 const wall_time = Ref(time_ns())
 
-function progress(sim)
+_progress_tracers(tracers::Symbol) = (tracers,)
+
+function _progress_tracers(tracers)
+    tracer_names = Tuple(tracers)
+    all(tracer -> tracer isa Symbol, tracer_names) ||
+        throw(ArgumentError("progress tracers must be Symbols."))
+    return tracer_names
+end
+
+function _tracer_extrema_message(model_tracers, tracer_name)
+    if !hasproperty(model_tracers, tracer_name)
+        available_tracers = join([":" * String(name) for name in propertynames(model_tracers)], ", ")
+        throw(ArgumentError("Tracer :$tracer_name is not defined. Available tracers: $available_tracers."))
+    end
+
+    tracer = getproperty(model_tracers, tracer_name)
+    tracer_max = maximum(interior(tracer))
+    tracer_min = minimum(interior(tracer))
+    units = tracer_name === :T ? " ᵒC" : ""
+
+    return @sprintf("extrema(%s): (%.2f, %.2f)%s", String(tracer_name), tracer_max, tracer_min, units)
+end
+
+function progress(sim; tracers = (:T,), wall_time_reference = wall_time)
     ocean = sim.model.ocean
     u, v, w = ocean.model.velocities
-    T = ocean.model.tracers.T
-
-    Tmax = maximum(interior(T))
-    Tmin = minimum(interior(T))
 
     umax = (maximum(abs, interior(u)), maximum(abs, interior(v)), maximum(abs, interior(w)))
 
-    step_time = 1e-9 * (time_ns() - wall_time[])
+    step_time = 1e-9 * (time_ns() - wall_time_reference[])
 
     msg = @sprintf("Iter: %d, time: %s, Δt: %s", iteration(sim), prettytime(sim), prettytime(sim.Δt))
-    msg *= @sprintf(
-        ", max|u|: (%.2e, %.2e, %.2e) m s⁻¹, extrema(T): (%.2f, %.2f) ᵒC, wall time: %s",
-        umax...,
-        Tmax,
-        Tmin,
-        prettytime(step_time)
-    )
+    msg *= @sprintf(", max|u|: (%.2e, %.2e, %.2e) m s⁻¹", umax...)
+
+    tracer_names = _progress_tracers(tracers)
+    for tracer_name in tracer_names
+        msg *= ", " * _tracer_extrema_message(ocean.model.tracers, tracer_name)
+    end
+
+    msg *= @sprintf(", wall time: %s", prettytime(step_time))
 
     @info msg
 
-    wall_time[] = time_ns()
+    wall_time_reference[] = time_ns()
+end
+
+function progress_callback(; tracers = (:T,))
+    wall_time_reference = Ref(time_ns())
+    return sim -> progress(sim; tracers, wall_time_reference)
 end
 
 function safe_execute(callable)
