@@ -8,7 +8,6 @@ using Oceananigans.Architectures: on_architecture
 using Oceananigans.Fields: interior
 using Oceananigans.Grids: x_domain, y_domain
 
-const DEFAULT_CONFIG_PATH = joinpath(@__DIR__, "..", "configs", "drammensfjorden.jl")
 # Logical figure pixels per grid cell, and fixed margin for title/labels/colorbar.
 # Sized from the grid so every cell is rendered as a distinct, unambiguous block
 # rather than being blurred together by too few output pixels per cell.
@@ -79,7 +78,7 @@ function plot_bathymetry(
 end
 
 function parse_args(args = ARGS)
-    config_path = DEFAULT_CONFIG_PATH
+    config_path = nothing
 
     i = 1
     while i <= length(args)
@@ -99,6 +98,8 @@ function parse_args(args = ARGS)
         end
     end
 
+    isnothing(config_path) && error("--config PATH is required")
+
     return (; config_path)
 end
 
@@ -107,10 +108,10 @@ function print_usage()
     Prepare Geonorge bathymetry for a configured FjordSim setup.
 
     Usage:
-      julia --project scripts/bathymetry_prepare.jl [--config PATH]
+      julia --project scripts/bathymetry_prepare.jl --config PATH
 
     Options:
-      --config PATH   Setup config (Julia file). Default: configs/drammensfjorden.jl
+      --config PATH   Setup config (Julia file). Required, e.g. configs/oslofjorden.jl
     """)
 end
 

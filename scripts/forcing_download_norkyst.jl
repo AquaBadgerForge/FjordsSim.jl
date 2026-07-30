@@ -4,10 +4,8 @@ using Downloads
 using FjordSim
 using NCDatasets
 
-const DEFAULT_CONFIG_PATH = joinpath(@__DIR__, "..", "configs", "drammensfjorden.jl")
-
 function parse_args(args = ARGS)
-    config_path = DEFAULT_CONFIG_PATH
+    config_path = nothing
 
     i = 1
     while i <= length(args)
@@ -27,6 +25,8 @@ function parse_args(args = ARGS)
         end
     end
 
+    isnothing(config_path) && error("--config PATH is required")
+
     config = include(abspath(config_path))
     return (
         config = config,
@@ -39,10 +39,10 @@ function print_usage()
     Download and combine NorKyst-800m monthly data for configured years.
 
     Usage:
-      julia --project scripts/forcing_download_norkyst.jl [--config PATH]
+      julia --project scripts/forcing_download_norkyst.jl --config PATH
 
     Options:
-      --config PATH      Setup config (Julia file). Default: configs/drammensfjorden.jl
+      --config PATH      Setup config (Julia file). Required, e.g. configs/oslofjorden.jl
     """)
 end
 
