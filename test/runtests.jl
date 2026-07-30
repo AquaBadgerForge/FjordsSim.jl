@@ -1,6 +1,7 @@
 using FjordSim
 using FjordSim.Bathymetry: write_bathymetry_file
 using Test
+using ArchGDAL
 using NCDatasets
 using Oceananigans
 using Oceananigans.BoundaryConditions: FluxBoundaryCondition
@@ -188,5 +189,116 @@ end
         @test_nowarn ImmersedBoundaryGrid(bathymetry_path, arch, (1, 1, 1))
         @test FjordSim.Bathymetry.contour_point_indices(10, 3) == [0, 3, 6, 9]
         @test FjordSim.Bathymetry.contour_point_indices(5, 3) == [0, 3, 4]
+    end
+end
+
+@testset "Bathymetry point sampling (bulk coordinate transform)" begin
+    # Synthetic dybdepunkt/dybdekurve-like layers in EPSG:25833, built on a Memory
+    # dataset so this test needs no real Geonorge FileGDB.
+    source_points = [(10000.0, 6_600_000.0), (10500.0, 6_600_500.0), (11000.0, 6_601_000.0)]
+    source_depths = [5.0, -12.5, 30.0]
+
+    contour_vertices =
+        [(20000.0, 6_610_000.0), (20100.0, 6_610_100.0), (20200.0, 6_610_200.0), (20300.0, 6_610_300.0)]
+    contour_depth = 42.0
+    contour_stride = 2
+
+    xs = Float64[]
+    ys = Float64[]
+    bottom_heights = Float64[]
+
+    ArchGDAL.importEPSG(25833; order = :trad) do source_srs
+        ArchGDAL.create(ArchGDAL.getdriver("Memory")) do dataset
+            ArchGDAL.createlayer(
+                name = "dybdepunkt",
+                dataset = dataset,
+                geom = ArchGDAL.wkbPoint,
+                spatialref = source_srs,
+            ) do layer
+                ArchGDAL.addfielddefn!(layer, "dybde", ArchGDAL.OFTReal)
+                depth_index = ArchGDAL.findfieldindex(layer, "dybde", false)
+                for ((x, y), depth) in zip(source_points, source_depths)
+                    ArchGDAL.createfeature(layer) do feature
+                        ArchGDAL.setfield!(feature, depth_index, depth)
+                        ArchGDAL.setgeom!(feature, 0, ArchGDAL.createpoint(x, y))
+                        return nothing
+                    end
+                end
+            end
+
+            ArchGDAL.createlayer(
+                name = "dybdekurve",
+                dataset = dataset,
+                geom = ArchGDAL.wkbMultiLineString,
+                spatialref = source_srs,
+            ) do layer
+                ArchGDAL.addfielddefn!(layer, "dybde", ArchGDAL.OFTReal)
+                depth_index = ArchGDAL.findfieldindex(layer, "dybde", false)
+                wkt_points = join(("$x $y" for (x, y) in contour_vertices), ", ")
+                ArchGDAL.createfeature(layer) do feature
+                    ArchGDAL.setfield!(feature, depth_index, contour_depth)
+                    ArchGDAL.setgeom!(feature, 0, ArchGDAL.fromWKT("MULTILINESTRING (($wkt_points))"))
+                    return nothing
+                end
+            end
+
+            FjordSim.Bathymetry.collect_depth_layer_coordinates!(
+                xs,
+                ys,
+                bottom_heights,
+                dataset,
+                "dybdepunkt",
+                0.0,
+                6_500_000.0,
+                100_000.0,
+                6_700_000.0;
+                geometry = :point,
+            )
+            FjordSim.Bathymetry.collect_depth_layer_coordinates!(
+                xs,
+                ys,
+                bottom_heights,
+                dataset,
+                "dybdekurve",
+                0.0,
+                6_500_000.0,
+                100_000.0,
+                6_700_000.0;
+                geometry = :line,
+                contour_stride,
+            )
+        end
+    end
+
+    expected_contour_indices = FjordSim.Bathymetry.contour_point_indices(length(contour_vertices), contour_stride)
+    npoints = length(source_points)
+
+    @test length(xs) == npoints + length(expected_contour_indices)
+    @test xs[1:npoints] == first.(source_points)
+    @test ys[1:npoints] == last.(source_points)
+    @test bottom_heights[1:npoints] == -abs.(source_depths)
+    @test xs[npoints+1:end] == first.(contour_vertices[expected_contour_indices.+1])
+    @test ys[npoints+1:end] == last.(contour_vertices[expected_contour_indices.+1])
+    @test all(==(-abs(contour_depth)), bottom_heights[npoints+1:end])
+
+    # The single bulk transform now used by `sample_bathymetry_points!` must match
+    # transforming each point individually — the per-point behavior it replaces.
+    n = length(xs)
+    bulk_xs, bulk_ys = copy(xs), copy(ys)
+
+    ArchGDAL.importEPSG(25833; order = :trad) do source_srs
+        ArchGDAL.importEPSG(4326; order = :trad) do target_srs
+            ArchGDAL.createcoordtrans(source_srs, target_srs) do transform
+                ArchGDAL.transform!(bulk_xs, bulk_ys, zeros(Float64, n), transform)
+
+                for i = 1:n
+                    point = ArchGDAL.createpoint(xs[i], ys[i])
+                    ArchGDAL.transform!(point, transform)
+                    px, py, _ = ArchGDAL.getpoint(point, 0)
+                    @test bulk_xs[i] ≈ px
+                    @test bulk_ys[i] ≈ py
+                end
+            end
+        end
     end
 end

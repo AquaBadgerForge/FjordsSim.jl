@@ -534,34 +534,52 @@ function sample_bathymetry_points!(
     contour_stride::Int = 1,
 )
     xmin, ymin, xmax, ymax = filter_bounds
-    point_count = 0
+    xs = Float64[]
+    ys = Float64[]
+    bottom_heights = Float64[]
 
     ArchGDAL.read(geodatabase_path) do dataset
-        point_count += sample_depth_layer!(
-            point_layer,
+        collect_depth_layer_coordinates!(
+            xs,
+            ys,
+            bottom_heights,
             dataset,
             "dybdepunkt",
-            transform,
             xmin,
             ymin,
             xmax,
             ymax;
             geometry = :point,
         )
-        include_contours && (
-            point_count += sample_depth_layer!(
-                point_layer,
-                dataset,
-                "dybdekurve",
-                transform,
-                xmin,
-                ymin,
-                xmax,
-                ymax;
-                geometry = :line,
-                contour_stride,
-            )
+        include_contours && collect_depth_layer_coordinates!(
+            xs,
+            ys,
+            bottom_heights,
+            dataset,
+            "dybdekurve",
+            xmin,
+            ymin,
+            xmax,
+            ymax;
+            geometry = :line,
+            contour_stride,
         )
+    end
+
+    point_count = length(xs)
+    point_count > 0 || return 0
+
+    # Transform the whole point cloud in a single GDAL call instead of one call per
+    # point/vertex, which otherwise dominates wall-clock time for dense sounding data.
+    ArchGDAL.transform!(xs, ys, zeros(Float64, point_count), transform)
+
+    z_field_index = ArchGDAL.findfieldindex(point_layer, "z", false)
+    for i = 1:point_count
+        ArchGDAL.createfeature(point_layer) do feature
+            ArchGDAL.setfield!(feature, z_field_index, bottom_heights[i])
+            ArchGDAL.setgeom!(feature, 0, ArchGDAL.createpoint(xs[i], ys[i]))
+            return nothing
+        end
     end
 
     return point_count
@@ -596,11 +614,12 @@ function sample_land_features!(land_layer, geodatabase_path, transform, filter_b
     return nothing
 end
 
-function sample_depth_layer!(
-    point_layer,
+function collect_depth_layer_coordinates!(
+    xs,
+    ys,
+    bottom_heights,
     dataset,
     layer_name,
-    transform,
     xmin,
     ymin,
     xmax,
@@ -609,11 +628,10 @@ function sample_depth_layer!(
     contour_stride::Int = 1,
 )
     layer = find_layer(dataset, layer_name)
-    isnothing(layer) && return 0
+    isnothing(layer) && return nothing
 
     ArchGDAL.setspatialfilter!(layer, xmin, ymin, xmax, ymax)
     depth_index = ArchGDAL.findfieldindex(layer, "dybde", false)
-    point_count = 0
 
     for feature in layer
         depth = ArchGDAL.getfield(feature, depth_index)
@@ -621,69 +639,53 @@ function sample_depth_layer!(
 
         bottom_height = -abs(Float64(depth))
         geometry == :point &&
-            (point_count += add_point_geometry!(point_layer, ArchGDAL.getgeom(feature), transform, bottom_height))
-        geometry == :line && (
-            point_count += add_linestring_points!(
-                point_layer,
-                ArchGDAL.getgeom(feature),
-                transform,
-                bottom_height;
-                stride = contour_stride,
-            )
+            collect_point_coordinates!(xs, ys, bottom_heights, ArchGDAL.getgeom(feature), bottom_height)
+        geometry == :line && collect_linestring_coordinates!(
+            xs,
+            ys,
+            bottom_heights,
+            ArchGDAL.getgeom(feature),
+            bottom_height;
+            stride = contour_stride,
         )
     end
 
-    return point_count
+    return nothing
 end
 
-function add_point_geometry!(point_layer, point_geometry, transform, bottom_height)
-    point = ArchGDAL.clone(point_geometry)
-    ArchGDAL.transform!(point, transform)
-    longitude, latitude, _ = ArchGDAL.getpoint(point, 0)
-
-    ArchGDAL.createfeature(point_layer) do feature
-        ArchGDAL.setfield!(feature, ArchGDAL.findfieldindex(feature, "z"), bottom_height)
-        ArchGDAL.setgeom!(feature, 0, ArchGDAL.createpoint(longitude, latitude))
-        return nothing
-    end
-
-    return 1
+function collect_point_coordinates!(xs, ys, bottom_heights, point_geometry, bottom_height)
+    x, y, _ = ArchGDAL.getpoint(point_geometry, 0)
+    push!(xs, x)
+    push!(ys, y)
+    push!(bottom_heights, bottom_height)
+    return nothing
 end
 
-function add_linestring_points!(point_layer, line, transform, bottom_height; stride::Int = 1)
+function collect_linestring_coordinates!(xs, ys, bottom_heights, line, bottom_height; stride::Int = 1)
     if ArchGDAL.geomname(line) == "MULTILINESTRING"
-        added = 0
         for geometry_index = 0:ArchGDAL.ngeom(line)-1
-            added += add_linestring_points!(
-                point_layer,
+            collect_linestring_coordinates!(
+                xs,
+                ys,
+                bottom_heights,
                 ArchGDAL.getgeom(line, geometry_index),
-                transform,
                 bottom_height;
                 stride,
             )
         end
-        return added
+        return nothing
     end
 
     npoints = ArchGDAL.ngeom(line)
-    added = 0
 
     for point_index in contour_point_indices(npoints, stride)
         x, y, _ = ArchGDAL.getpoint(line, point_index)
-        point = ArchGDAL.createpoint(x, y)
-        ArchGDAL.transform!(point, transform)
-        longitude, latitude, _ = ArchGDAL.getpoint(point, 0)
-
-        ArchGDAL.createfeature(point_layer) do feature
-            ArchGDAL.setfield!(feature, ArchGDAL.findfieldindex(feature, "z"), bottom_height)
-            ArchGDAL.setgeom!(feature, 0, ArchGDAL.createpoint(longitude, latitude))
-            return nothing
-        end
-
-        added += 1
+        push!(xs, x)
+        push!(ys, y)
+        push!(bottom_heights, bottom_height)
     end
 
-    return added
+    return nothing
 end
 
 function contour_point_indices(npoints, stride)
