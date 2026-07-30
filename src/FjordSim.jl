@@ -19,6 +19,9 @@ export
     geodatabase_path,
     # forcings
     forcing_from_file,
+    forcing_path,
+    forcing_plot_path,
+    prepare_norkyst_forcing,
     norkyst_directory,
     norkyst_monthly_filename,
     # boundary conditions

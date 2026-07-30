@@ -24,9 +24,14 @@ FjordConfig(
         regrid_cache          = false,
     ),
     forcing_config = NorKystConfig(
-        data_root        = _data_root,
-        output_directory = "norkyst",
-        parameters       = ["temperature", "salinity", "u_eastward", "v_northward"],
-        years            = [2020],
+        data_root            = _data_root,
+        output_directory     = "norkyst",
+        output_file          = "forcing.nc",
+        plot_file            = "forcing.png",
+        relaxation_edge      = :south,
+        relaxation_cells     = 10,
+        relaxation_timescale = 86400.0,
+        parameters           = ["temperature", "salinity", "u_eastward", "v_northward"],
+        years                = [2020],
     ),
 )

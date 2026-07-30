@@ -33,6 +33,10 @@ abstract type AbstractBathymetryConfig end
 Supertype for forcing configurations. A concrete subtype describes one forcing dataset and
 how to download and subset it.
 
+Subtypes are expected to provide `data_root`, `output_file` and `plot_file`, which
+`forcing_path` and `forcing_plot_path` resolve. Dataset-specific behavior is added by
+overloading on the concrete subtype.
+
 `FjordSim.Forcing.NorKystConfig` is the built-in implementation, for NorKyst-800m.
 """
 abstract type AbstractForcingConfig end

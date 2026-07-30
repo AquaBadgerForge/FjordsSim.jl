@@ -5,8 +5,14 @@ using Oceananigans.Units: Time
 using Oceananigans.OutputReaders: Cyclical, AbstractInMemoryBackend, FlavorOfFTS, time_indices
 using Oceananigans.Operators: Ax, Ay, Az, volume
 using Oceananigans: fill_halo_regions!, nodes, interior
-using Dates: Second
+using Oceananigans.Grids: active_cell, peripheral_node
+using Oceananigans.Fields: interpolate
+using Oceananigans.Utils: launch!
+using KernelAbstractions: @kernel, @index, @Const
+using Dates: DateTime, Day, Millisecond, Second
+import Dates
 using Adapt
+using ArchGDAL
 using NCDatasets
 
 import Oceananigans: on_architecture
@@ -15,7 +21,13 @@ import Oceananigans.OutputReaders: new_backend
 
 using ..Configs: AbstractForcingConfig
 
-export forcing_from_file, norkyst_directory, norkyst_monthly_filename, NorKystConfig
+export forcing_from_file,
+    forcing_path,
+    forcing_plot_path,
+    norkyst_directory,
+    norkyst_monthly_filename,
+    prepare_norkyst_forcing,
+    NorKystConfig
 
 const NORKYST_CATALOG_URL = "https://thredds.met.no/thredds/catalog/fou-hi/norkyst800m/catalog.xml"
 const NORKYST_OPENDAP_URL = "https://thredds.met.no/thredds/dodsC/fou-hi/norkyst800m/"
@@ -36,12 +48,19 @@ A setup states where its forcing goes, which variables to extract and which year
 Only `catalog_url` and `opendap_url` are defaulted, being the NorKyst dataset's own public
 endpoints.
 
-`output_directory` is a name relative to `data_root`, resolved by `norkyst_directory`.
-Setting it to an absolute path overrides `data_root`.
+`output_directory`, `output_file` and `plot_file` are names relative to `data_root`, resolved
+by `norkyst_directory`, `forcing_path` and `forcing_plot_path`. Setting one to an absolute
+path overrides `data_root` for that entry only.
 
 # Fields
 - `data_root`: Directory holding this setup's forcing files. Required.
 - `output_directory`: Name of the directory where monthly NetCDF files are written. Required.
+- `output_file`: Name of the prepared forcing NetCDF written by `prepare_norkyst_forcing`.
+- `plot_file`: Name of the diagnostic forcing plot.
+- `relaxation_edge`: Lateral boundary the forcing relaxes towards NorKyst on, one of
+  `:south`, `:north`, `:west` or `:east`.
+- `relaxation_cells`: Width of the relaxation band in grid cells.
+- `relaxation_timescale`: Relaxation timescale in seconds; the written lambda is its inverse.
 - `catalog_url`: THREDDS catalog URL listing available files.
 - `opendap_url`: OPeNDAP base URL for streaming data.
 - `parameters`: Variable names to extract (e.g. `["temperature", "salinity"]`). Required.
@@ -50,6 +69,11 @@ Setting it to an absolute path overrides `data_root`.
 Base.@kwdef mutable struct NorKystConfig <: AbstractForcingConfig
     data_root::String
     output_directory::String
+    output_file::String = "forcing.nc"
+    plot_file::String = "forcing.png"
+    relaxation_edge::Symbol = :south
+    relaxation_cells::Int = 10
+    relaxation_timescale::Float64 = 86400.0
     catalog_url::String = NORKYST_CATALOG_URL
     opendap_url::String = NORKYST_OPENDAP_URL
     parameters::Vector{String}
@@ -63,6 +87,17 @@ Resolve `config.output_directory` against `config.data_root`. An absolute
 `output_directory` is returned unchanged.
 """
 norkyst_directory(config::NorKystConfig) = joinpath(config.data_root, config.output_directory)
+
+"""
+    forcing_path(config)
+    forcing_plot_path(config)
+
+Resolve `config.output_file` and `config.plot_file` against `config.data_root`. Defined for
+every `AbstractForcingConfig`, so a new forcing dataset inherits path resolution. A field
+holding an absolute path is returned unchanged, relocating that file outside `data_root`.
+"""
+forcing_path(config::AbstractForcingConfig) = joinpath(config.data_root, config.output_file)
+forcing_plot_path(config::AbstractForcingConfig) = joinpath(config.data_root, config.plot_file)
 
 """ Custom backend for FieldTimeSeries """
 struct NetCDFBackend <: AbstractInMemoryBackend{Int}
@@ -165,13 +200,13 @@ end
 
 function load_from_netcdf(; path::String, var_name::String, grid_size::Tuple, time_indices_in_memory::Tuple)
     ds = NCDataset(path)
-    var = coalesce.(ds[var_name], -999.0)
+    var = ds[var_name]
     native_times = ds["time"]
 
     data = zeros(Float64, (grid_size[1:end]..., length(time_indices_in_memory)))
     j = 1
     for i in time_indices_in_memory
-        @views data[:, :, :, j] .= var[:, :, :, i]
+        @views data[:, :, :, j] .= coalesce.(var[:, :, :, i], -999.0)
         j += 1
     end
     times = convert.(Int64, native_times_to_seconds(native_times))
@@ -266,6 +301,887 @@ function forcing_from_file(; grid, filepath, tracers)
     )
 
     return result
+end
+
+"""
+    forcing_from_file(config::AbstractForcingConfig; grid, tracers)
+
+Return the forcing named tuple for the prepared forcing file this setup names, resolved by
+`forcing_path`. `config` is positional so the method dispatches on it.
+"""
+forcing_from_file(config::AbstractForcingConfig; grid, tracers) =
+    forcing_from_file(; grid, filepath = forcing_path(config), tracers)
+
+# --- NorKyst forcing preparation ---
+
+# NorKyst variable names and the FjordSim forcing names they become. Only the intersection of
+# this mapping with `config.parameters` is prepared.
+const NORKYST_VARIABLE_NAMES = Dict(
+    "temperature" => "T",
+    "salinity" => "S",
+    "u_eastward" => "u",
+    "v_northward" => "v",
+)
+# Scalar NorKyst variable whose `proj4` attribute defines the projected X/Y coordinates.
+const NORKYST_PROJECTION_VARIABLE = "projection_stere"
+const FORCING_DEFLATE_LEVEL = 5
+const RELAXATION_EDGES = (:south, :north, :west, :east)
+# Longest run of missing days interpolated without a separate warning, matching the default of
+# `NumericalEarth.DataWrangling.fill_gaps!`.
+const FORCING_MAX_GAP = 6
+const MILLISECONDS_PER_DAY = 86_400_000
+
+"""
+    validate_relaxation_edge(edge)
+
+Return `edge` if it names a lateral boundary, else throw. Checked up front so a typo fails
+before any regridding rather than deep inside the variable loop.
+"""
+function validate_relaxation_edge(edge)
+    edge in RELAXATION_EDGES ||
+        throw(ArgumentError("relaxation_edge must be one of $RELAXATION_EDGES, got :$edge"))
+    return edge
+end
+
+"""
+    NorKystSourceGrid
+
+Geometry of a downloaded NorKyst subset: the regular projected coordinates the data lives on,
+its depth levels and the projection they are defined in.
+
+# Fields
+- `x`, `y`: Projected coordinate centers in meters, regularly spaced.
+- `depths`: Depth levels in meters, positive down.
+- `proj4`: PROJ.4 definition of the projection, read from `NORKYST_PROJECTION_VARIABLE`.
+"""
+struct NorKystSourceGrid
+    x::Vector{Float64}
+    y::Vector{Float64}
+    depths::Vector{Float64}
+    proj4::String
+end
+
+"""
+    SourceFill
+
+Where every masked NorKyst cell takes its value from, so that a filled source slab can be handed
+to `Oceananigans.Fields.interpolate` without a `NaN` anywhere in it.
+
+Built once per variable from the first time step, because the mask is a property of the dataset
+rather than of the step. `nearest` is a linear index into the `(NX, NY)` plane of the same level;
+levels with no valid cell at all (NorKyst levels deeper than the fjord) are marked in
+`level_valid` and filled from the deepest level that does have data.
+
+This is not `NumericalEarth`'s `inpaint_mask!`: that re-`NaN`s every masked cell before
+propagating horizontally, discarding its own `continue_downwards!` pass, so a fully masked level
+has nothing to spread from. With the default `NearestNeighborInpainting(Inf)` it then never
+terminates, and with a finite cap `_fill_nans!` turns the level into zeros — a plausible-looking
+fabricated temperature or salinity.
+
+# Fields
+- `valid`: Whether each source cell holds data.
+- `nearest`: `(NX, NY, levels)` linear index of the nearest valid cell in the same level.
+- `level_valid`: Whether a level has any valid cell inside the subset.
+"""
+struct SourceFill
+    valid::BitArray{3}
+    nearest::Array{Int32,3}
+    level_valid::Vector{Bool}
+end
+
+"""
+    SourceRecord
+
+One time record present in a downloaded monthly NorKyst file.
+
+# Fields
+- `date`: Time of the record.
+- `filepath`: Monthly NorKyst file holding it.
+- `index`: Time index within that file.
+"""
+struct SourceRecord
+    date::DateTime
+    filepath::String
+    index::Int
+end
+
+"""
+    ForcingTimeStep
+
+One output time step and the source records it is built from.
+
+A step present in the download reads a single record (`lower === upper`, `weight == 0`). A day
+missing from the download is the linear interpolation of the records bracketing it, following
+`NumericalEarth.DataWrangling.fill_gaps!`.
+
+# Fields
+- `date`: Time of the output step.
+- `lower`, `upper`: Bracketing source records; equal when the step is present in the download.
+- `weight`: Weight of `upper`; zero when the step is present in the download.
+"""
+struct ForcingTimeStep
+    date::DateTime
+    lower::SourceRecord
+    upper::SourceRecord
+    weight::Float32
+end
+
+"""
+    PreparedVariable
+
+Everything needed to write one forcing variable: where it comes from, the land mask and target
+nodes of its Oceananigans location, how to fill its source mask, and its relaxation lambdas.
+
+`x` and `y` are the target nodes projected into the NorKyst coordinate system, held as 2D arrays
+so the interpolation kernel only indexes them.
+"""
+struct PreparedVariable
+    source_name::String
+    name::String
+    dimensions::NTuple{4,String}
+    mask::Array{Bool,3}
+    x::Matrix{Float64}
+    y::Matrix{Float64}
+    z::Vector{Float64}
+    mask_fill::SourceFill
+    lambda::Array{Float32,3}
+end
+
+"""
+    prepare_norkyst_forcing(target_grid, config::NorKystConfig; architecture = CPU())
+
+Regrid the NorKyst-800m monthly files already downloaded into `norkyst_directory(config)` onto
+`target_grid`, and write a forcing NetCDF at `forcing_path(config)` that `forcing_from_file`
+reads directly.
+
+`target_grid` should be the `ImmersedBoundaryGrid` the simulation runs on, so the output
+dimensions and land mask match it exactly — the mask comes from `peripheral_node`, the same
+predicate the model uses. Interpolation is one trilinear `Oceananigans.Fields.interpolate` call
+per target cell, taken in the NorKyst projection and clamped at the vertical ends. Cells the model
+treats as land are written as `NaN`, which `forcing_from_file` reads back as the `value > -990`
+sentinel the forcing kernel skips. Days missing from the download are interpolated between their
+neighbours.
+
+`architecture` selects where the interpolation kernel runs and is independent of `target_grid`,
+which must stay on the CPU: building the masks walks `peripheral_node` cell by cell, which needs
+scalar access to the bathymetry. Only the target nodes, mask and output buffer are moved to
+`architecture`, and only the finished slab comes back for each write, so a GPU run keeps the same
+streaming memory profile.
+
+Relaxation lambdas are `1 / config.relaxation_timescale` in the `config.relaxation_cells`-wide
+band along `config.relaxation_edge` and zero elsewhere, so only that band relaxes towards
+NorKyst.
+
+# Why the interpolation is not `NumericalEarth`'s
+
+The NorKyst grid is rotated about 59 degrees from east in the Oslofjord region, so it cannot be
+a `LatitudeLongitudeGrid`; treating its 2D `lon`/`lat` as separable is wrong by roughly 100 grid
+cells. `NumericalEarth`'s dataset path (`native_grid`, `set!(field, metadata)`,
+`DatasetRestoring`) always builds a `LatitudeLongitudeGrid`, and `Oceananigans`' field-to-field
+`interpolate!` cannot bridge lon/lat and projected meters, so neither applies here. The NORA3
+atmosphere avoids this only because its file has already been regridded to a regular lon/lat
+grid upstream. What does work is projecting the target nodes and interpolating against a
+`RectilinearGrid` in projected meters; see `source_field_grid` and `interpolate_to_target!`.
+
+# Returns
+A named tuple with `output_file`, `times` and `variables` (the written variable names).
+"""
+function prepare_norkyst_forcing(target_grid, config::NorKystConfig; architecture = CPU())
+    source_names = [name for name in config.parameters if haskey(NORKYST_VARIABLE_NAMES, name)]
+    isempty(source_names) && error(
+        "None of the configured parameters $(config.parameters) map to a forcing variable. " *
+        "Known NorKyst variables: $(sort(collect(keys(NORKYST_VARIABLE_NAMES)))).",
+    )
+
+    validate_relaxation_edge(config.relaxation_edge)
+
+    steps = daily_time_steps(norkyst_time_steps(config))
+    reference_file = first(steps).lower.filepath
+    source = norkyst_source_grid(reference_file)
+    @info "Preparing NorKyst forcing from $(length(unique(step -> step.lower.filepath, steps))) file(s), " *
+          "$(length(steps)) time steps: $(first(steps).date) to $(last(steps).date)"
+
+    variables = [prepared_variable(name, target_grid, source, reference_file, config) for name in source_names]
+
+    output_file = forcing_path(config)
+    @info "Writing forcing file to $output_file, interpolating on $(summary(architecture))"
+    write_forcing_file(output_file, target_grid, variables, steps, source, architecture)
+    @info "Finished preparing NorKyst forcing"
+
+    return (; output_file, times = [step.date for step in steps], variables = [variable.name for variable in variables])
+end
+
+"""
+    norkyst_time_steps(config::NorKystConfig)
+
+Every time record of every downloaded monthly file for `config.years`, sorted by date with
+duplicates dropped. Errors if the directory or the files are missing.
+"""
+function norkyst_time_steps(config::NorKystConfig)
+    directory = norkyst_directory(config)
+    isdir(directory) || error(
+        "NorKyst directory $directory does not exist. " *
+        "Run scripts/forcing_download_norkyst.jl for this config first.",
+    )
+
+    records = SourceRecord[]
+    for year in config.years, month = 1:12
+        filepath = joinpath(directory, norkyst_monthly_filename(year, month))
+        isfile(filepath) || continue
+        NCDataset(filepath) do ds
+            for (index, date) in enumerate(ds["time"][:])
+                push!(records, SourceRecord(DateTime(date), filepath, index))
+            end
+        end
+    end
+
+    isempty(records) && error("No NorKyst monthly files for years $(config.years) found in $directory.")
+    sort!(records; by = record -> record.date)
+
+    return unique(record -> record.date, records)
+end
+
+"""
+    daily_time_steps(records; max_gap = FORCING_MAX_GAP)
+
+Complete `records` to a gap-free daily axis, linearly interpolating any missing day between the
+records bracketing it. Downloaded NorKyst months are occasionally short a day, which would
+otherwise leave a hole in the cyclical forcing period.
+
+A gap longer than `max_gap` days is still interpolated, but warned about separately: MET's
+archive is missing whole weeks in 2017 and 2018, and papering over those silently would
+misrepresent the forcing. Returned as single-record steps if the times are not on a whole-day
+cadence.
+"""
+function daily_time_steps(records; max_gap = FORCING_MAX_GAP)
+    single(record) = ForcingTimeStep(record.date, record, record, 0)
+
+    differences = diff([record.date for record in records])
+    if !all(difference -> difference % Day(1) == Millisecond(0), differences)
+        @warn "NorKyst times are not on a whole-day cadence; using them as downloaded."
+        return map(single, records)
+    end
+
+    steps = ForcingTimeStep[]
+    interpolated = DateTime[]
+
+    for n = 1:length(records)-1
+        lower = records[n]
+        upper = records[n+1]
+        push!(steps, single(lower))
+
+        span = Dates.value(upper.date - lower.date) ÷ MILLISECONDS_PER_DAY
+        span > max_gap + 1 && @warn "NorKyst gap of $(span - 1) day(s) after $(lower.date) " *
+                                    "exceeds max_gap = $max_gap; interpolating anyway"
+
+        for missing_day = 1:span-1
+            date = lower.date + Day(missing_day)
+            push!(interpolated, date)
+            push!(steps, ForcingTimeStep(date, lower, upper, missing_day / span))
+        end
+    end
+    push!(steps, single(last(records)))
+
+    isempty(interpolated) ||
+        @warn "Interpolated $(length(interpolated)) missing NorKyst day(s): $(join(interpolated, ", "))"
+
+    return steps
+end
+
+"""
+    norkyst_source_grid(filepath)
+
+Read the projected coordinates, depth levels and projection of a downloaded NorKyst subset.
+Errors unless the projected coordinates are regularly spaced, which `source_field_grid` needs in
+order to express them as a `RectilinearGrid`.
+"""
+function norkyst_source_grid(filepath)
+    return NCDataset(filepath) do ds
+        x = Array{Float64}(ds["X"][:])
+        y = Array{Float64}(ds["Y"][:])
+        depths = Array{Float64}(ds["depth"][:])
+        proj4 = NCDatasets.variable(ds, NORKYST_PROJECTION_VARIABLE).attrib["proj4"]
+
+        length(x) >= 2 && length(y) >= 2 ||
+            error("NorKyst subset in $filepath is too small to interpolate from: $(length(x))x$(length(y)).")
+        all(difference -> isapprox(difference, x[2] - x[1]), diff(x)) &&
+            all(difference -> isapprox(difference, y[2] - y[1]), diff(y)) ||
+            error("NorKyst projected coordinates in $filepath are not regularly spaced.")
+
+        return NorKystSourceGrid(x, y, depths, proj4)
+    end
+end
+
+"""
+    water_mask(target_grid, LX, LY, edge)
+
+Water flag per cell of `target_grid` at the location `(LX, LY, Center)`, taken from
+`Oceananigans.Grids.peripheral_node` so that it is by construction the same predicate the model
+uses. That covers the staggering: a velocity face is peripheral when either tracer cell it
+separates is inactive, and `PartialCellBottom` decides "inactive" with its own
+`minimum_fractional_cell_height` rather than a hand-rolled cell-center test.
+
+`edge` names the open lateral boundary, whose outermost face row `open_boundary_water!` restores.
+"""
+function water_mask(target_grid, LX, LY, edge)
+    Nx, Ny, Nz = size(target_grid)
+    nx = LX === Face ? Nx + 1 : Nx
+    ny = LY === Face ? Ny + 1 : Ny
+
+    mask = falses(nx, ny, Nz)
+    for k = 1:Nz, j = 1:ny, i = 1:nx
+        mask[i, j, k] = !peripheral_node(i, j, k, target_grid, LX(), LY(), Center())
+    end
+
+    return open_boundary_water!(mask, target_grid, LX, LY, edge)
+end
+
+"""
+    open_boundary_water!(mask, target_grid, LX, LY, edge)
+
+Mark the velocity faces lying on the open lateral boundary `edge` as water wherever the tracer
+cell just inside them is active.
+
+`peripheral_node` treats those faces as peripheral because the tracer cell outside the domain is
+a halo cell, and halo cells are inactive in `Bounded` directions. For a closed wall that is
+right, but `edge` is where the setup relaxes towards NorKyst and carries an
+`OpenBoundaryCondition`, so leaving that row masked would drop the forcing exactly where it is
+needed. Only the component staggered across `edge` is affected.
+"""
+function open_boundary_water!(mask, target_grid, LX, LY, edge)
+    Nx, Ny, Nz = size(target_grid)
+
+    if LY === Face && edge === :south
+        for k = 1:Nz, i in axes(mask, 1)
+            mask[i, 1, k] = active_cell(i, 1, k, target_grid)
+        end
+    elseif LY === Face && edge === :north
+        for k = 1:Nz, i in axes(mask, 1)
+            mask[i, Ny+1, k] = active_cell(i, Ny, k, target_grid)
+        end
+    elseif LX === Face && edge === :west
+        for k = 1:Nz, j in axes(mask, 2)
+            mask[1, j, k] = active_cell(1, j, k, target_grid)
+        end
+    elseif LX === Face && edge === :east
+        for k = 1:Nz, j in axes(mask, 2)
+            mask[Nx+1, j, k] = active_cell(Nx, j, k, target_grid)
+        end
+    end
+
+    return mask
+end
+
+"""
+    forcing_dimension_names(name)
+
+NetCDF dimension names for a forcing variable, staggered according to its Oceananigans
+location. Written in Julia (fastest-first) order, which yields the `(time, Nz, Ny, Nx)` layout
+in the file.
+"""
+function forcing_dimension_names(name)
+    LX, LY, _ = get_data_location(Symbol(name))
+    return (LX === Face ? "Nx_faces" : "Nx", LY === Face ? "Ny_faces" : "Ny", "Nz", "time")
+end
+
+"""
+    prepared_variable(source_name, target_grid, source, filepath, config)
+
+Build the mask, projected target nodes, source fill and lambdas for one NorKyst variable at its
+target location.
+"""
+function prepared_variable(source_name, target_grid, source::NorKystSourceGrid, filepath, config::NorKystConfig)
+    name = NORKYST_VARIABLE_NAMES[source_name]
+    LX, LY, LZ = get_data_location(Symbol(name))
+    @info "Preparing target nodes and source fill for $source_name -> $name"
+
+    mask = water_mask(target_grid, LX, LY, config.relaxation_edge)
+    longitude = Array(λnodes(target_grid, LX()))
+    latitude = Array(φnodes(target_grid, LY()))
+    size(mask)[1:2] == (length(longitude), length(latitude)) || error(
+        "Target node count $(length(longitude))x$(length(latitude)) does not match the mask " *
+        "$(size(mask)[1:2]) for $name; the grid topology must be bounded in both directions.",
+    )
+
+    x, y = projected_target_nodes(longitude, latitude, source)
+    shape = (length(longitude), length(latitude))
+    mask_fill = source_fill(source_validity(filepath, source_name))
+    lambda = relaxation_lambda(mask, config)
+
+    return PreparedVariable(
+        source_name,
+        name,
+        forcing_dimension_names(name),
+        mask,
+        reshape(x, shape),
+        reshape(y, shape),
+        Array(znodes(target_grid, LZ())),
+        mask_fill,
+        lambda,
+    )
+end
+
+"""
+    projected_target_nodes(longitude, latitude, source::NorKystSourceGrid)
+
+Project the target node grid into the NorKyst projection, flattened with longitude varying
+fastest. The whole point cloud is transformed in a single GDAL call, as in
+`FjordSim.Bathymetry.sample_bathymetry_points!`.
+"""
+function projected_target_nodes(longitude, latitude, source::NorKystSourceGrid)
+    point_count = length(longitude) * length(latitude)
+    x = Vector{Float64}(undef, point_count)
+    y = Vector{Float64}(undef, point_count)
+
+    point = 1
+    for φ in latitude, λ in longitude
+        x[point] = λ
+        y[point] = φ
+        point += 1
+    end
+
+    ArchGDAL.importEPSG(4326; order = :trad) do source_srs
+        ArchGDAL.importPROJ4(source.proj4) do target_srs
+            ArchGDAL.createcoordtrans(source_srs, target_srs) do transform
+                ArchGDAL.transform!(x, y, zeros(Float64, point_count), transform)
+            end
+        end
+    end
+
+    return x, y
+end
+
+"""
+    source_validity(filepath, source_name)
+
+Whether each source cell holds data, taken from the first time step. NorKyst land cells and
+the points the download masked out as being outside the requested box are `NaN`, and that
+pattern is a property of the dataset rather than of the time step, so one read serves every
+step.
+"""
+function source_validity(filepath, source_name)
+    return NCDataset(filepath) do ds
+        return isfinite.(coalesce.(ds[source_name][:, :, :, 1], NaN32))
+    end
+end
+
+"""
+    source_fill(valid)
+
+Build the `SourceFill` for a source mask: the nearest valid cell per masked cell per level.
+"""
+function source_fill(valid)
+    NX, NY, ND = size(valid)
+    level_valid = [any(@view valid[:, :, level]) for level = 1:ND]
+    any(level_valid) || error("NorKyst data has no valid cell inside the requested region.")
+
+    nearest = zeros(Int32, NX, NY, ND)
+    for level = 1:ND
+        level_valid[level] || continue
+        nearest[:, :, level] = nearest_valid_map(valid, level)
+    end
+
+    return SourceFill(BitArray(valid), nearest, level_valid)
+end
+
+"""
+    fill_source!(slab, mask_fill::SourceFill)
+
+Replace every masked value in `slab` with the nearest valid value in the same level, and every
+fully masked level with the deepest level that has data. Mutates and returns `slab`, which is then
+free of `NaN` so `interpolate` can never propagate one.
+
+Filling a level from the deepest level with data reproduces what the previous hand-written
+vertical interpolation achieved by clamping: NorKyst levels below the fjord's own bathymetry carry
+no information, so the deepest real value is the best available.
+"""
+function fill_source!(slab, mask_fill::SourceFill)
+    NX, NY, ND = size(slab)
+    size(mask_fill.valid) == (NX, NY, ND) || throw(DimensionMismatch("source fill does not match the slab"))
+    flat = reshape(slab, NX * NY, ND)
+
+    for level = 1:ND
+        mask_fill.level_valid[level] || continue
+        for j = 1:NY, i = 1:NX
+            @inbounds mask_fill.valid[i, j, level] || (flat[i+(j-1)*NX, level] = flat[mask_fill.nearest[i, j, level], level])
+        end
+    end
+
+    deepest = findlast(mask_fill.level_valid)
+    for level = 1:ND
+        mask_fill.level_valid[level] && continue
+        @inbounds flat[:, level] .= @view flat[:, deepest]
+    end
+
+    return slab
+end
+
+"""
+    nearest_valid_map(valid, level)
+
+For every cell of source `level`, the linear index of the nearest valid cell in that level.
+
+Computed by relaxing squared Euclidean distance out from all valid cells at once, propagating
+the originating cell over 8 neighbors, which costs one near-linear pass per level. This plays the
+role of the `scipy.ndimage.distance_transform_edt` nearest-fill used to prepare the Oslofjord
+forcing, and of `NumericalEarth`'s `inpaint_mask!`, which cannot be used here — see `SourceFill`.
+"""
+function nearest_valid_map(valid, level)
+    NX, NY, _ = size(valid)
+    nearest = zeros(Int32, NX, NY)
+    origin_i = zeros(Int32, NX, NY)
+    origin_j = zeros(Int32, NX, NY)
+    distance = fill(typemax(Int32), NX, NY)
+    queue = Tuple{Int32,Int32}[]
+
+    for j = 1:NY, i = 1:NX
+        valid[i, j, level] || continue
+        nearest[i, j] = i + (j - 1) * NX
+        origin_i[i, j] = i
+        origin_j[i, j] = j
+        distance[i, j] = 0
+        push!(queue, (i, j))
+    end
+
+    head = 1
+    while head <= length(queue)
+        i, j = queue[head]
+        head += 1
+        source_i = origin_i[i, j]
+        source_j = origin_j[i, j]
+
+        for dj = -1:1, di = -1:1
+            di == 0 && dj == 0 && continue
+            neighbor_i = i + di
+            neighbor_j = j + dj
+            1 <= neighbor_i <= NX && 1 <= neighbor_j <= NY || continue
+
+            candidate = (neighbor_i - source_i)^2 + (neighbor_j - source_j)^2
+            candidate < distance[neighbor_i, neighbor_j] || continue
+
+            distance[neighbor_i, neighbor_j] = candidate
+            origin_i[neighbor_i, neighbor_j] = source_i
+            origin_j[neighbor_i, neighbor_j] = source_j
+            nearest[neighbor_i, neighbor_j] = source_i + (source_j - 1) * NX
+            push!(queue, (neighbor_i, neighbor_j))
+        end
+    end
+
+    return nearest
+end
+
+"""
+    solve_vertical_faces(depths)
+
+Vertical faces of an Oceananigans grid whose cell centers land exactly on the NorKyst depth
+levels, so that `interpolate` sees the levels the data is actually defined at.
+
+Oceananigans grids are specified by faces with centers at face midpoints, while NorKyst's
+`depth` values *are* centers of a strongly non-uniform axis. Solving `c_k = (f_k + f_{k+1})/2`
+leaves one free parameter `s = f_1`, with `f_k = (-1)^(k-1) s + g_k`, and a positive cell
+thickness requires `f_k < c_k`. Each level therefore bounds `s` from one side, alternating with
+parity. For NorKyst's 16 levels the resulting interval is about one metre wide in a 3 km domain —
+it exists, but it is a property of MET's depth list rather than of this code, so an empty
+interval is an error rather than a silently misplaced grid.
+"""
+function solve_vertical_faces(depths)
+    centers = -reverse(depths)
+    n = length(centers)
+
+    g = zeros(n + 1)
+    for k = 2:n+1
+        g[k] = 2 * centers[k-1] - g[k-1]
+    end
+
+    lower = -Inf
+    upper = Inf
+    for k = 1:n
+        if isodd(k)
+            upper = min(upper, centers[k] - g[k])
+        else
+            lower = max(lower, g[k] - centers[k])
+        end
+    end
+
+    upper > lower || error(
+        "NorKyst depth levels $(-centers) cannot be represented as an Oceananigans grid: the " *
+        "faces placing cell centers there are non-monotonic for every choice of the deepest " *
+        "face (feasible interval would be ($lower, $upper)).",
+    )
+
+    faces = zeros(n + 1)
+    faces[1] = (lower + upper) / 2
+    for k = 1:n
+        faces[k+1] = 2 * centers[k] - faces[k]
+    end
+
+    return faces
+end
+
+"""
+    source_field_grid(source::NorKystSourceGrid, architecture = CPU())
+
+The NorKyst subset as a `RectilinearGrid` in projected meters, on `architecture`.
+
+NorKyst's `X`/`Y` are regular, so this is a legal `RectilinearGrid` and
+`Oceananigans.Fields.interpolate` applies. It is *not* expressible as a `LatitudeLongitudeGrid`:
+the grid is rotated about 59 degrees from east in the Oslofjord region, which also rules out the
+`NumericalEarth` dataset path, whose `native_grid` is always a `LatitudeLongitudeGrid`.
+"""
+function source_field_grid(source::NorKystSourceGrid, architecture = CPU())
+    Δx = source.x[2] - source.x[1]
+    Δy = source.y[2] - source.y[1]
+
+    return RectilinearGrid(
+        architecture;
+        size = (length(source.x), length(source.y), length(source.depths)),
+        x = collect(range(source.x[1] - Δx / 2, step = Δx, length = length(source.x) + 1)),
+        y = collect(range(source.y[1] - Δy / 2, step = Δy, length = length(source.y) + 1)),
+        z = solve_vertical_faces(source.depths),
+        topology = (Bounded, Bounded, Bounded),
+    )
+end
+
+"""
+    set_source_field!(source_field, slab, mask_fill::SourceFill)
+
+Load one source slab into `source_field`, filling its mask via `fill_source!` and flipping the
+depth axis so it increases upwards like the grid. `slab` is mutated.
+"""
+function set_source_field!(source_field, slab, mask_fill::SourceFill)
+    fill_source!(slab, mask_fill)
+    set!(source_field, reverse(slab, dims = 3))
+    fill_halo_regions!(source_field)
+
+    return source_field
+end
+
+@kernel function _interpolate_to_target!(output, @Const(x), @Const(y), @Const(z), @Const(mask),
+                                         source_field, source_grid, source_location)
+    i, j, k = @index(Global, NTuple)
+
+    @inbounds begin
+        node = (x[i, j], y[i, j], z[k])
+        output[i, j, k] = ifelse(
+            mask[i, j, k],
+            convert(Float32, interpolate(node, source_field, source_location, source_grid)),
+            NaN32,
+        )
+    end
+end
+
+"""
+    interpolate_to_target!(output, source_field, x, y, z, mask, architecture)
+
+Interpolate `source_field` onto the target nodes `x`, `y`, `z`, writing `NaN` where `mask` says the
+target cell is land. Every array must live on `architecture`.
+
+The target nodes were projected into the NorKyst coordinate system by `projected_target_nodes`,
+which is what lets `Oceananigans.Fields.interpolate` do the work: the source is a
+`RectilinearGrid` in the same projected meters, so one trilinear call covers both the horizontal
+and the vertical.
+
+`launch!` takes its work size from `size(output)` and its device from `architecture`; the grid
+argument is unused for a size-tuple work spec, so the source grid is passed for consistency.
+"""
+function interpolate_to_target!(output, source_field, x, y, z, mask, architecture)
+    launch!(
+        architecture,
+        source_field.grid,
+        size(output),
+        _interpolate_to_target!,
+        output,
+        x,
+        y,
+        z,
+        mask,
+        source_field,
+        source_field.grid,
+        (Center(), Center(), Center()),
+    )
+
+    return output
+end
+
+"""
+    relaxation_lambda(mask, config::NorKystConfig)
+
+Relaxation rates for one variable: `1 / config.relaxation_timescale` in the water cells of the
+`config.relaxation_cells`-wide band along `config.relaxation_edge`, zero everywhere else.
+`|λ| < 1` routes the forcing through `forcing_term_relax`.
+"""
+function relaxation_lambda(mask, config::NorKystConfig)
+    config.relaxation_cells >= 0 || throw(ArgumentError("relaxation_cells must be >= 0"))
+    config.relaxation_timescale > 0 || throw(ArgumentError("relaxation_timescale must be > 0"))
+    edge = validate_relaxation_edge(config.relaxation_edge)
+
+    Nx, Ny, Nz = size(mask)
+    cells = config.relaxation_cells
+
+    x_range, y_range = if edge === :south
+        1:Nx, 1:min(cells, Ny)
+    elseif edge === :north
+        1:Nx, max(1, Ny - cells + 1):Ny
+    elseif edge === :west
+        1:min(cells, Nx), 1:Ny
+    else
+        max(1, Nx - cells + 1):Nx, 1:Ny
+    end
+
+    lambda = zeros(Float32, Nx, Ny, Nz)
+    rate = Float32(1 / config.relaxation_timescale)
+    for k = 1:Nz, j in y_range, i in x_range
+        mask[i, j, k] && (lambda[i, j, k] = rate)
+    end
+
+    return lambda
+end
+
+"""
+    SourceReader(filepath)
+
+Holds the one monthly NorKyst file currently open, reopening on demand. Output steps are written
+in date order so consecutive reads almost always hit the same file; only an interpolated day
+straddling a month boundary reopens, which happens at most once per gap.
+"""
+mutable struct SourceReader{D}
+    filepath::String
+    dataset::D
+end
+
+SourceReader(filepath::String) = SourceReader(filepath, NCDataset(filepath))
+
+Base.close(reader::SourceReader) = close(reader.dataset)
+
+"""
+    source_slab(reader::SourceReader, record::SourceRecord, source_name)
+
+One `(X, Y, depth)` slab of `source_name`, with masked points as `NaN`.
+"""
+function source_slab(reader::SourceReader, record::SourceRecord, source_name)
+    if reader.filepath != record.filepath
+        close(reader.dataset)
+        reader.dataset = NCDataset(record.filepath)
+        reader.filepath = record.filepath
+    end
+
+    return Float32.(coalesce.(reader.dataset[source_name][:, :, :, record.index], NaN32))
+end
+
+"""
+    blended_slab(reader::SourceReader, step::ForcingTimeStep, source_name)
+
+The source slab for `step`: a single record when the step is present in the download, otherwise
+the linear blend of the records bracketing an interpolated day. Land stays `NaN` because it is
+`NaN` in both records.
+"""
+function blended_slab(reader::SourceReader, step::ForcingTimeStep, source_name)
+    lower = source_slab(reader, step.lower, source_name)
+    iszero(step.weight) && return lower
+
+    upper = source_slab(reader, step.upper, source_name)
+    @. lower = (1 - step.weight) * lower + step.weight * upper
+
+    return lower
+end
+
+"""
+    write_forcing_file(filepath, target_grid, variables, steps, source, architecture)
+
+Write the forcing NetCDF, streaming one time step at a time so peak memory stays at a single
+slab rather than a whole variable. Interpolation runs on `architecture`.
+"""
+function write_forcing_file(filepath, target_grid, variables, steps, source::NorKystSourceGrid, architecture)
+    isdir(dirname(filepath)) || mkpath(dirname(filepath))
+    isfile(filepath) && rm(filepath; force = true)
+
+    ds = NCDataset(filepath, "c")
+    try
+        define_forcing_dimensions(ds, target_grid, steps)
+        for variable in variables
+            # One horizontal level of one time step per chunk. Both this writer and
+            # `load_from_netcdf` touch exactly one time index at a time, so a chunk spanning
+            # several time steps would be decompressed and recompressed once per step; the
+            # netCDF default chunking does span them and makes the write an order of magnitude
+            # slower.
+            chunksizes = [size(variable.mask, 1), size(variable.mask, 2), 1, 1]
+            for name in (variable.name, variable.name * "_lambda")
+                defVar(ds, name, Float32, variable.dimensions; chunksizes,
+                    deflatelevel = FORCING_DEFLATE_LEVEL, attrib = ["_FillValue" => NaN32])
+            end
+        end
+
+        # All four NorKyst variables live on the same source grid, so one field is enough.
+        source_field = Field{Center,Center,Center}(source_field_grid(source, architecture))
+
+        # Target nodes, mask and output buffer move to the interpolation device once; only the
+        # finished slab comes back per step, for the NetCDF write.
+        devices = [(
+            x = on_architecture(architecture, variable.x),
+            y = on_architecture(architecture, variable.y),
+            z = on_architecture(architecture, variable.z),
+            mask = on_architecture(architecture, variable.mask),
+            output = on_architecture(architecture, zeros(Float32, size(variable.mask))),
+            host = Array{Float32}(undef, size(variable.mask)),
+        ) for variable in variables]
+
+        reader = SourceReader(first(steps).lower.filepath)
+        announced = ""
+
+        try
+            for (index, step) in enumerate(steps)
+                if step.lower.filepath != announced
+                    announced = step.lower.filepath
+                    @info "Regridding $(basename(announced))"
+                end
+
+                for (variable, device) in zip(variables, devices)
+                    slab = blended_slab(reader, step, variable.source_name)
+                    set_source_field!(source_field, slab, variable.mask_fill)
+                    interpolate_to_target!(
+                        device.output, source_field, device.x, device.y, device.z, device.mask, architecture,
+                    )
+                    copyto!(device.host, device.output)
+                    ds[variable.name][:, :, :, index] = device.host
+                    ds[variable.name*"_lambda"][:, :, :, index] = variable.lambda
+                end
+            end
+        finally
+            close(reader)
+        end
+    finally
+        close(ds)
+    end
+
+    return filepath
+end
+
+"""
+    define_forcing_dimensions(ds, target_grid, steps)
+
+Define the dimensions and coordinate variables `forcing_from_file` checks against the grid.
+"""
+function define_forcing_dimensions(ds, target_grid, steps)
+    coordinates = (
+        "Nx" => Array(λnodes(target_grid, Center())),
+        "Ny" => Array(φnodes(target_grid, Center())),
+        "Nz" => Array(znodes(target_grid, Center())),
+        "Nx_faces" => Array(λnodes(target_grid, Face())),
+        "Ny_faces" => Array(φnodes(target_grid, Face())),
+        "Nz_faces" => Array(znodes(target_grid, Face())),
+    )
+
+    for (name, values) in coordinates
+        defDim(ds, name, length(values))
+    end
+    defDim(ds, "time", length(steps))
+
+    for (name, values) in coordinates
+        defVar(ds, name, Float64, (name,))[:] = values
+    end
+    defVar(ds, "time", [step.date for step in steps], ("time",))
+
+    return ds
 end
 
 end # module

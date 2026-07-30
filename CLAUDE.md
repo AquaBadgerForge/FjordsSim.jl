@@ -14,9 +14,12 @@ julia --project scripts/bathymetry_prepare.jl --config configs/drammensfjorden.j
 
 # Download and subset NorKyst-800m forcing for a configured fjord
 julia --project scripts/forcing_download_norkyst.jl --config configs/oslofjorden.jl
+
+# Regrid the downloaded forcing onto the fjord's grid (needs the bathymetry and download first)
+julia --project scripts/forcing_prepare.jl --config configs/oslofjorden.jl
 ```
 
-`--config` is required by both scripts — there is no default setup.
+`--config` is required by every script — there is no default setup.
 
 Activate the environment before running scripts interactively:
 ```julia
@@ -65,10 +68,31 @@ modules, in `include` order from `src/FjordSim.jl`:
    `forcing_from_file`. The `ForcingFromFile` struct carries two `FieldTimeSeries`
    (values + lambdas) and dispatches to flux, advection, or relaxation terms based on the sign of
    lambda: `λ > 1` → x-flux, `λ < -1` → y-flux, `|λ| < 1` → relaxation. Uses a custom
-   `NetCDFBackend` keeping 2 time indices in memory. Also holds
-   `NorKystConfig <: AbstractForcingConfig` (THREDDS endpoints, variables, years) and
-   `norkyst_directory`/`norkyst_monthly_filename`; the download itself lives in
-   `scripts/forcing_download_norkyst.jl`.
+   `NetCDFBackend` keeping 2 time indices in memory. `forcing_from_file` takes either a
+   `filepath` keyword or an `AbstractForcingConfig` positionally, resolved by `forcing_path`.
+   Also holds `NorKystConfig <: AbstractForcingConfig` (THREDDS endpoints, variables, years,
+   output names, relaxation zone) with `norkyst_directory`/`norkyst_monthly_filename` and
+   `forcing_path`/`forcing_plot_path`, plus `prepare_norkyst_forcing(target_grid, config)`,
+   which regrids the downloaded monthly files onto the simulation grid: daily time axis with
+   gaps interpolated between neighbouring days → land mask from `peripheral_node` (so it matches
+   the model, including `PartialCellBottom` and the velocity-face wall convention), with the open
+   `relaxation_edge` row restored → source mask filled from the nearest valid cell (`SourceFill`)
+   → one trilinear `Oceananigans.Fields.interpolate` per target cell in a `launch!` kernel,
+   against the NorKyst subset expressed as a `RectilinearGrid` in projected meters → relaxation
+   lambdas along `relaxation_edge` → streaming NetCDF write.
+
+   The `architecture` keyword selects where the interpolation kernel runs (`GPU()` is ~12x faster
+   than a single-threaded `CPU()`); `target_grid` must stay on the CPU because building the masks
+   walks `peripheral_node` cell by cell. `scripts/forcing_prepare.jl` picks the GPU when
+   `CUDA.functional()` and takes `--cpu` to override.
+   The download itself lives in `scripts/forcing_download_norkyst.jl`; the CLI wrapper and
+   diagnostic plot for preparation live in `scripts/forcing_prepare.jl`.
+
+   Two library functions deliberately *not* used, documented in `prepare_norkyst_forcing` and
+   `SourceFill`: NumericalEarth's dataset path (`native_grid`, `set!(field, metadata)`,
+   `DatasetRestoring`) always builds a `LatitudeLongitudeGrid`, but the NorKyst grid is rotated
+   ~59° from east here; and `inpaint_mask!` cannot fill a fully masked depth level, so on this
+   regional subset it either never terminates or silently writes zeros.
 
 7. **Boundary conditions** (`src/BoundaryConditions.jl`) — `top_bottom_boundary_conditions` creates
    wind/heat/salt flux fields at the top and quadratic bottom drag, returning a named tuple
@@ -145,8 +169,14 @@ kernel must follow these rules:
 
 - Never extend `getproperty` to fix undefined-property bugs — fix the caller instead
 - A variable named the same as a function produces "type is not callable" — rename the variable
-- Never add/remove/change `[deps]` in `Project.toml` unless the task requires it; only touch
-  `[compat]` when explicitly asked
+- Never add/remove/change `[deps]` in `Project.toml` on your own initiative; only touch
+  `[compat]` when explicitly asked. But if a dependency would meaningfully simplify the
+  implementation, *ask* — do not silently contort the design to avoid it. This applies to packages
+  already present transitively (e.g. `KernelAbstractions` via Oceananigans), where a direct
+  `[deps]` entry costs nothing but is still required to `using` them.
+- `Pkg.resolve()` currently fails in this environment on an unrelated pinned `CUDACore` version.
+  Adding a `[deps]` entry for a package already in `Manifest.toml` works without resolving; do not
+  try to fix the resolve failure as a side effect.
 
 ## Key conventions
 
