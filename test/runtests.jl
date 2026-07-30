@@ -192,6 +192,75 @@ end
     end
 end
 
+@testset "Bathymetry gap filling" begin
+    fill_diagonal_pairs = FjordSim.Bathymetry.fill_diagonal_pairs
+    fill_secondary_diagonal_pairs = FjordSim.Bathymetry.fill_secondary_diagonal_pairs
+    remove_isolated_sea_cells = FjordSim.Bathymetry.remove_isolated_sea_cells
+    fill_isolated_land_cells = FjordSim.Bathymetry.fill_isolated_land_cells
+
+    # top-left/bottom-right sea, top-right/bottom-left land -> fill top-right
+    h = [-5.0 1.0; 1.0 -3.0]
+    filled = fill_diagonal_pairs(h)
+    @test filled[1, 2] == -4.0
+    @test filled[1, 1] == -5.0
+    @test filled[2, 1] == 1.0
+    @test filled[2, 2] == -3.0
+    @test fill_secondary_diagonal_pairs(h) == h  # opposite diagonal pattern doesn't match
+
+    # top-right/bottom-left sea, top-left/bottom-right land -> fill top-left
+    h2 = [1.0 -5.0; -3.0 1.0]
+    filled2 = fill_secondary_diagonal_pairs(h2)
+    @test filled2[1, 1] == -4.0
+    @test filled2[1, 2] == -5.0
+    @test filled2[2, 1] == -3.0
+    @test filled2[2, 2] == 1.0
+    @test fill_diagonal_pairs(h2) == h2  # opposite diagonal pattern doesn't match
+
+    # interior sea cell surrounded by land on all 4 sides -> becomes land (0)
+    h3 = [0.0 0.0 0.0; 0.0 -5.0 0.0; 0.0 0.0 0.0]
+    replaced = remove_isolated_sea_cells(h3)
+    @test replaced[2, 2] == 0.0
+    @test replaced[1, :] == h3[1, :]  # boundary row untouched
+
+    # a boundary sea cell is left alone even if it would otherwise qualify
+    h4 = [0.0 -5.0 0.0; 0.0 0.0 0.0; 0.0 0.0 0.0]
+    @test remove_isolated_sea_cells(h4) == h4
+
+    # interior land cell surrounded by sea on all 4 sides -> filled with neighbor mean
+    h5 = [-1.0 -2.0 -1.0; -6.0 0.0 -8.0; -1.0 -4.0 -1.0]
+    filled5 = fill_isolated_land_cells(h5)
+    @test filled5[2, 2] == -5.0  # mean(-6, -2, -8, -4)
+    @test filled5[1, :] == h5[1, :]  # boundary row untouched
+
+    # a boundary land cell is left alone even if it would otherwise qualify
+    h6 = [0.0 -1.0 0.0; -1.0 -1.0 -1.0; 0.0 -1.0 0.0]
+    @test fill_isolated_land_cells(h6) == h6
+
+    # smooth_bathymetry_gaps! round-trips a Field through the same pipeline
+    arch = CPU()
+    grid = LatitudeLongitudeGrid(
+        arch;
+        size = (3, 3, 1),
+        halo = (1, 1, 1),
+        longitude = (10.0, 11.0),
+        latitude = (59.0, 60.0),
+        z = [-10.0, 0.0],
+    )
+    raw = Float32[0.0 0.0 0.0; 0.0 -5.0 0.0; 0.0 0.0 0.0]
+    bottom_height = Field{Center, Center, Nothing}(grid)
+    set!(bottom_height, raw)
+
+    FjordSim.Bathymetry.smooth_bathymetry_gaps!(bottom_height)
+
+    expected =
+        FjordSim.Bathymetry.fill_secondary_diagonal_pairs(FjordSim.Bathymetry.fill_diagonal_pairs(copy(raw)))
+    for _ = 1:FjordSim.Bathymetry.BATHYMETRY_GAP_FILL_PASSES
+        expected = fill_isolated_land_cells(remove_isolated_sea_cells(expected))
+    end
+
+    @test Array(interior(bottom_height, :, :, 1)) == expected
+end
+
 @testset "Bathymetry point sampling (bulk coordinate transform)" begin
     # Synthetic dybdepunkt/dybdekurve-like layers in EPSG:25833, built on a Memory
     # dataset so this test needs no real Geonorge FileGDB.

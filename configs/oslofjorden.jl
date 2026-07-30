@@ -23,7 +23,7 @@ _data_root = expanduser("~/FjordSim_data/oslofjorden")
         contour_stride        = 10,
         interpolation_passes  = 1,
         major_basins          = 1,
-        geonorge_cache        = false,
+        geonorge_cache        = true,
         regrid_cache          = false,
     ),
     norkyst = NorKystConfig(

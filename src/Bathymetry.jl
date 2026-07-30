@@ -66,6 +66,10 @@ const GEONORGE_FGDB_BASE_URL = "https://nedlasting.geonorge.no/geonorge/Basisdat
 # NumericalEarth bathymetry regridding constructs a native grid with halo = (10, 10, 1).
 # Keep the generated raw dataset comfortably larger than that minimum.
 const MIN_NATIVE_BATHYMETRY_SIZE = 24
+# Matches the fixed loop count and neighbor threshold used in the Oslofjord notebook's
+# post-regrid gap-filling pass.
+const BATHYMETRY_GAP_FILL_PASSES = 10
+const ISOLATED_SEA_CELL_LAND_SIDES = 3
 
 download_bathymetry_cache::String = ""
 
@@ -240,6 +244,8 @@ function prepare_geonorge_bathymetry(
     metadata = Metadatum(:bottom_height; dataset)
     @info "Regridding Geonorge bathymetry onto target grid"
     bottom_height = NumericalEarth.regrid_bathymetry(target_grid, metadata; cache = regrid_cache, regrid_kw...)
+    @info "Smoothing small-scale bathymetry gaps"
+    smooth_bathymetry_gaps!(bottom_height)
     @info "Writing processed bathymetry file to $output_path"
     write_bathymetry_file(output_path, target_grid, bottom_height)
     @info "Finished preparing Geonorge bathymetry"
@@ -303,6 +309,123 @@ function write_bathymetry_file(filepath::String, target_grid, bottom_height)
     end
 
     return filepath
+end
+
+"""
+    smooth_bathymetry_gaps!(bottom_height)
+
+Remove small-scale diagonal checkerboard artifacts and single-cell sea/land noise left
+by regridding, following the fixed cleanup pass used for the Oslofjord ROMS-based
+bathymetry: one diagonal-pair fill, then `BATHYMETRY_GAP_FILL_PASSES` rounds of isolated
+sea/land cell cleanup. Mutates `bottom_height` in place.
+"""
+function smooth_bathymetry_gaps!(bottom_height)
+    cpu_bottom_height = on_architecture(CPU(), bottom_height)
+    h = Array(interior(cpu_bottom_height, :, :, 1))
+
+    h = fill_secondary_diagonal_pairs(fill_diagonal_pairs(h))
+    for _ = 1:BATHYMETRY_GAP_FILL_PASSES
+        h = fill_isolated_land_cells(remove_isolated_sea_cells(h))
+    end
+
+    set!(bottom_height, h)
+    return bottom_height
+end
+
+"""
+    fill_diagonal_pairs(h)
+
+For every 2x2 block where the top-left/bottom-right cells are sea (`h < 0`) and the
+top-right/bottom-left cells are land (`h >= 0`), fill the top-right cell with the mean of
+the two sea corners.
+"""
+function fill_diagonal_pairs(h)
+    filled = copy(h)
+    Nx, Ny = size(h)
+
+    for i = 1:Nx-1, j = 1:Ny-1
+        top_left = h[i, j]
+        top_right = h[i, j+1]
+        bottom_left = h[i+1, j]
+        bottom_right = h[i+1, j+1]
+
+        if top_left < 0 && bottom_right < 0 && top_right >= 0 && bottom_left >= 0
+            filled[i, j+1] = (top_left + bottom_right) / 2
+        end
+    end
+
+    return filled
+end
+
+"""
+    fill_secondary_diagonal_pairs(h)
+
+For every 2x2 block where the top-right/bottom-left cells are sea (`h < 0`) and the
+top-left/bottom-right cells are land (`h >= 0`), fill the top-left cell with the mean of
+the two sea corners.
+"""
+function fill_secondary_diagonal_pairs(h)
+    filled = copy(h)
+    Nx, Ny = size(h)
+
+    for i = 1:Nx-1, j = 1:Ny-1
+        top_left = h[i, j]
+        top_right = h[i, j+1]
+        bottom_left = h[i+1, j]
+        bottom_right = h[i+1, j+1]
+
+        if top_right < 0 && bottom_left < 0 && top_left >= 0 && bottom_right >= 0
+            filled[i, j] = (top_right + bottom_left) / 2
+        end
+    end
+
+    return filled
+end
+
+"""
+    remove_isolated_sea_cells(h; sides = ISOLATED_SEA_CELL_LAND_SIDES)
+
+Turn interior sea cells (`h < 0`) with at least `sides` land neighbors (out of
+north/south/east/west) into land, by setting them to zero.
+"""
+function remove_isolated_sea_cells(h; sides = ISOLATED_SEA_CELL_LAND_SIDES)
+    replaced = copy(h)
+    Nx, Ny = size(h)
+
+    for i = 2:Nx-1, j = 2:Ny-1
+        if h[i, j] < 0
+            land_neighbors = count((h[i-1, j] >= 0, h[i+1, j] >= 0, h[i, j-1] >= 0, h[i, j+1] >= 0))
+            land_neighbors >= sides && (replaced[i, j] = zero(eltype(h)))
+        end
+    end
+
+    return replaced
+end
+
+"""
+    fill_isolated_land_cells(h)
+
+Fill interior land cells (`h >= 0`) whose north/south/east/west neighbors are all sea
+(`h < 0`) with the mean of those 4 neighbor depths.
+"""
+function fill_isolated_land_cells(h)
+    filled = copy(h)
+    Nx, Ny = size(h)
+
+    for i = 2:Nx-1, j = 2:Ny-1
+        if h[i, j] >= 0
+            west = h[i, j-1]
+            north = h[i-1, j]
+            east = h[i, j+1]
+            south = h[i+1, j]
+
+            if west < 0 && north < 0 && east < 0 && south < 0
+                filled[i, j] = (west + north + east + south) / 4
+            end
+        end
+    end
+
+    return filled
 end
 
 function geonorge_dataset(

@@ -9,8 +9,21 @@ using Oceananigans.Fields: interior
 using Oceananigans.Grids: x_domain, y_domain
 
 const DEFAULT_CONFIG_PATH = joinpath(@__DIR__, "..", "configs", "drammensfjorden.jl")
+# Logical figure pixels per grid cell, and fixed margin for title/labels/colorbar.
+# Sized from the grid so every cell is rendered as a distinct, unambiguous block
+# rather than being blurred together by too few output pixels per cell.
+const BATHYMETRY_PLOT_PIXELS_PER_CELL = 6
+const BATHYMETRY_PLOT_MARGIN = (300, 150)
 
-function plot_bathymetry(grid, bathymetry; plot_path, title = "Bathymetry", figure_size = (1000, 700))
+function default_bathymetry_figure_size(grid)
+    Nx, Ny, _ = size(grid)
+    return (
+        Nx * BATHYMETRY_PLOT_PIXELS_PER_CELL + BATHYMETRY_PLOT_MARGIN[1],
+        Ny * BATHYMETRY_PLOT_PIXELS_PER_CELL + BATHYMETRY_PLOT_MARGIN[2],
+    )
+end
+
+function plot_bathymetry(grid, bathymetry; plot_path, title = "Bathymetry", figure_size = default_bathymetry_figure_size(grid))
     isdir(dirname(plot_path)) || mkpath(dirname(plot_path))
 
     cpu_bathymetry = on_architecture(CPU(), bathymetry)
