@@ -19,8 +19,6 @@ export forcing_from_file, norkyst_directory, norkyst_monthly_filename, NorKystCo
 
 const NORKYST_CATALOG_URL = "https://thredds.met.no/thredds/catalog/fou-hi/norkyst800m/catalog.xml"
 const NORKYST_OPENDAP_URL = "https://thredds.met.no/thredds/dodsC/fou-hi/norkyst800m/"
-const NORKYST_DIRECTORY = "norkyst"
-const NORKYST_PARAMETERS = ["temperature", "salinity", "u_eastward", "v_northward"]
 
 """
     norkyst_monthly_filename(year, month)
@@ -34,26 +32,27 @@ norkyst_monthly_filename(year, month) = "NorKyst-800m_ZDEPTHS_avg_$(year)$(lpad(
 
 Configuration for downloading and subsetting NorKyst-800m reanalysis data.
 
-Only `data_root` and `years` are required; the remaining fields default to the public
-THREDDS endpoints and a `norkyst` subdirectory of `data_root`.
+A setup states where its forcing goes, which variables to extract and which years to cover.
+Only `catalog_url` and `opendap_url` are defaulted, being the NorKyst dataset's own public
+endpoints.
 
 `output_directory` is a name relative to `data_root`, resolved by `norkyst_directory`.
 Setting it to an absolute path overrides `data_root`.
 
 # Fields
-- `data_root`: Directory holding this setup's forcing files.
-- `output_directory`: Name of the directory where monthly NetCDF files are written.
+- `data_root`: Directory holding this setup's forcing files. Required.
+- `output_directory`: Name of the directory where monthly NetCDF files are written. Required.
 - `catalog_url`: THREDDS catalog URL listing available files.
 - `opendap_url`: OPeNDAP base URL for streaming data.
-- `parameters`: Variable names to extract (e.g. `["temperature", "salinity"]`).
-- `years`: Calendar years to download.
+- `parameters`: Variable names to extract (e.g. `["temperature", "salinity"]`). Required.
+- `years`: Calendar years to download. Required.
 """
 Base.@kwdef mutable struct NorKystConfig <: AbstractForcingConfig
     data_root::String
-    output_directory::String = NORKYST_DIRECTORY
+    output_directory::String
     catalog_url::String = NORKYST_CATALOG_URL
     opendap_url::String = NORKYST_OPENDAP_URL
-    parameters::Vector{String} = copy(NORKYST_PARAMETERS)
+    parameters::Vector{String}
     years::Vector{Int}
 end
 

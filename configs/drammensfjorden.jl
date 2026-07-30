@@ -24,7 +24,9 @@ FjordConfig(
         regrid_cache          = false,
     ),
     forcing_config = NorKystConfig(
-        data_root = _data_root,
-        years     = [2020],
+        data_root        = _data_root,
+        output_directory = "norkyst",
+        parameters       = ["temperature", "salinity", "u_eastward", "v_northward"],
+        years            = [2020],
     ),
 )

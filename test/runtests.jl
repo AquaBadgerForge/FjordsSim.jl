@@ -188,13 +188,38 @@ end
     @test geodatabase_path(shared) == "/shared/Dybdedata.gdb"
     @test bathymetry_path(shared) == joinpath(data_root, "bathymetry.nc")  # others unaffected
 
-    forcing_config = NorKystConfig(data_root = data_root, years = [2020])
+    # A setup states its own forcing directory, variables and years; only the NorKyst
+    # endpoints are defaulted.
+    @test_throws UndefKeywordError NorKystConfig(data_root = data_root, years = [2020])
+    @test_throws UndefKeywordError NorKystConfig(
+        data_root = data_root,
+        output_directory = "norkyst",
+        years = [2020],
+    )
+    @test_throws UndefKeywordError NorKystConfig(
+        data_root = data_root,
+        parameters = ["temperature"],
+        years = [2020],
+    )
+
+    forcing_config = NorKystConfig(
+        data_root = data_root,
+        output_directory = "norkyst",
+        parameters = ["temperature", "salinity"],
+        years = [2020],
+    )
     @test norkyst_directory(forcing_config) == joinpath(data_root, "norkyst")
-    @test norkyst_directory(NorKystConfig(data_root = data_root, output_directory = "/nk", years = [2020])) == "/nk"
+    @test forcing_config.parameters == ["temperature", "salinity"]
+    @test norkyst_directory(
+        NorKystConfig(
+            data_root = data_root,
+            output_directory = "/nk",
+            parameters = ["temperature"],
+            years = [2020],
+        ),
+    ) == "/nk"
     @test norkyst_monthly_filename(2020, 3) == "NorKyst-800m_ZDEPTHS_avg_202003.nc"
     @test occursin("thredds.met.no", forcing_config.catalog_url)
-    # Each config gets its own parameter vector, not the shared module-level default.
-    @test forcing_config.parameters !== FjordSim.Forcing.NORKYST_PARAMETERS
 
     grid_config = EvenGrid(
         size = (2, 3, 2),
@@ -257,7 +282,12 @@ end
             output_file = "bathymetry.nc",
             plot_file = "bathymetry.png",
         ),
-        forcing_config = NorKystConfig(data_root = data_root, years = [2020]),
+        forcing_config = NorKystConfig(
+            data_root = data_root,
+            output_directory = "norkyst",
+            parameters = ["temperature"],
+            years = [2020],
+        ),
     ) isa FjordConfig
 
     # Path resolution is inherited from AbstractBathymetryConfig — no new methods needed.

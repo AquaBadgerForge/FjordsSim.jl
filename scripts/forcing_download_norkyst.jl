@@ -66,7 +66,30 @@ function bounding_range(mask, dimension)
     return first(indices):last(indices)
 end
 
-function subset_ranges(ds; latitude_range, longitude_range)
+"""
+    NorKystSubset
+
+The spatial window of a NorKyst dataset selected by a setup, plus the variables to extract.
+Derived from a `FjordConfig` by `subset_ranges` and passed to every function that writes the
+subset out.
+
+# Fields
+- `ranges`: Index range per dataset dimension covering the requested lon/lat box.
+- `mask`: In-box flag per point of the subset, used to blank out points outside the box.
+- `spatial_dimensions`: Names of the dimensions `mask` is indexed by, in order.
+- `parameters`: Variable names to extract.
+"""
+struct NorKystSubset{M<:AbstractArray,S<:Tuple}
+    ranges::Dict{String,UnitRange{Int}}
+    mask::M
+    spatial_dimensions::S
+    parameters::Vector{String}
+end
+
+function subset_ranges(ds, config::FjordConfig)
+    latitude_range = config.grid_config.latitude
+    longitude_range = config.grid_config.longitude
+
     latitude_variable = variable(ds, "lat")
     longitude_variable = variable(ds, "lon")
     latitude = Array(latitude_variable[ntuple(_ -> :, ndims(latitude_variable))...])
@@ -83,7 +106,7 @@ function subset_ranges(ds; latitude_range, longitude_range)
 
     spatial_dimensions = dimnames(latitude_variable)
     subset_mask = mask[(ranges[dimension] for dimension in spatial_dimensions)...]
-    return ranges, subset_mask, spatial_dimensions
+    return NorKystSubset(ranges, subset_mask, spatial_dimensions, config.forcing_config.parameters)
 end
 
 function variable_indices(variable, ranges)
@@ -130,10 +153,10 @@ function concrete_float_data(data)
     return output
 end
 
-function define_subset_variable(output, source, name, ranges; deflatelevel = 5)
+function define_subset_variable(output, source, name, subset::NorKystSubset; deflatelevel = 5)
     variable = NCDatasets.variable(source, name)
     dimensions = dimnames(variable)
-    indices = variable_indices(variable, ranges)
+    indices = variable_indices(variable, subset.ranges)
     data = variable[indices...]
     variable_type = data isa AbstractArray ? eltype(data) : typeof(data)
 
@@ -157,13 +180,13 @@ function define_subset_variable(output, source, name, ranges; deflatelevel = 5)
     return output_variable
 end
 
-function copy_auxiliary_variable(name, variable, time_dim, parameters)
-    name in parameters && return false
+function copy_auxiliary_variable(name, variable, time_dim, subset::NorKystSubset)
+    name in subset.parameters && return false
     dimensions = dimnames(variable)
     return name == time_dim || time_dim ∉ dimensions
 end
 
-function define_output_file(output_path, template, ranges, total_time; parameters)
+function define_output_file(output_path, template, subset::NorKystSubset, total_time)
     time_dim = time_dimension(template)
     isfile(output_path) && rm(output_path; force = true)
 
@@ -172,8 +195,8 @@ function define_output_file(output_path, template, ranges, total_time; parameter
         for dimension in dimnames(template)
             dimension_length = if dimension == time_dim
                 total_time
-            elseif haskey(ranges, dimension)
-                length(ranges[dimension])
+            elseif haskey(subset.ranges, dimension)
+                length(subset.ranges[dimension])
             else
                 NCDatasets.dim(template, dimension)
             end
@@ -182,12 +205,12 @@ function define_output_file(output_path, template, ranges, total_time; parameter
 
         for name in keys(template)
             variable = NCDatasets.variable(template, name)
-            copy_auxiliary_variable(name, variable, time_dim, parameters) || continue
+            copy_auxiliary_variable(name, variable, time_dim, subset) || continue
             all(dimension -> dimension in dimnames(output), dimnames(variable)) || continue
-            define_subset_variable(output, template, name, ranges; deflatelevel = 0)
+            define_subset_variable(output, template, name, subset; deflatelevel = 0)
         end
 
-        for name in parameters
+        for name in subset.parameters
             variable = template[name]
             variable_type = nonmissingtype(eltype(variable))
             defVar(
@@ -217,15 +240,15 @@ function masked_fill_value(data)
     end
 end
 
-function apply_spatial_mask(data, variable, mask, spatial_dimensions)
-    spatial_indices = [findfirst(==(dimension), dimnames(variable)) for dimension in spatial_dimensions]
+function apply_spatial_mask(data, variable, subset::NorKystSubset)
+    spatial_indices = [findfirst(==(dimension), dimnames(variable)) for dimension in subset.spatial_dimensions]
     any(isnothing, spatial_indices) && return data
 
     masked_data = copy(data)
     fill_value = masked_fill_value(masked_data)
 
-    for mask_index in CartesianIndices(mask)
-        mask[mask_index] && continue
+    for mask_index in CartesianIndices(subset.mask)
+        subset.mask[mask_index] && continue
         data_indices = ntuple(ndims(masked_data)) do i
             mask_dimension = findfirst(==(i), spatial_indices)
             mask_dimension === nothing ? (:) : mask_index[mask_dimension]
@@ -236,11 +259,11 @@ function apply_spatial_mask(data, variable, mask, spatial_dimensions)
     return masked_data
 end
 
-function write_parameter_chunk!(output, source, name, ranges, mask, spatial_dimensions, time_start)
+function write_parameter_chunk!(output, source, name, subset::NorKystSubset, time_start)
     variable = source[name]
-    input_indices = variable_indices(variable, ranges)
+    input_indices = variable_indices(variable, subset.ranges)
     data = concrete_float_data(variable[input_indices...])
-    data = apply_spatial_mask(data, variable, mask, spatial_dimensions)
+    data = apply_spatial_mask(data, variable, subset)
 
     output_variable = output[name]
     output_indices = ntuple(ndims(output_variable)) do i
@@ -256,17 +279,17 @@ function write_parameter_chunk!(output, source, name, ranges, mask, spatial_dime
     return size(data, findfirst(==(time_dimension(source)), dimnames(variable)))
 end
 
-function write_time_dependent_coordinates!(output, source, ranges, time_start; parameters)
+function write_time_dependent_coordinates!(output, source, subset::NorKystSubset, time_start)
     time_dim = time_dimension(source)
 
     for name in keys(source)
-        name in parameters && continue
+        name in subset.parameters && continue
         variable = NCDatasets.variable(source, name)
         time_index = findfirst(==(time_dim), dimnames(variable))
         time_index === nothing && continue
         haskey(output, name) || continue
 
-        input_indices = variable_indices(variable, ranges)
+        input_indices = variable_indices(variable, subset.ranges)
         data = variable[input_indices...]
         output_variable = NCDatasets.variable(output, name)
         output_indices = ntuple(ndims(output_variable)) do i
@@ -282,10 +305,6 @@ end
 
 function process_month(year, month, config::FjordConfig; files = nothing)
     forcing_config = config.forcing_config
-    parameters = forcing_config.parameters
-    latitude_range = config.grid_config.latitude
-    longitude_range = config.grid_config.longitude
-
     files = isnothing(files) ? list_opendap_files(catalog_url = forcing_config.catalog_url) : files
     month_string = ".$(year)$(lpad(month, 2, '0'))"
     year_month = month_string[2:end]
@@ -314,17 +333,17 @@ function process_month(year, month, config::FjordConfig; files = nothing)
             println("    Opened: $url")
         end
 
-        ranges, mask, spatial_dimensions = subset_ranges(first(datasets); latitude_range, longitude_range)
+        subset = subset_ranges(first(datasets), config)
         total_time = sum(time_length, datasets)
 
         println("  Writing output to: $output_path")
-        output = define_output_file(output_path, first(datasets), ranges, total_time; parameters)
+        output = define_output_file(output_path, first(datasets), subset, total_time)
         try
             time_start = 1
             for ds in datasets
-                write_time_dependent_coordinates!(output, ds, ranges, time_start; parameters)
-                for name in parameters
-                    write_parameter_chunk!(output, ds, name, ranges, mask, spatial_dimensions, time_start)
+                write_time_dependent_coordinates!(output, ds, subset, time_start)
+                for name in subset.parameters
+                    write_parameter_chunk!(output, ds, name, subset, time_start)
                 end
                 time_start += time_length(ds)
             end
