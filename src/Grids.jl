@@ -1,6 +1,6 @@
 module Grids
 
-export ImmersedBoundaryGrid, GridConfig
+export ImmersedBoundaryGrid, EvenGrid
 
 using Oceananigans
 using Oceananigans.BoundaryConditions: fill_halo_regions!
@@ -9,11 +9,13 @@ using NCDatasets
 import Oceananigans.ImmersedBoundaries: ImmersedBoundaryGrid
 import Oceananigans: LatitudeLongitudeGrid
 using ..Utils: compute_faces
+using ..Configs: AbstractGridConfig
 
 """
-    GridConfig
+    EvenGrid
 
-Configuration for a `LatitudeLongitudeGrid` used in FjordSim simulations.
+Configuration for a `LatitudeLongitudeGrid` that is regularly spaced in longitude and
+latitude, with explicit vertical faces.
 
 # Fields
 - `size`: `(Nx, Ny, Nz)` number of cells.
@@ -22,7 +24,7 @@ Configuration for a `LatitudeLongitudeGrid` used in FjordSim simulations.
 - `latitude`: `(south, north)` latitude bounds in degrees.
 - `z_faces`: Vertical face coordinates in increasing order (bottom to top).
 """
-Base.@kwdef struct GridConfig
+Base.@kwdef mutable struct EvenGrid <: AbstractGridConfig
     size::NTuple{3,Int}
     halo::NTuple{3,Int}
     longitude::NTuple{2,Float64}
@@ -30,7 +32,7 @@ Base.@kwdef struct GridConfig
     z_faces::Vector{Float64}
 end
 
-function LatitudeLongitudeGrid(arch, config::GridConfig)
+function LatitudeLongitudeGrid(arch, config::EvenGrid)
     return LatitudeLongitudeGrid(
         arch;
         size      = config.size,

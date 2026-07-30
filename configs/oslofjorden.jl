@@ -2,8 +2,8 @@ using FjordSim
 
 _data_root = expanduser("~/FjordSim_data/oslofjorden")
 
-(
-    grid = GridConfig(
+FjordConfig(
+    grid_config = EvenGrid(
         size      = (240, 520, 18),
         halo      = (7, 7, 7),
         longitude = (10.2, 11.02),
@@ -13,10 +13,10 @@ _data_root = expanduser("~/FjordSim_data/oslofjorden")
             -75.0, -50.0, -25.0, -15.0, -10.0, -7.5, -5.0, -3.0, -2.0, -1.0, 0.0,
         ],
     ),
-    bathymetry = BathymetryConfig(
-        output_path           = joinpath(_data_root, "bathymetry.nc"),
-        plot_path             = joinpath(_data_root, "bathymetry.png"),
-        geodatabase_path      = joinpath(expanduser("~/FjordSim_data"), "Basisdata_0000_Norge_25833_Dybdedata_FGDB.gdb"),
+    bathymetry_config = DybdedataConfig(
+        data_root             = _data_root,
+        output_file           = "bathymetry.nc",
+        plot_file             = "bathymetry.png",
         raw_resolution_factor = 2,
         padding_cells         = 2,
         include_contours      = false,
@@ -26,11 +26,8 @@ _data_root = expanduser("~/FjordSim_data/oslofjorden")
         geonorge_cache        = true,
         regrid_cache          = false,
     ),
-    norkyst = NorKystConfig(
-        output_dir  = joinpath(_data_root, "norkyst"),
-        catalog_url = "https://thredds.met.no/thredds/catalog/fou-hi/norkyst800m/catalog.xml",
-        opendap_url = "https://thredds.met.no/thredds/dodsC/fou-hi/norkyst800m/",
-        parameters  = ["temperature", "salinity", "u_eastward", "v_northward"],
-        years       = [2020],
+    forcing_config = NorKystConfig(
+        data_root = _data_root,
+        years     = [2020],
     ),
 )

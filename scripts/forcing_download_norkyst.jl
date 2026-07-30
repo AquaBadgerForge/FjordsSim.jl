@@ -280,21 +280,16 @@ function write_time_dependent_coordinates!(output, source, ranges, time_start; p
     end
 end
 
-function process_month(
-    year,
-    month,
-    output_dir;
-    files = nothing,
-    catalog_url,
-    opendap_url,
-    parameters,
-    latitude_range,
-    longitude_range,
-)
-    files = isnothing(files) ? list_opendap_files(catalog_url = catalog_url) : files
+function process_month(year, month, config::FjordConfig; files = nothing)
+    forcing_config = config.forcing_config
+    parameters = forcing_config.parameters
+    latitude_range = config.grid_config.latitude
+    longitude_range = config.grid_config.longitude
+
+    files = isnothing(files) ? list_opendap_files(catalog_url = forcing_config.catalog_url) : files
     month_string = ".$(year)$(lpad(month, 2, '0'))"
     year_month = month_string[2:end]
-    output_path = joinpath(output_dir, "NorKyst-800m_ZDEPTHS_avg_$(year_month).nc")
+    output_path = joinpath(norkyst_directory(forcing_config), norkyst_monthly_filename(year, month))
 
     if isfile(output_path)
         println("Skipping $year_month (already exists)")
@@ -309,7 +304,7 @@ function process_month(
         return nothing
     end
 
-    urls = [joinpath(opendap_url, file) for file in monthly_files]
+    urls = [joinpath(forcing_config.opendap_url, file) for file in monthly_files]
     println("  Opening $(length(urls)) datasets...")
 
     datasets = NCDataset[]
@@ -347,27 +342,18 @@ end
 function main()
     args = parse_args()
     config = args.config
-    norkyst = config.norkyst
-    mkpath(norkyst.output_dir)
+    forcing_config = config.forcing_config
+    output_directory = norkyst_directory(forcing_config)
+    mkpath(output_directory)
 
-    println("Processing years: $(join(norkyst.years, ", "))")
+    println("Processing years: $(join(forcing_config.years, ", "))")
     println("Config: $(args.config_path)")
-    println("Output directory: $(norkyst.output_dir)\n")
+    println("Output directory: $output_directory\n")
 
-    files = list_opendap_files(catalog_url = norkyst.catalog_url)
-    for year in norkyst.years
+    files = list_opendap_files(catalog_url = forcing_config.catalog_url)
+    for year in forcing_config.years
         for month in 1:12
-            process_month(
-                year,
-                month,
-                norkyst.output_dir;
-                files,
-                catalog_url = norkyst.catalog_url,
-                opendap_url = norkyst.opendap_url,
-                parameters = norkyst.parameters,
-                latitude_range = config.grid.latitude,
-                longitude_range = config.grid.longitude,
-            )
+            process_month(year, month, config; files)
         end
     end
 

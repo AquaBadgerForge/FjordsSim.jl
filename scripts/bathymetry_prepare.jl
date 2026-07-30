@@ -23,8 +23,15 @@ function default_bathymetry_figure_size(grid)
     )
 end
 
-function plot_bathymetry(grid, bathymetry; plot_path, title = "Bathymetry", figure_size = default_bathymetry_figure_size(grid))
-    isdir(dirname(plot_path)) || mkpath(dirname(plot_path))
+function plot_bathymetry(
+    grid,
+    bathymetry,
+    config::DybdedataConfig;
+    title = "Bathymetry",
+    figure_size = default_bathymetry_figure_size(grid),
+)
+    plot_file = plot_path(config)
+    isdir(dirname(plot_file)) || mkpath(dirname(plot_file))
 
     cpu_bathymetry = on_architecture(CPU(), bathymetry)
     bathymetry_data = Array(interior(cpu_bathymetry, :, :, 1))
@@ -66,9 +73,9 @@ function plot_bathymetry(grid, bathymetry; plot_path, title = "Bathymetry", figu
         color = :black,
         linewidth = 4,
     )
-    save(plot_path, figure)
+    save(plot_file, figure)
 
-    return plot_path
+    return plot_file
 end
 
 function parse_args(args = ARGS)
@@ -123,17 +130,17 @@ function main()
     args = parse_args()
     config = include(abspath(args.config_path))
 
-    grid = LatitudeLongitudeGrid(CPU(), config.grid)
-    mkpath(dirname(config.bathymetry.output_path))
+    grid = LatitudeLongitudeGrid(CPU(), config.grid_config)
+    mkpath(dirname(bathymetry_path(config.bathymetry_config)))
     print_grid_extents(grid)
 
-    result = prepare_geonorge_bathymetry(grid, config.bathymetry)
+    result = prepare_geonorge_bathymetry(grid, config.bathymetry_config)
 
-    plot_bathymetry(grid, result.bottom_height; plot_path = config.bathymetry.plot_path)
+    plot_file = plot_bathymetry(grid, result.bottom_height, config.bathymetry_config)
 
-    @info "Raw Geonorge bathymetry saved to $(result.raw_path)"
-    @info "Processed FjordSim bathymetry saved to $(result.output_path)"
-    @info "Bathymetry plot saved to $(config.bathymetry.plot_path)"
+    @info "Raw Geonorge bathymetry saved to $(result.raw_file)"
+    @info "Processed FjordSim bathymetry saved to $(result.output_file)"
+    @info "Bathymetry plot saved to $plot_file"
 end
 
 if abspath(PROGRAM_FILE) == @__FILE__() || get(ENV, "FJORDSIM_RUN_MAIN", "") == "1"

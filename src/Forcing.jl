@@ -13,27 +13,57 @@ import Oceananigans: on_architecture
 import Oceananigans.Fields: set!
 import Oceananigans.OutputReaders: new_backend
 
-export forcing_from_file, NorKystConfig
+using ..Configs: AbstractForcingConfig
+
+export forcing_from_file, norkyst_directory, norkyst_monthly_filename, NorKystConfig
+
+const NORKYST_CATALOG_URL = "https://thredds.met.no/thredds/catalog/fou-hi/norkyst800m/catalog.xml"
+const NORKYST_OPENDAP_URL = "https://thredds.met.no/thredds/dodsC/fou-hi/norkyst800m/"
+const NORKYST_DIRECTORY = "norkyst"
+const NORKYST_PARAMETERS = ["temperature", "salinity", "u_eastward", "v_northward"]
+
+"""
+    norkyst_monthly_filename(year, month)
+
+Name of the combined monthly NorKyst-800m NetCDF file written for `year` and `month`.
+"""
+norkyst_monthly_filename(year, month) = "NorKyst-800m_ZDEPTHS_avg_$(year)$(lpad(month, 2, '0')).nc"
 
 """
     NorKystConfig
 
 Configuration for downloading and subsetting NorKyst-800m reanalysis data.
 
+Only `data_root` and `years` are required; the remaining fields default to the public
+THREDDS endpoints and a `norkyst` subdirectory of `data_root`.
+
+`output_directory` is a name relative to `data_root`, resolved by `norkyst_directory`.
+Setting it to an absolute path overrides `data_root`.
+
 # Fields
-- `output_dir`: Directory where monthly NetCDF files are written.
+- `data_root`: Directory holding this setup's forcing files.
+- `output_directory`: Name of the directory where monthly NetCDF files are written.
 - `catalog_url`: THREDDS catalog URL listing available files.
 - `opendap_url`: OPeNDAP base URL for streaming data.
 - `parameters`: Variable names to extract (e.g. `["temperature", "salinity"]`).
 - `years`: Calendar years to download.
 """
-Base.@kwdef struct NorKystConfig
-    output_dir::String
-    catalog_url::String
-    opendap_url::String
-    parameters::Vector{String}
+Base.@kwdef mutable struct NorKystConfig <: AbstractForcingConfig
+    data_root::String
+    output_directory::String = NORKYST_DIRECTORY
+    catalog_url::String = NORKYST_CATALOG_URL
+    opendap_url::String = NORKYST_OPENDAP_URL
+    parameters::Vector{String} = copy(NORKYST_PARAMETERS)
     years::Vector{Int}
 end
+
+"""
+    norkyst_directory(config::NorKystConfig)
+
+Resolve `config.output_directory` against `config.data_root`. An absolute
+`output_directory` is returned unchanged.
+"""
+norkyst_directory(config::NorKystConfig) = joinpath(config.data_root, config.output_directory)
 
 """ Custom backend for FieldTimeSeries """
 struct NetCDFBackend <: AbstractInMemoryBackend{Int}

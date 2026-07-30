@@ -5,13 +5,22 @@ export
     ImmersedBoundaryGrid,
     LatitudeLongitudeGrid,
     # configs
-    GridConfig,
-    BathymetryConfig,
+    FjordConfig,
+    AbstractGridConfig,
+    AbstractBathymetryConfig,
+    AbstractForcingConfig,
+    EvenGrid,
+    DybdedataConfig,
     NorKystConfig,
     # bathymetry
     prepare_geonorge_bathymetry,
+    bathymetry_path,
+    plot_path,
+    geodatabase_path,
     # forcings
     forcing_from_file,
+    norkyst_directory,
+    norkyst_monthly_filename,
     # boundary conditions
     top_bottom_boundary_conditions,
     # simulations
@@ -55,6 +64,7 @@ function compute_bounding_indices(longitude::Nothing, latitude::Nothing, grid, L
     return i₁, i₂, j₁, j₂, TX
 end
 
+include("Configs.jl")
 include("FDatasets.jl")
 include("Utils.jl")
 include("Bathymetry.jl")
@@ -63,6 +73,7 @@ include("Forcing.jl")
 include("BoundaryConditions.jl")
 include("Grids.jl")
 
+using .Configs
 using .FDatasets
 using .Utils
 using .Bathymetry

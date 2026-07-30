@@ -24,6 +24,16 @@ import Oceananigans.OutputReaders: new_backend, update_field_time_series!
 import NumericalEarth: all_dates
 import NumericalEarth.DataWrangling: metadata_filename
 
+const NORA3_FILE = "NORA3.nc"
+
+"""
+    default_nora3_dataset()
+
+`MultiYearNORA3` for the default NORA3 reanalysis file at
+`~/FjordSim_data/NORA3/NORA3.nc`.
+"""
+default_nora3_dataset() = MultiYearNORA3(NORA3_FILE, joinpath(homedir(), "FjordSim_data", "NORA3"))
+
 NORA3_variable_names = (
     :freshwater_flux,
     :specific_humidity,
@@ -217,7 +227,7 @@ end
 function NORA3PrescribedAtmosphere(
     architecture = CPU(),
     FT = Float32;
-    dataset = MultiYearNORA3("NORA3.nc", joinpath(homedir(), "FjordSim_data", "NORA3")),
+    dataset = default_nora3_dataset(),
     start_date = first_date(dataset),
     end_date = last_date(dataset),
     backend = NORA3NetCDFBackend(10),
@@ -265,7 +275,7 @@ end # function
 
 """
     NORA3PrescribedRadiation([architecture = CPU(), FT = Float32];
-                             dataset = MultiYearNORA3("NORA3.nc", joinpath(homedir(), "FjordSim_data", "NORA3")),
+                             dataset = default_nora3_dataset(),
                              start_date = first_date(dataset),
                              end_date = last_date(dataset),
                              backend = NORA3NetCDFBackend(10),
@@ -281,7 +291,7 @@ longwave `NORA3FieldTimeSeries`.
 function NORA3PrescribedRadiation(
     architecture = CPU(),
     FT = Float32;
-    dataset = MultiYearNORA3("NORA3.nc", joinpath(homedir(), "FjordSim_data", "NORA3")),
+    dataset = default_nora3_dataset(),
     start_date = first_date(dataset),
     end_date = last_date(dataset),
     backend = NORA3NetCDFBackend(10),

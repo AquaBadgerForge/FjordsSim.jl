@@ -6,10 +6,45 @@ using NCDatasets
 using Oceananigans
 using Oceananigans.BoundaryConditions: FluxBoundaryCondition
 
+# Alternative config types used by the "Config extensibility" testset. They exist only to
+# check that `FjordConfig` accepts any subtype of the abstract config supertypes and that new
+# behavior is added by overloading, without editing FjordSim. Defined at top level because a
+# @testset body is a function scope, where `struct` is not allowed.
+struct SingleColumnGrid <: AbstractGridConfig
+    depth::Float64
+end
+
+struct MinimalBathymetry <: AbstractBathymetryConfig
+    data_root::String
+    output_file::String
+    plot_file::String
+end
+
+struct ConstantForcing <: AbstractForcingConfig
+    temperature::Float64
+end
+
+# New behavior for a new grid config, added without touching Grids.jl.
+Oceananigans.LatitudeLongitudeGrid(arch, config::SingleColumnGrid) = LatitudeLongitudeGrid(
+    arch;
+    size = (1, 1, 2),
+    halo = (1, 1, 1),
+    longitude = (10.0, 11.0),
+    latitude = (59.0, 60.0),
+    z = [-config.depth, -config.depth / 2, 0.0],
+)
+
 @testset "Backward Compatibility — API Exports" begin
     # Verify all exported symbols are present in the public interface
     exported_symbols = [
         :ImmersedBoundaryGrid,
+        :FjordConfig,
+        :AbstractGridConfig,
+        :AbstractBathymetryConfig,
+        :AbstractForcingConfig,
+        :EvenGrid,
+        :DybdedataConfig,
+        :NorKystConfig,
         :forcing_from_file,
         :top_bottom_boundary_conditions,
         :coupled_hydrostatic_simulation,
@@ -48,8 +83,8 @@ end
 @testset "Backward Compatibility — Function Signatures" begin
     mktempdir() do tmp
         # Create minimal test files
-        bathymetry_path = joinpath(tmp, "bathymetry.nc")
-        ds = NCDataset(bathymetry_path, "c")
+        bathymetry_file = joinpath(tmp, "bathymetry.nc")
+        ds = NCDataset(bathymetry_file, "c")
         defDim(ds, "x", 2)
         defDim(ds, "y", 2)
         defDim(ds, "zf", 3)
@@ -64,7 +99,7 @@ end
         close(ds)
 
         arch = CPU()
-        grid = ImmersedBoundaryGrid(bathymetry_path, arch, (1, 1, 1))
+        grid = ImmersedBoundaryGrid(bathymetry_file, arch, (1, 1, 1))
 
         # Test top_bottom_boundary_conditions signature
         @test_nowarn top_bottom_boundary_conditions(; grid, bottom_drag_coefficient = 0.003)
@@ -122,14 +157,127 @@ end
     end
 end
 
+@testset "Setup configs" begin
+    data_root = joinpath(tempdir(), "fjordsim_config_test")
+
+    # A setup must name its own output files; only the Geonorge FileGDB name is defaulted.
+    @test_throws UndefKeywordError DybdedataConfig(data_root = data_root)
+    @test_throws UndefKeywordError DybdedataConfig(data_root = data_root, output_file = "b.nc")
+    @test_throws UndefKeywordError DybdedataConfig(output_file = "b.nc", plot_file = "b.png")
+
+    bathymetry_config = DybdedataConfig(
+        data_root = data_root,
+        output_file = "bathymetry_105to232.nc",
+        plot_file = "bathymetry_105to232.png",
+        padding_cells = 4,
+    )
+    # Chosen names resolve against data_root...
+    @test bathymetry_path(bathymetry_config) == joinpath(data_root, "bathymetry_105to232.nc")
+    @test plot_path(bathymetry_config) == joinpath(data_root, "bathymetry_105to232.png")
+    @test geodatabase_path(bathymetry_config) ==
+          joinpath(data_root, "Basisdata_0000_Norge_25833_Dybdedata_FGDB.gdb")
+    @test isdir(bathymetry_config.raw_directory)  # scratch space created by __init__
+
+    # ...while an absolute path overrides data_root, so one FileGDB copy can be shared.
+    shared = DybdedataConfig(
+        data_root = data_root,
+        output_file = "bathymetry.nc",
+        plot_file = "bathymetry.png",
+        geodatabase_file = "/shared/Dybdedata.gdb",
+    )
+    @test geodatabase_path(shared) == "/shared/Dybdedata.gdb"
+    @test bathymetry_path(shared) == joinpath(data_root, "bathymetry.nc")  # others unaffected
+
+    forcing_config = NorKystConfig(data_root = data_root, years = [2020])
+    @test norkyst_directory(forcing_config) == joinpath(data_root, "norkyst")
+    @test norkyst_directory(NorKystConfig(data_root = data_root, output_directory = "/nk", years = [2020])) == "/nk"
+    @test norkyst_monthly_filename(2020, 3) == "NorKyst-800m_ZDEPTHS_avg_202003.nc"
+    @test occursin("thredds.met.no", forcing_config.catalog_url)
+    # Each config gets its own parameter vector, not the shared module-level default.
+    @test forcing_config.parameters !== FjordSim.Forcing.NORKYST_PARAMETERS
+
+    grid_config = EvenGrid(
+        size = (2, 3, 2),
+        halo = (1, 1, 1),
+        longitude = (10.0, 12.0),
+        latitude = (59.0, 62.0),
+        z_faces = [-20.0, -10.0, 0.0],
+    )
+
+    config = FjordConfig(; grid_config, bathymetry_config, forcing_config)
+    grid = LatitudeLongitudeGrid(CPU(), config.grid_config)
+
+    # `native_region!` derives the padded native region from the target grid: 4 cells of
+    # 1 degree either side, refined by the default raw_resolution_factor of 4.
+    FjordSim.Bathymetry.native_region!(config.bathymetry_config, grid)
+    @test config.bathymetry_config.longitude == (6.0, 16.0)
+    @test config.bathymetry_config.latitude == (55.0, 66.0)
+    @test config.bathymetry_config.size == (40, 44, 1)
+    @test dirname(config.bathymetry_config.raw_file) == config.bathymetry_config.raw_directory
+    @test occursin("_40x44", config.bathymetry_config.raw_file)
+
+    # Every config is editable in place.
+    config.grid_config.size = (4, 6, 2)
+    config.bathymetry_config.padding_cells = 0
+    config.forcing_config.years = [2020, 2021]
+    @test config.grid_config.size == (4, 6, 2)
+    @test config.bathymetry_config.padding_cells == 0
+    @test config.forcing_config.years == [2020, 2021]
+end
+
+@testset "Config extensibility" begin
+    data_root = joinpath(tempdir(), "fjordsim_extensibility_test")
+
+    # FjordConfig accepts the alternative subtypes without any change to its definition.
+    config = FjordConfig(
+        grid_config = SingleColumnGrid(120.0),
+        bathymetry_config = MinimalBathymetry(data_root, "column.nc", "column.png"),
+        forcing_config = ConstantForcing(8.0),
+    )
+
+    @test config.grid_config isa AbstractGridConfig
+    @test config.bathymetry_config isa AbstractBathymetryConfig
+    @test config.forcing_config isa AbstractForcingConfig
+
+    # Field types are still concrete, so the struct stays type-stable per instantiation.
+    @test isconcretetype(typeof(config))
+    @test fieldtype(typeof(config), :grid_config) === SingleColumnGrid
+
+    # ...and the built-in types remain valid, i.e. FjordConfig is genuinely generic.
+    @test FjordConfig(
+        grid_config = EvenGrid(
+            size = (2, 3, 2),
+            halo = (1, 1, 1),
+            longitude = (10.0, 12.0),
+            latitude = (59.0, 62.0),
+            z_faces = [-20.0, -10.0, 0.0],
+        ),
+        bathymetry_config = DybdedataConfig(
+            data_root = data_root,
+            output_file = "bathymetry.nc",
+            plot_file = "bathymetry.png",
+        ),
+        forcing_config = NorKystConfig(data_root = data_root, years = [2020]),
+    ) isa FjordConfig
+
+    # Path resolution is inherited from AbstractBathymetryConfig — no new methods needed.
+    @test bathymetry_path(config.bathymetry_config) == joinpath(data_root, "column.nc")
+    @test plot_path(config.bathymetry_config) == joinpath(data_root, "column.png")
+
+    # A method overloaded on the new grid config is picked up by existing call sites.
+    grid = LatitudeLongitudeGrid(CPU(), config.grid_config)
+    @test size(grid) == (1, 1, 2)
+    @test collect(Oceananigans.Grids.znodes(grid, Face())) == [-120.0, -60.0, 0.0]
+end
+
 @testset "FjordSim.jl" begin
     mktempdir() do tmp
-        bathymetry_path = joinpath(tmp, "bathymetry.nc")
+        bathymetry_file = joinpath(tmp, "bathymetry.nc")
         nora3_filename = "NORA3_test.nc"
         nora3_path = joinpath(tmp, nora3_filename)
 
         # Minimal bathymetry file for Grids.ImmersedBoundaryGrid.
-        ds = NCDataset(bathymetry_path, "c")
+        ds = NCDataset(bathymetry_file, "c")
         defDim(ds, "x", 2)
         defDim(ds, "y", 2)
         defDim(ds, "zf", 3)
@@ -155,7 +303,7 @@ end
         close(ds)
 
         arch = CPU()
-        grid = @test_nowarn ImmersedBoundaryGrid(bathymetry_path, arch, (1, 1, 1))
+        grid = @test_nowarn ImmersedBoundaryGrid(bathymetry_file, arch, (1, 1, 1))
         @test_nowarn top_bottom_boundary_conditions(; grid, bottom_drag_coefficient = 0.003)
         @test_nowarn MultiYearNORA3(nora3_filename, tmp)
     end
@@ -177,16 +325,38 @@ end
         bottom_height = Field{Center, Center, Nothing}(grid)
         set!(bottom_height, [-15.0 -16.0 -17.0; -18.0 -19.0 -20.0])
 
-        bathymetry_path = joinpath(tmp, "bathymetry_written.nc")
-        @test_nowarn write_bathymetry_file(bathymetry_path, grid, bottom_height)
+        bathymetry_file = joinpath(tmp, "bathymetry_written.nc")
+        @test_nowarn write_bathymetry_file(bathymetry_file, grid, bottom_height)
 
-        ds = NCDataset(bathymetry_path)
+        ds = NCDataset(bathymetry_file)
         @test ds["lon"][:] == [10.5, 11.5]
         @test ds["lat"][:] == [59.5, 60.5, 61.5]
         @test ds["h"][:, :] == Float32[-15.0 -16.0 -17.0; -18.0 -19.0 -20.0]
+        # z_faces must survive the write unchanged: `vertical_faces` previously offset its
+        # slice of the OffsetArray `grid.z.cᵃᵃᶠ` by the halo, dropping the deepest face and
+        # appending one above the surface.
+        @test ds["z_faces"][:] == z_faces
         close(ds)
 
-        @test_nowarn ImmersedBoundaryGrid(bathymetry_path, arch, (1, 1, 1))
+        # Full round-trip: grid -> file -> grid must preserve the vertical extent.
+        reloaded = ImmersedBoundaryGrid(bathymetry_file, arch, (1, 1, 1))
+        @test collect(Oceananigans.Grids.znodes(reloaded.underlying_grid, Face())) == z_faces
+
+        @test FjordSim.Bathymetry.vertical_faces(grid) == z_faces
+        # Independent of the halo size, which is what the old indexing got wrong.
+        for halo_size in (1, 2, 3)
+            deep_faces = [-450.0, -200.0, -50.0, 0.0]
+            deep_grid = LatitudeLongitudeGrid(
+                arch;
+                size = (4, 4, 3),
+                halo = (halo_size, halo_size, halo_size),
+                longitude = (10.0, 11.0),
+                latitude = (59.0, 60.0),
+                z = deep_faces,
+            )
+            @test FjordSim.Bathymetry.vertical_faces(deep_grid) == deep_faces
+        end
+
         @test FjordSim.Bathymetry.contour_point_indices(10, 3) == [0, 3, 6, 9]
         @test FjordSim.Bathymetry.contour_point_indices(5, 3) == [0, 3, 4]
     end
@@ -272,9 +442,17 @@ end
     contour_depth = 42.0
     contour_stride = 2
 
-    xs = Float64[]
-    ys = Float64[]
-    bottom_heights = Float64[]
+    # `collect_depth_layer_coordinates!` reads the spatial filter and the contour stride off
+    # the config, so set the derived `filter_bounds` directly instead of via `native_region!`.
+    bathymetry_config = DybdedataConfig(
+        data_root = tempdir(),
+        output_file = "bathymetry.nc",
+        plot_file = "bathymetry.png",
+        contour_stride = contour_stride,
+        filter_bounds = (0.0, 6_500_000.0, 100_000.0, 6_700_000.0),
+    )
+    samples = FjordSim.Bathymetry.DepthSamples()
+    xs, ys, bottom_heights = samples.xs, samples.ys, samples.bottom_heights
 
     ArchGDAL.importEPSG(25833; order = :trad) do source_srs
         ArchGDAL.create(ArchGDAL.getdriver("Memory")) do dataset
@@ -312,29 +490,18 @@ end
             end
 
             FjordSim.Bathymetry.collect_depth_layer_coordinates!(
-                xs,
-                ys,
-                bottom_heights,
+                samples,
                 dataset,
                 "dybdepunkt",
-                0.0,
-                6_500_000.0,
-                100_000.0,
-                6_700_000.0;
+                bathymetry_config;
                 geometry = :point,
             )
             FjordSim.Bathymetry.collect_depth_layer_coordinates!(
-                xs,
-                ys,
-                bottom_heights,
+                samples,
                 dataset,
                 "dybdekurve",
-                0.0,
-                6_500_000.0,
-                100_000.0,
-                6_700_000.0;
+                bathymetry_config;
                 geometry = :line,
-                contour_stride,
             )
         end
     end
