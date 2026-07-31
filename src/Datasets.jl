@@ -1,6 +1,6 @@
-module FDatasets
+module Datasets
 
-export DSForcing, DSResults, last_date
+export ForcingDataset, ResultsDataset, last_date
 
 using Dates
 
@@ -25,7 +25,7 @@ import NumericalEarth.DataWrangling:
     retrieve_data,
     default_inpainting
 
-struct DSForcing{D, Z}
+struct ForcingDataset{D, Z}
     metadata_filename::String
     default_download_directory::String
     reversed_vertical_axis::Bool
@@ -38,25 +38,25 @@ struct DSForcing{D, Z}
     z_interfaces::Vector{Z}
 end
 
-function DSForcing(metadata_filename, default_download_directory)
+function ForcingDataset(metadata_filename, default_download_directory)
     filepath = joinpath(default_download_directory, metadata_filename)
     ds = NCDataset(filepath)
     longitude_interfaces = (Float64(ds["Nx"][1]), Float64(ds["Nx"][end]))
     latitude_interfaces = (Float64(ds["Ny"][1]), Float64(ds["Ny"][end]))
-    sz = NTuple{3, Int}((ds.dim["Nx"], ds.dim["Ny"], ds.dim["Nz"]))
+    dataset_size = NTuple{3, Int}((ds.dim["Nx"], ds.dim["Ny"], ds.dim["Nz"]))
     all_dates = ds["time"][:]
     first_date = ds["time"][1]
     last_date = ds["time"][end]
     z_interfaces = ds["Nz_faces"][:]
     close(ds)
 
-    return DSForcing(
+    return ForcingDataset(
         metadata_filename,
         default_download_directory,
         false,
         longitude_interfaces,
         latitude_interfaces,
-        sz,
+        dataset_size,
         all_dates,
         first_date,
         last_date,
@@ -64,7 +64,7 @@ function DSForcing(metadata_filename, default_download_directory)
     )
 end  # function
 
-struct DSResults{D, Z}
+struct ResultsDataset{D, Z}
     metadata_filename::String
     default_download_directory::String
     reversed_vertical_axis::Bool
@@ -78,7 +78,7 @@ struct DSResults{D, Z}
 end
 
 """
-    DSResults(metadata_filename, default_download_directory; start_date_time)
+    ResultsDataset(metadata_filename, default_download_directory; start_date_time)
 
 Load and save info from a NetCDF file.
 
@@ -95,7 +95,7 @@ Load and save info from a NetCDF file.
     `joinpath(default_download_directory, metadata_filename)`.
 
 """
-function DSResults(
+function ResultsDataset(
     metadata_filename::String,
     default_download_directory::String;
     start_date_time::DateTime
@@ -104,20 +104,20 @@ function DSResults(
     ds = NCDataset(filepath)
     longitude_interfaces = (Float64(ds["λ_faa"][1]), Float64(ds["λ_faa"][end]))
     latitude_interfaces = (Float64(ds["φ_afa"][1]), Float64(ds["φ_afa"][end]))
-    sz = NTuple{3, Int}(size(ds["T"])[1:3])  # that is for a grid, so size should be for tracers
+    dataset_size = NTuple{3, Int}(size(ds["T"])[1:3])  # that is for a grid, so size should be for tracers
     all_dates = start_date_time .+ Millisecond.(round.(Int, ds["time"][:] .* 1000))
     first_date = all_dates[1]
     last_date = all_dates[end]
     z_interfaces = ds["z_aaf"][:]
     close(ds)
 
-    return DSResults(
+    return ResultsDataset(
         metadata_filename,
         default_download_directory,
         false,
         longitude_interfaces,
         latitude_interfaces,
-        sz,
+        dataset_size,
         all_dates,
         first_date,
         last_date,
@@ -142,23 +142,23 @@ Variable_location = Dict(
     :downwelling_longwave => (Center, Center, Nothing),
 )
 
-const MetadatumForcing = Metadatum{<:DSForcing,<:Any,<:Any}
-const MetadatumResults = Metadatum{<:DSResults,<:Any,<:Any}
+const MetadatumForcing = Metadatum{<:ForcingDataset,<:Any,<:Any}
+const MetadatumResults = Metadatum{<:ResultsDataset,<:Any,<:Any}
 
 # Metadatum constructors query metadata_filename(dataset, ...) with extra context arguments.
-metadata_filename(ds::Union{DSResults, DSForcing}, args...) = ds.metadata_filename
+metadata_filename(ds::Union{ResultsDataset, ForcingDataset}, args...) = ds.metadata_filename
 metadata_filename(metadata::Union{MetadatumForcing, MetadatumResults}) = metadata.dataset.metadata_filename
-default_download_directory(ds::Union{DSResults, DSForcing}) = ds.default_download_directory
-reversed_vertical_axis(ds::Union{DSResults, DSForcing}) = ds.reversed_vertical_axis
-longitude_interfaces(ds::Union{DSResults, DSForcing}) = ds.longitude_interfaces
-latitude_interfaces(ds::Union{DSResults, DSForcing}) = ds.latitude_interfaces
+default_download_directory(ds::Union{ResultsDataset, ForcingDataset}) = ds.default_download_directory
+reversed_vertical_axis(ds::Union{ResultsDataset, ForcingDataset}) = ds.reversed_vertical_axis
+longitude_interfaces(ds::Union{ResultsDataset, ForcingDataset}) = ds.longitude_interfaces
+latitude_interfaces(ds::Union{ResultsDataset, ForcingDataset}) = ds.latitude_interfaces
 
-Base.size(ds::Union{DSResults, DSForcing}) = ds.size
-Base.size(ds::Union{DSResults, DSForcing}, variable) = size(ds)
+Base.size(ds::Union{ResultsDataset, ForcingDataset}) = ds.size
+Base.size(ds::Union{ResultsDataset, ForcingDataset}, variable) = size(ds)
 
-all_dates(ds::Union{DSResults, DSForcing}, args...) = ds.all_dates
-first_date(ds::Union{DSResults, DSForcing}, args...) = ds.first_date
-last_date(ds::Union{DSResults, DSForcing}, args...) = ds.last_date
+all_dates(ds::Union{ResultsDataset, ForcingDataset}, args...) = ds.all_dates
+first_date(ds::Union{ResultsDataset, ForcingDataset}, args...) = ds.first_date
+last_date(ds::Union{ResultsDataset, ForcingDataset}, args...) = ds.last_date
 
 z_interfaces(metadata::Union{MetadatumResults, MetadatumForcing}) = metadata.dataset.z_interfaces
 
@@ -196,7 +196,7 @@ inpainted_metadata_path(metadata::Union{MetadatumResults, MetadatumForcing}) = j
 
 Retrieve data from netcdf file according to `metadata`.
 """
-function retrieve_data(metadata::Union{Metadatum{V} where V<:DSResults, Metadatum{V} where V<:DSForcing})
+function retrieve_data(metadata::Union{Metadatum{V} where V<:ResultsDataset, Metadatum{V} where V<:ForcingDataset})
     path = metadata_path(metadata)
     name = dataset_variable_name(metadata)
     # NetCDF shenanigans

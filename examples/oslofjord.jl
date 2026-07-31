@@ -4,14 +4,17 @@ using Oceananigans.Units
 using NumericalEarth
 using SeawaterPolynomials.TEOS10
 using FjordSim
-using FjordSim.FDatasets
+using FjordSim.Datasets
 using CUDA  # it should be here to make GPU() not throw an error
 
 const FT = Oceananigans.defaults.FloatType
 
-arch = GPU()
-grid =
-    ImmersedBoundaryGrid(joinpath(homedir(), "FjordSim_data", "oslofjord", "bathymetry_105to232.nc"), arch, (7, 7, 7))
+architecture = GPU()
+grid = ImmersedBoundaryGrid(
+    joinpath(homedir(), "FjordSim_data", "oslofjord", "bathymetry_105to232.nc"),
+    architecture,
+    (7, 7, 7),
+)
 buoyancy = SeawaterBuoyancy(FT, equation_of_state = TEOS10EquationOfState(FT))
 closure = (
     CATKEVerticalDiffusivity(minimum_tke = 7e-6),
@@ -20,7 +23,7 @@ closure = (
 tracer_advection = (T = WENO(), S = WENO())
 momentum_advection = WENOVectorInvariant(FT)
 tracers = (:T, :S)
-# dataset = DSResults(
+# dataset = ResultsDataset(
 #     "snapshots_ocean_2.nc",
 #     joinpath(homedir(), "FjordSim_results", "oslofjord");
 #     start_date_time = DateTime(2025, 1, 1),
@@ -43,14 +46,14 @@ tbbc = top_bottom_boundary_conditions(; grid = grid, bottom_drag_coefficient = 0
 sobc = (v = (south = OpenBoundaryCondition(nothing),),)
 boundary_conditions = map(x -> FieldBoundaryConditions(; x...), recursive_merge(tbbc, sobc))
 # atmosphere = JRA55PrescribedAtmosphere(
-#     arch,
+#     architecture,
 #     FT;
 #     latitude = (58.98, 59.94),
 #     longitude = (10.18, 11.03),
 #     dir = joinpath(homedir(), "FjordSim_data", "JRA55"),
 # )
-atmosphere = NORA3PrescribedAtmosphere(arch)
-downwelling_radiation = NORA3PrescribedRadiation(arch)
+atmosphere = NORA3PrescribedAtmosphere(architecture)
+downwelling_radiation = NORA3PrescribedRadiation(architecture)
 sea_ice = FreezingLimitedOceanTemperature()
 biogeochemistry = nothing
 results_dir = joinpath(homedir(), "FjordSim_results", "oslofjord")

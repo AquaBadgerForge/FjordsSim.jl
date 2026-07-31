@@ -1,7 +1,7 @@
 # Rivers: the generic half of the river pipeline. `add_rivers` copies a prepared forcing file
 # and writes river relaxation into the surface level of the copy, one grid cell per river. Only
 # the three hooks `river_locations`, `river_series` and `download_rivers` are dataset-specific —
-# `src/Forcing/OF800Rivers.jl` is the template to copy for a new river dataset.
+# `src/Forcing/of800_rivers.jl` is the template to copy for a new river dataset.
 
 const RIVER_NEIGHBOUR_OFFSETS = ((-1, -1), (-1, 0), (-1, 1), (0, -1), (0, 1), (1, -1), (1, 0), (1, 1))
 
@@ -211,7 +211,7 @@ function add_rivers(target_grid, config::AbstractForcingConfig, rivers::Abstract
     cp(forcing_file, output_file; force = true)
 
     lambda = Float32(1 / rivers.relaxation_timescale)
-    written = write_rivers!(output_file, cells, locations, series, lambda, length(times))
+    written = write_rivers(output_file, cells, locations, series, lambda, length(times))
 
     @info "Finished adding rivers"
 
@@ -242,7 +242,7 @@ function report_river_cells(cells)
 end
 
 """
-    write_rivers!(output_file, cells, locations, series, lambda, n_times)
+    write_rivers(output_file, cells, locations, series, lambda, n_times)
 
 Patch the surface level of each river cell in `output_file`, in place. Variables the forcing
 file does not carry are skipped with a warning, so a river dataset may offer more than a given
@@ -252,7 +252,7 @@ The file is chunked one horizontal slab per `(level, time)`, so this reads, patc
 back whole surface slabs rather than individual cells — a point write would rewrite the entire
 slab anyway.
 """
-function write_rivers!(output_file, cells, locations, series, lambda, n_times)
+function write_rivers(output_file, cells, locations, series, lambda, n_times)
     rows = Dict(location.id => row for (row, location) in enumerate(locations))
     written = String[]
 

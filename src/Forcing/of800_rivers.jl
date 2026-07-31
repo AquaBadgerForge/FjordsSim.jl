@@ -1,7 +1,7 @@
 # OF800 rivers adapter: the source-specific half of the river pipeline. Copy this file's shape
 # to add a new river dataset — it owns a config subtype and the hook methods `river_locations`
 # and `river_series` (plus `download_rivers` if it fetches data). Everything else comes from the
-# generic core in Rivers.jl.
+# generic core in rivers.jl.
 
 using Downloads
 

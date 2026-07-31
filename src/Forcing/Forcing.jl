@@ -60,10 +60,10 @@ Base.summary(backend::NetCDFBackend) = string("NetCDFBackend(", backend.start, "
 
 const NetCDFFTS = FlavorOfFTS{<:Any,<:Any,<:Any,<:Any,<:NetCDFBackend}
 
-function get_data_location(var::Symbol)
-    if var in (:u,)
+function data_location(variable::Symbol)
+    if variable in (:u,)
         return (Face, Center, Center)
-    elseif var in (:v,)
+    elseif variable in (:v,)
         return (Center, Face, Center)
     else
         return (Center, Center, Center)
@@ -71,12 +71,12 @@ function get_data_location(var::Symbol)
 end
 
 # Runtime generation of dictionaries based on forcing_variables_names
-function get_oceananigans_fieldname(vars)
-    Dict(Symbol(var) => Val{Symbol(var)}() for var in vars)
+function oceananigans_field_names(variables)
+    Dict(Symbol(variable) => Val{Symbol(variable)}() for variable in variables)
 end
 
-function get_data_location_dict(vars)
-    Dict(Val{Symbol(var)}() => get_data_location(Symbol(var)) for var in vars)
+function data_locations(variables)
+    Dict(Val{Symbol(variable)}() => data_location(Symbol(variable)) for variable in variables)
 end
 
 # Generic Base.getindex for any variable using Val types
@@ -87,16 +87,16 @@ end
 struct ForcingFromFile{FTS,V}
     fts_value::FTS
     fts_λ::FTS
-    fieldname::V
+    field_name::V
 end
 
 Adapt.adapt_structure(to, p::ForcingFromFile) =
-    ForcingFromFile(Adapt.adapt(to, p.fts_value), Adapt.adapt(to, p.fts_λ), Adapt.adapt(to, p.fieldname))
+    ForcingFromFile(Adapt.adapt(to, p.fts_value), Adapt.adapt(to, p.fts_λ), Adapt.adapt(to, p.field_name))
 
 on_architecture(to, forcing::ForcingFromFile) = ForcingFromFile(
     on_architecture(to, forcing.fts_value),
     on_architecture(to, forcing.fts_λ),
-    on_architecture(to, forcing.fieldname),
+    on_architecture(to, forcing.field_name),
 )
 
 """ x direction """
@@ -123,17 +123,17 @@ Return a result to be added to the tendency contributions (a kernel function).
     result = 0.0
     result += @inbounds ifelse(
         λ > 1 && value > -990,
-        forcing_term_u(λ, value, i, j, k, grid, fields[i, j, k, p.fieldname]),
+        forcing_term_u(λ, value, i, j, k, grid, fields[i, j, k, p.field_name]),
         0,
     )
     result += @inbounds ifelse(
         λ < -1 && value > -990,
-        forcing_term_v(λ, value, i, j, k, grid, fields[i, j, k, p.fieldname]),
+        forcing_term_v(λ, value, i, j, k, grid, fields[i, j, k, p.field_name]),
         0,
     )
     result += @inbounds ifelse(
         -1 < λ < 1 && value > -990,
-        forcing_term_relax(λ, value, i, j, k, grid, fields[i, j, k, p.fieldname]),
+        forcing_term_relax(λ, value, i, j, k, grid, fields[i, j, k, p.field_name]),
         0,
     )
     return result
@@ -145,15 +145,15 @@ function native_times_to_seconds(native_times, start_time = native_times[1])
     return [Second(t - start_time).value for t in native_times]
 end
 
-function load_from_netcdf(; path::String, var_name::String, grid_size::Tuple, time_indices_in_memory::Tuple)
+function load_from_netcdf(; path::String, variable_name::String, grid_size::Tuple, time_indices_in_memory::Tuple)
     ds = NCDataset(path)
-    var = ds[var_name]
+    variable = ds[variable_name]
     native_times = ds["time"]
 
     data = zeros(Float64, (grid_size[1:end]..., length(time_indices_in_memory)))
     j = 1
     for i in time_indices_in_memory
-        @views data[:, :, :, j] .= coalesce.(var[:, :, :, i], -999.0)
+        @views data[:, :, :, j] .= coalesce.(variable[:, :, :, i], -999.0)
         j += 1
     end
     times = convert.(Int64, native_times_to_seconds(native_times))
@@ -165,7 +165,8 @@ end
 """ Update data in the FieldTimeSeries, e.g. in ForcingFromFile forcing structures. """
 function set!(fts::NetCDFFTS, path::String = fts.path, name::String = fts.name)
     ti = time_indices(fts)
-    data, _ = load_from_netcdf(; path, var_name = name, grid_size = size(fts)[1:end-1], time_indices_in_memory = ti)
+    data, _ =
+        load_from_netcdf(; path, variable_name = name, grid_size = size(fts)[1:end-1], time_indices_in_memory = ti)
 
     copyto!(interior(fts, :, :, :, :), data)
     fill_halo_regions!(fts)
@@ -180,23 +181,34 @@ By default both FieldTimeSeries keep only 2 times indices in memory.
 """
 function forcing_get_tuple(
     filepath,
-    var_name,
+    variable_name,
     grid,
     time_indices_in_memory,
     backend,
-    oceananigans_fieldname,
-    data_location,
+    field_names,
+    locations,
 )
-    field_name = oceananigans_fieldname[Symbol(var_name)]
-    LX, LY, LZ = data_location[field_name]
+    field_name = field_names[Symbol(variable_name)]
+    LX, LY, LZ = locations[field_name]
     grid_size_tupled = size.(nodes(grid, (LX(), LY(), LZ())))
     grid_size = Tuple(x[1] for x in grid_size_tupled)
 
-    data, times = load_from_netcdf(; path = filepath, var_name, grid_size, time_indices_in_memory)
-    dataλ, timesλ =
-        load_from_netcdf(; path = filepath, var_name = var_name * "_lambda", grid_size, time_indices_in_memory)
+    data, times = load_from_netcdf(; path = filepath, variable_name, grid_size, time_indices_in_memory)
+    dataλ, timesλ = load_from_netcdf(;
+        path = filepath,
+        variable_name = variable_name * "_lambda",
+        grid_size,
+        time_indices_in_memory,
+    )
 
-    fts = FieldTimeSeries{LX,LY,LZ}(grid, times; backend, time_indexing = Cyclical(), path = filepath, name = var_name)
+    fts = FieldTimeSeries{LX,LY,LZ}(
+        grid,
+        times;
+        backend,
+        time_indexing = Cyclical(),
+        path = filepath,
+        name = variable_name,
+    )
     copyto!(interior(fts, :, :, :, :), data)
     fill_halo_regions!(fts)
 
@@ -206,13 +218,13 @@ function forcing_get_tuple(
         backend,
         time_indexing = Cyclical(),
         path = filepath,
-        name = var_name * "_lambda",
+        name = variable_name * "_lambda",
     )
     copyto!(interior(ftsλ, :, :, :, :), dataλ)
     fill_halo_regions!(ftsλ)
 
     _forcing = ForcingFromFile(fts, ftsλ, field_name)
-    result = NamedTuple{(Symbol(var_name),)}((_forcing,))
+    result = NamedTuple{(Symbol(variable_name),)}((_forcing,))
     return result
 end
 
@@ -228,20 +240,20 @@ function forcing_from_file(; grid, filepath, tracers)
     forcing_variables_names = (map(String, tracers) ∪ ("u", "v")) ∩ keys(ds)
     close(ds)
 
-    oceananigans_fieldname = get_oceananigans_fieldname(forcing_variables_names)
-    data_location = get_data_location_dict(forcing_variables_names)
+    field_names = oceananigans_field_names(forcing_variables_names)
+    locations = data_locations(forcing_variables_names)
 
     backend = NetCDFBackend(2)
     time_indices_in_memory = (1, length(backend))
     result = mapreduce(
-        var_name -> forcing_get_tuple(
+        variable_name -> forcing_get_tuple(
             filepath,
-            var_name,
+            variable_name,
             grid,
             time_indices_in_memory,
             backend,
-            oceananigans_fieldname,
-            data_location,
+            field_names,
+            locations,
         ),
         merge,
         forcing_variables_names,
@@ -308,7 +320,7 @@ duplicates dropped. `prepare_forcing` completes them to a gap-free daily axis wi
 `daily_time_steps`.
 
 A new forcing dataset implements this on its `AbstractForcingConfig` subtype; see
-`forcing_time_steps(config::NorKystConfig)` in `src/Forcing/NorKyst.jl`.
+`forcing_time_steps(config::NorKystConfig)` in `src/Forcing/norkyst.jl`.
 """
 function forcing_time_steps end
 
@@ -655,7 +667,7 @@ location. Written in Julia (fastest-first) order, which yields the `(time, Nz, N
 in the file.
 """
 function forcing_dimension_names(name)
-    LX, LY, _ = get_data_location(Symbol(name))
+    LX, LY, _ = data_location(Symbol(name))
     return (LX === Face ? "Nx_faces" : "Nx", LY === Face ? "Ny_faces" : "Ny", "Nz", "time")
 end
 
@@ -667,7 +679,7 @@ target location.
 """
 function prepared_variable(source_name, target_grid, source, filepath, config::AbstractForcingConfig)
     name = forcing_variable_names(config)[source_name]
-    LX, LY, LZ = get_data_location(Symbol(name))
+    LX, LY, LZ = data_location(Symbol(name))
     @info "Preparing target nodes and source fill for $source_name -> $name"
 
     mask = water_mask(target_grid, LX, LY, config.relaxation_edge)
@@ -1075,7 +1087,7 @@ function write_forcing_file(filepath, target_grid, variables, steps, source, arc
 
     ds = NCDataset(filepath, "c")
     try
-        define_forcing_dimensions(ds, target_grid, steps)
+        define_forcing_dimensions!(ds, target_grid, steps)
         for variable in variables
             # One horizontal level of one time step per chunk. Both this writer and
             # `load_from_netcdf` touch exactly one time index at a time, so a chunk spanning
@@ -1135,11 +1147,11 @@ function write_forcing_file(filepath, target_grid, variables, steps, source, arc
 end
 
 """
-    define_forcing_dimensions(ds, target_grid, steps)
+    define_forcing_dimensions!(ds, target_grid, steps)
 
 Define the dimensions and coordinate variables `forcing_from_file` checks against the grid.
 """
-function define_forcing_dimensions(ds, target_grid, steps)
+function define_forcing_dimensions!(ds, target_grid, steps)
     coordinates = (
         "Nx" => Array(λnodes(target_grid, Center())),
         "Ny" => Array(φnodes(target_grid, Center())),
@@ -1162,8 +1174,8 @@ function define_forcing_dimensions(ds, target_grid, steps)
     return ds
 end
 
-include("Rivers.jl")
-include("NorKyst.jl")
-include("OF800Rivers.jl")
+include("rivers.jl")
+include("norkyst.jl")
+include("of800_rivers.jl")
 
 end # module

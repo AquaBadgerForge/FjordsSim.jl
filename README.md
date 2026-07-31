@@ -62,13 +62,13 @@ pipeline is one generic function plus a handful of dispatch points:
 
 | Pipeline | Generic entry point | Hooks a new source implements |
 |---|---|---|
-| Grid | — | `LatitudeLongitudeGrid(arch, config)` |
+| Grid | — | `LatitudeLongitudeGrid(architecture, config)` |
 | Bathymetry | `prepare_bathymetry(target_grid, config)` | `bathymetry_dataset(target_grid, config)`; optionally `regrid_options(config)` |
 | Forcing | `prepare_forcing(target_grid, config)`, `download_forcing(config)` | `forcing_time_steps`, `forcing_source_grid`, `forcing_variable_names`; `download_forcing(target_grid, config)` if it downloads |
 
 Path resolution (`bathymetry_path`, `forcing_path`, `forcing_directory`, `plot_path`) and the
 diagnostic plots (`plot_bathymetry`, `plot_forcing`) are defined on the supertypes, so a new
-source inherits them. `src/Bathymetry/Geonorge.jl` and `src/Forcing/NorKyst.jl` are the built-in
+source inherits them. `src/Bathymetry/geonorge.jl` and `src/Forcing/norkyst.jl` are the built-in
 adapters and the templates to copy; each supertype's docstring in `src/Configs.jl` lists the
 fields and hooks it expects.
 

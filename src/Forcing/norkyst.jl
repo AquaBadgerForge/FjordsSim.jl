@@ -250,10 +250,10 @@ function time_length(ds)
     return NCDatasets.dim(ds, time_dimension(ds))
 end
 
-function copy_attributes!(dest, source)
+function copy_attributes!(destination, source)
     for (key, value) in source.attrib
         key == "_FillValue" && continue
-        dest.attrib[key] = value
+        destination.attrib[key] = value
     end
 end
 
@@ -276,7 +276,7 @@ function concrete_float_data(data)
     return output
 end
 
-function define_subset_variable(output, source, name, subset::NorKystSubset; deflatelevel = 5)
+function define_subset_variable!(output, source, name, subset::NorKystSubset; deflatelevel = 5)
     variable = NCDatasets.variable(source, name)
     dimensions = dimnames(variable)
     indices = variable_indices(variable, subset.ranges)
@@ -303,20 +303,20 @@ function define_subset_variable(output, source, name, subset::NorKystSubset; def
     return output_variable
 end
 
-function copy_auxiliary_variable(name, variable, time_dim, subset::NorKystSubset)
+function copy_auxiliary_variable(name, variable, time_dimension_name, subset::NorKystSubset)
     name in subset.parameters && return false
     dimensions = dimnames(variable)
-    return name == time_dim || time_dim ∉ dimensions
+    return name == time_dimension_name || time_dimension_name ∉ dimensions
 end
 
 function define_output_file(output_path, template, subset::NorKystSubset, total_time)
-    time_dim = time_dimension(template)
+    time_dimension_name = time_dimension(template)
     isfile(output_path) && rm(output_path; force = true)
 
     output = NCDataset(output_path, "c")
     try
         for dimension in dimnames(template)
-            dimension_length = if dimension == time_dim
+            dimension_length = if dimension == time_dimension_name
                 total_time
             elseif haskey(subset.ranges, dimension)
                 length(subset.ranges[dimension])
@@ -328,9 +328,9 @@ function define_output_file(output_path, template, subset::NorKystSubset, total_
 
         for name in keys(template)
             variable = NCDatasets.variable(template, name)
-            copy_auxiliary_variable(name, variable, time_dim, subset) || continue
+            copy_auxiliary_variable(name, variable, time_dimension_name, subset) || continue
             all(dimension -> dimension in dimnames(output), dimnames(variable)) || continue
-            define_subset_variable(output, template, name, subset; deflatelevel = 0)
+            define_subset_variable!(output, template, name, subset; deflatelevel = 0)
         end
 
         for name in subset.parameters
@@ -403,12 +403,12 @@ function write_parameter_chunk!(output, source, name, subset::NorKystSubset, tim
 end
 
 function write_time_dependent_coordinates!(output, source, subset::NorKystSubset, time_start)
-    time_dim = time_dimension(source)
+    time_dimension_name = time_dimension(source)
 
     for name in keys(source)
         name in subset.parameters && continue
         variable = NCDatasets.variable(source, name)
-        time_index = findfirst(==(time_dim), dimnames(variable))
+        time_index = findfirst(==(time_dimension_name), dimnames(variable))
         time_index === nothing && continue
         haskey(output, name) || continue
 

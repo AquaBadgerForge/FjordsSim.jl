@@ -25,7 +25,7 @@ function compute_faces(centers)
     return faces
 end
 
-const wall_time = Ref(time_ns())
+const WALL_TIME = Ref(time_ns())
 
 function progress(sim)
     ocean = sim.model.ocean
@@ -37,7 +37,7 @@ function progress(sim)
 
     umax = (maximum(abs, interior(u)), maximum(abs, interior(v)), maximum(abs, interior(w)))
 
-    step_time = 1e-9 * (time_ns() - wall_time[])
+    step_time = 1e-9 * (time_ns() - WALL_TIME[])
 
     msg = @sprintf("Iter: %d, time: %s, Δt: %s", iteration(sim), prettytime(sim), prettytime(sim.Δt))
     msg *= @sprintf(
@@ -50,7 +50,7 @@ function progress(sim)
 
     @info msg
 
-    wall_time[] = time_ns()
+    WALL_TIME[] = time_ns()
 end
 
 function safe_execute(callable)
@@ -81,10 +81,10 @@ end
 function netcdf_to_jld2(netcdf_file::String, jld2_file::String)
     ds = NCDataset(netcdf_file, "r")
     data_dict = Dict()
-    for varname in keys(ds)
-        arr = convert(Array, ds[varname])
-        data_dict[varname] = arr
-        print(size(arr))
+    for variable_name in keys(ds)
+        array = convert(Array, ds[variable_name])
+        data_dict[variable_name] = array
+        print(size(array))
     end
 
     @save jld2_file data_dict
@@ -107,26 +107,26 @@ function save_fts(; jld2_filepath, fts_name, fts, grid, times, boundary_conditio
     end
 end
 
-function recursive_merge(nt1::NamedTuple, nt2::NamedTuple)
+function recursive_merge(a::NamedTuple, b::NamedTuple)
     # Get all unique keys from both NamedTuples
-    all_keys = union(keys(nt1), keys(nt2))
+    all_keys = union(keys(a), keys(b))
 
     # Initialize an empty NamedTuple for the result
     result_pairs = Pair{Symbol,Any}[]
 
     for key in all_keys
-        val1 = get(nt1, key, nothing)
-        val2 = get(nt2, key, nothing)
+        a_value = get(a, key, nothing)
+        b_value = get(b, key, nothing)
 
-        if val1 isa NamedTuple && val2 isa NamedTuple
+        if a_value isa NamedTuple && b_value isa NamedTuple
             # If both values are NamedTuples, recursively merge them
-            push!(result_pairs, key => recursive_merge(val1, val2))
-        elseif val2 !== nothing
-            # If only val2 exists or is not a NamedTuple, use val2
-            push!(result_pairs, key => val2)
+            push!(result_pairs, key => recursive_merge(a_value, b_value))
+        elseif b_value !== nothing
+            # If only b_value exists or is not a NamedTuple, use b_value
+            push!(result_pairs, key => b_value)
         else
-            # Otherwise, use val1 (if it exists)
-            push!(result_pairs, key => val1)
+            # Otherwise, use a_value (if it exists)
+            push!(result_pairs, key => a_value)
         end
     end
     return (; result_pairs...)

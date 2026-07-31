@@ -88,7 +88,7 @@ function compute_bounding_indices(longitude::Nothing, latitude::Nothing, grid, L
 end
 
 include("Configs.jl")
-include("FDatasets.jl")
+include("Datasets.jl")
 include("Utils.jl")
 include("Bathymetry/Bathymetry.jl")
 include("Atmospheres/Atmospheres.jl")
@@ -98,7 +98,7 @@ include("Grids.jl")
 include("Plotting.jl")
 
 using .Configs
-using .FDatasets
+using .Datasets
 using .Utils
 using .Bathymetry
 using .Atmospheres

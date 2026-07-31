@@ -50,7 +50,7 @@ modules, in `include` order from `src/FjordSim.jl`:
    supertype's docstring lists the fields and hook methods a subtype must provide — see
    "Adding a new source" below.
 
-2. **Dataset adapters** (`src/FDatasets.jl`) — `DSForcing` and `DSResults` are NumericalEarth
+2. **Dataset adapters** (`src/Datasets.jl`) — `ForcingDataset` and `ResultsDataset` are NumericalEarth
    dataset wrappers for local FjordSim NetCDF files (forcing inputs and simulation outputs),
    used for initial conditions and restart.
 
@@ -58,7 +58,7 @@ modules, in `include` order from `src/FjordSim.jl`:
    named tuples, `cell_advection_timescale_coupled_model` for the time-step wizard, plus
    `compute_faces` and NetCDF/JLD2 helpers.
 
-4. **Bathymetry** (`src/Bathymetry/Bathymetry.jl` generic core, `src/Bathymetry/Geonorge.jl`
+4. **Bathymetry** (`src/Bathymetry/Bathymetry.jl` generic core, `src/Bathymetry/geonorge.jl`
    source adapter, included into the same `Bathymetry` module).
    `prepare_bathymetry(target_grid, config::AbstractBathymetryConfig)` is the generic pipeline:
    `bathymetry_dataset(target_grid, config)` (the one source-specific step) →
@@ -66,7 +66,7 @@ modules, in `include` order from `src/FjordSim.jl`:
    `write_bathymetry_file`. The core also owns the smoothing kernels and the
    `center_coordinates`/`expand_domain`/`vertical_faces` domain helpers.
 
-   `Geonorge.jl` holds `DybdedataConfig <: AbstractBathymetryConfig` and the Geonorge Sjøkart
+   `geonorge.jl` holds `DybdedataConfig <: AbstractBathymetryConfig` and the Geonorge Sjøkart
    Dybdedata implementation of the two hooks: derive the native region from the target grid
    (`native_region!`) → download and extract the FileGDB if absent (`ensure_geodatabase`,
    ~2.3 GB) → sample `dybdepunkt` points and optionally `dybdekurve` contours in EPSG:25833 →
@@ -80,7 +80,7 @@ modules, in `include` order from `src/FjordSim.jl`:
    `NORA3PrescribedRadiation` construct NumericalEarth `PrescribedAtmosphere`/`PrescribedRadiation`
    objects backed by `NORA3FieldTimeSeries`. Default data path: `~/FjordSim_data/NORA3/NORA3.nc`.
 
-6. **Forcing** (`src/Forcing/Forcing.jl` generic core, `src/Forcing/NorKyst.jl` dataset adapter,
+6. **Forcing** (`src/Forcing/Forcing.jl` generic core, `src/Forcing/norkyst.jl` dataset adapter,
    included into the same `Forcing` module).
 
    The read side loads river/relaxation forcing from NetCDF via `forcing_from_file`. The
@@ -113,7 +113,7 @@ modules, in `include` order from `src/FjordSim.jl`:
    grid on the CPU and dispatches on the forcing config, so a dataset only implements
    `download_forcing(target_grid, config)`. `scripts/forcing_download.jl` is a thin CLI over it.
 
-   `NorKyst.jl` holds `NorKystConfig <: AbstractForcingConfig` (THREDDS endpoints, variables,
+   `norkyst.jl` holds `NorKystConfig <: AbstractForcingConfig` (THREDDS endpoints, variables,
    years, output names, relaxation zone), `forcing_monthly_filename`, the three hook methods, and
    the NorKyst download: list the THREDDS catalog → open the month's OPeNDAP datasets → subset to
    the target grid's lon/lat box (`subset_ranges`, `NorKystSubset`) → write one combined monthly
@@ -125,13 +125,13 @@ modules, in `include` order from `src/FjordSim.jl`:
    ~59° from east here; and `inpaint_mask!` cannot fill a fully masked depth level, so on this
    regional subset it either never terminates or silently writes zeros.
 
-   `Rivers.jl` (generic core) and `OF800Rivers.jl` (dataset adapter) are included into the same
+   `rivers.jl` (generic core) and `of800_rivers.jl` (dataset adapter) are included into the same
    `Forcing` module and hold the rivers step, which runs *after* `prepare_forcing`.
    `add_rivers(target_grid, config::AbstractForcingConfig)` dispatches on `config.rivers` — a
    `nothing` river config is a no-op, so a setup opts in by naming one. The pipeline:
    `river_locations(rivers)` → snap each outlet to a grid cell (`river_cells`) → river values
    for the forcing file's own time axis (`river_series`) → copy the forcing file to
-   `river_forcing_path(rivers)` → patch the copy's surface level (`write_rivers!`). The original
+   `river_forcing_path(rivers)` → patch the copy's surface level (`write_rivers`). The original
    forcing file is never modified, so the step is re-runnable without redoing `forcing_prepare`.
 
    Rivers enter as **relaxation, not as a mass flux**: each river cell gets its value and
@@ -143,10 +143,10 @@ modules, in `include` order from `src/FjordSim.jl`:
    into open water. An outlet outside the grid, or with no coastal cell within `search_radius`,
    is dropped with a warning rather than written into land. The water mask comes from the same
    `water_mask` that `prepare_forcing` uses, so "water" means the same thing in both.
-   `write_rivers!` reads, patches and writes back whole surface slabs because the file is
+   `write_rivers` reads, patches and writes back whole surface slabs because the file is
    chunked one horizontal slab per `(level, time)`.
 
-   `OF800Rivers.jl` holds `OF800RiversConfig <: AbstractRiverConfig` and reads two files: an
+   `of800_rivers.jl` holds `OF800RiversConfig <: AbstractRiverConfig` and reads two files: an
    outlet CSV (hand-parsed; the project carries no CSV reader and the file is a couple of dozen
    rows) and a ROMS river NetCDF whose values repeat across `s_rho`, so only the top level is
    read and whose `river` coordinate is offset by `OF800_RIVER_NUMBER_OFFSET` from the CSV's
@@ -165,8 +165,8 @@ modules, in `include` order from `src/FjordSim.jl`:
    `(u, v, T, S)`.
 
 8. **Grids** (`src/Grids.jl`) — `EvenGrid <: AbstractGridConfig` (size, halo, longitude, latitude,
-   `z_faces`) with `LatitudeLongitudeGrid(arch, config::EvenGrid)`, and a constructor
-   `ImmersedBoundaryGrid(filepath, arch, halo)` that reads the processed bathymetry NetCDF and
+   `z_faces`) with `LatitudeLongitudeGrid(architecture, config::EvenGrid)`, and a constructor
+   `ImmersedBoundaryGrid(filepath, architecture, halo)` that reads the processed bathymetry NetCDF and
    returns an `ImmersedBoundaryGrid` wrapping a `LatitudeLongitudeGrid` with `PartialCellBottom`.
    The loader still accepts legacy files with positive depths or swapped `lon`/`lat` axes.
 
@@ -184,14 +184,14 @@ modules, in `include` order from `src/FjordSim.jl`:
 
 Every pipeline is a generic function on the config supertype plus a small set of hooks. Add a
 source by subtyping and overloading the hooks — never by editing the generic function. The
-adapter files (`src/Bathymetry/Geonorge.jl`, `src/Forcing/NorKyst.jl`, `src/Forcing/OF800Rivers.jl`)
+adapter files (`src/Bathymetry/geonorge.jl`, `src/Forcing/norkyst.jl`, `src/Forcing/of800_rivers.jl`)
 are the templates.
 
 Grid — `AbstractGridConfig`:
 
 | Hook | Required |
 |---|---|
-| `LatitudeLongitudeGrid(arch, config)` | yes |
+| `LatitudeLongitudeGrid(architecture, config)` | yes |
 
 Bathymetry — `AbstractBathymetryConfig`, consumed by `prepare_bathymetry`:
 
@@ -208,7 +208,7 @@ Forcing — `AbstractForcingConfig`, consumed by `prepare_forcing`:
 | `forcing_source_grid(config, filepath)` → source grid | yes |
 | `forcing_variable_names(config)` → `Dict` source name => FjordSim name | yes |
 | `download_forcing(target_grid, config)` | only if it downloads |
-| `source_field_grid(source, arch)`, `projected_target_nodes(longitude, latitude, source)` | only for a source grid that is not a regular projected grid; dispatch on the source-grid type, not the config |
+| `source_field_grid(source, architecture)`, `projected_target_nodes(longitude, latitude, source)` | only for a source grid that is not a regular projected grid; dispatch on the source-grid type, not the config |
 
 Rivers — `AbstractRiverConfig`, consumed by `add_rivers`:
 

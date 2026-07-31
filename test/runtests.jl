@@ -52,8 +52,8 @@ FjordSim.Forcing.river_locations(config::StubRivers) = config.locations
 FjordSim.Forcing.river_series(config::StubRivers, times) = config.series
 
 # New behavior for a new grid config, added without touching Grids.jl.
-Oceananigans.LatitudeLongitudeGrid(arch, config::SingleColumnGrid) = LatitudeLongitudeGrid(
-    arch;
+Oceananigans.LatitudeLongitudeGrid(architecture, config::SingleColumnGrid) = LatitudeLongitudeGrid(
+    architecture;
     size = (1, 1, 2),
     halo = (1, 1, 1),
     longitude = (10.0, 11.0),
@@ -125,9 +125,9 @@ FjordSim.Forcing.forcing_variable_names(config::ConstantForcing) = Dict("tempera
         (:Utils, :extract_z_faces),
         (:Utils, :netcdf_to_jld2),
         (:Utils, :save_fts),
-        (:FDatasets, :DSForcing),
-        (:FDatasets, :DSResults),
-        (:FDatasets, :last_date),
+        (:Datasets, :ForcingDataset),
+        (:Datasets, :ResultsDataset),
+        (:Datasets, :last_date),
     ]
 
     for (module_name, sym) in submodule_exports
@@ -156,8 +156,8 @@ end
         lon[:] = [10.0, 11.0]
         close(ds)
 
-        arch = CPU()
-        grid = ImmersedBoundaryGrid(bathymetry_file, arch, (1, 1, 1))
+        architecture = CPU()
+        grid = ImmersedBoundaryGrid(bathymetry_file, architecture, (1, 1, 1))
 
         # Test top_bottom_boundary_conditions signature
         @test_nowarn top_bottom_boundary_conditions(; grid, bottom_drag_coefficient = 0.003)
@@ -502,8 +502,8 @@ end
         time[:] = [0.0, 3600.0]
         close(ds)
 
-        arch = CPU()
-        grid = @test_nowarn ImmersedBoundaryGrid(bathymetry_file, arch, (1, 1, 1))
+        architecture = CPU()
+        grid = @test_nowarn ImmersedBoundaryGrid(bathymetry_file, architecture, (1, 1, 1))
         @test_nowarn top_bottom_boundary_conditions(; grid, bottom_drag_coefficient = 0.003)
         @test_nowarn MultiYearNORA3(nora3_filename, tmp)
     end
@@ -511,10 +511,10 @@ end
 
 @testset "Bathymetry writer" begin
     mktempdir() do tmp
-        arch = CPU()
+        architecture = CPU()
         z_faces = [-20.0, -10.0, 0.0]
         grid = LatitudeLongitudeGrid(
-            arch;
+            architecture;
             size = (2, 3, 2),
             halo = (1, 1, 1),
             longitude = (10.0, 12.0),
@@ -539,7 +539,7 @@ end
         close(ds)
 
         # Full round-trip: grid -> file -> grid must preserve the vertical extent.
-        reloaded = ImmersedBoundaryGrid(bathymetry_file, arch, (1, 1, 1))
+        reloaded = ImmersedBoundaryGrid(bathymetry_file, architecture, (1, 1, 1))
         @test collect(Oceananigans.Grids.znodes(reloaded.underlying_grid, Face())) == z_faces
 
         @test FjordSim.Bathymetry.vertical_faces(grid) == z_faces
@@ -547,7 +547,7 @@ end
         for halo_size in (1, 2, 3)
             deep_faces = [-450.0, -200.0, -50.0, 0.0]
             deep_grid = LatitudeLongitudeGrid(
-                arch;
+                architecture;
                 size = (4, 4, 3),
                 halo = (halo_size, halo_size, halo_size),
                 longitude = (10.0, 11.0),
@@ -607,9 +607,9 @@ end
     @test fill_isolated_land_cells(h6) == h6
 
     # smooth_bathymetry_gaps! round-trips a Field through the same pipeline
-    arch = CPU()
+    architecture = CPU()
     grid = LatitudeLongitudeGrid(
-        arch;
+        architecture;
         size = (3, 3, 1),
         halo = (1, 1, 1),
         longitude = (10.0, 11.0),
@@ -707,15 +707,15 @@ end
     end
 
     expected_contour_indices = FjordSim.Bathymetry.contour_point_indices(length(contour_vertices), contour_stride)
-    npoints = length(source_points)
+    n_points = length(source_points)
 
-    @test length(xs) == npoints + length(expected_contour_indices)
-    @test xs[1:npoints] == first.(source_points)
-    @test ys[1:npoints] == last.(source_points)
-    @test bottom_heights[1:npoints] == -abs.(source_depths)
-    @test xs[npoints+1:end] == first.(contour_vertices[expected_contour_indices.+1])
-    @test ys[npoints+1:end] == last.(contour_vertices[expected_contour_indices.+1])
-    @test all(==(-abs(contour_depth)), bottom_heights[npoints+1:end])
+    @test length(xs) == n_points + length(expected_contour_indices)
+    @test xs[1:n_points] == first.(source_points)
+    @test ys[1:n_points] == last.(source_points)
+    @test bottom_heights[1:n_points] == -abs.(source_depths)
+    @test xs[n_points+1:end] == first.(contour_vertices[expected_contour_indices.+1])
+    @test ys[n_points+1:end] == last.(contour_vertices[expected_contour_indices.+1])
+    @test all(==(-abs(contour_depth)), bottom_heights[n_points+1:end])
 
     # The single bulk transform now used by `sample_bathymetry_points!` must match
     # transforming each point individually — the per-point behavior it replaces.
@@ -881,7 +881,7 @@ end
     water_mask = FjordSim.Forcing.water_mask
 
     mktempdir() do tmp
-        arch = CPU()
+        architecture = CPU()
         # A 4x2 channel deepening to the east. Column 1 is land, column 2's bottom sits inside
         # the deep cell (a partial cell), columns 3-4 are fully wet. Both rows are identical, so
         # the staggered assertions below can compare against the tracer row directly.
@@ -892,13 +892,13 @@ end
             latitude = (59.0, 59.2),
             z_faces = [-20.0, -10.0, 0.0],
         )
-        underlying_grid = LatitudeLongitudeGrid(arch, grid_config)
+        underlying_grid = LatitudeLongitudeGrid(architecture, grid_config)
         bottom_height = Field{Center, Center, Nothing}(underlying_grid)
         set!(bottom_height, [0.0 0.0; -13.0 -13.0; -20.0 -20.0; -20.0 -20.0])
 
         bathymetry_file = joinpath(tmp, "bathymetry.nc")
         write_bathymetry_file(bathymetry_file, underlying_grid, bottom_height)
-        grid = ImmersedBoundaryGrid(bathymetry_file, arch, grid_config.halo)
+        grid = ImmersedBoundaryGrid(bathymetry_file, architecture, grid_config.halo)
 
         # The mask must agree with what the model treats as wet, which for PartialCellBottom is
         # decided by minimum_fractional_cell_height (0.2), not by a cell-centre test. Column 2's
@@ -936,7 +936,7 @@ end
 
 @testset "Forcing file round-trip" begin
     mktempdir() do tmp
-        arch = CPU()
+        architecture = CPU()
         grid_config = EvenGrid(
             size = (2, 3, 2),
             halo = (1, 1, 1),
@@ -944,13 +944,13 @@ end
             latitude = (59.0, 62.0),
             z_faces = [-20.0, -10.0, 0.0],
         )
-        underlying_grid = LatitudeLongitudeGrid(arch, grid_config)
+        underlying_grid = LatitudeLongitudeGrid(architecture, grid_config)
         bottom_height = Field{Center, Center, Nothing}(underlying_grid)
         set!(bottom_height, fill(-20.0, (2, 3)))
 
         bathymetry_file = joinpath(tmp, "bathymetry.nc")
         write_bathymetry_file(bathymetry_file, underlying_grid, bottom_height)
-        grid = ImmersedBoundaryGrid(bathymetry_file, arch, grid_config.halo)
+        grid = ImmersedBoundaryGrid(bathymetry_file, architecture, grid_config.halo)
 
         forcing_config = NorKystConfig(
             data_root = tmp,
@@ -996,12 +996,12 @@ end
             latitude = (59.0, 62.0),
             z_faces = [-20.0, -10.0, 0.0],
         )
-        other_underlying = LatitudeLongitudeGrid(arch, other_grid_config)
+        other_underlying = LatitudeLongitudeGrid(architecture, other_grid_config)
         other_bottom = Field{Center, Center, Nothing}(other_underlying)
         set!(other_bottom, fill(-20.0, (4, 3)))
         other_file = joinpath(tmp, "bathymetry_other.nc")
         write_bathymetry_file(other_file, other_underlying, other_bottom)
-        other = ImmersedBoundaryGrid(other_file, arch, other_grid_config.halo)
+        other = ImmersedBoundaryGrid(other_file, architecture, other_grid_config.halo)
         @test_throws DimensionMismatch forcing_from_file(forcing_config; grid = other, tracers = (:T, :S))
     end
 end
@@ -1035,7 +1035,7 @@ end
     @test nearest_coastal_cell(tie_mask, 3, 3, 10) == (3, 2, 1.0)
 
     mktempdir() do tmp
-        arch = CPU()
+        architecture = CPU()
         # A 5x4 basin with a land column at i = 2, so columns 1 and 3 are coastal while columns
         # 4 and 5 are open water. The land is off the domain edge because an outlet has to sit
         # strictly inside the grid to be accepted at all.
@@ -1046,7 +1046,7 @@ end
             latitude = (59.0, 59.4),
             z_faces = [-20.0, -10.0, 0.0],
         )
-        underlying_grid = LatitudeLongitudeGrid(arch, grid_config)
+        underlying_grid = LatitudeLongitudeGrid(architecture, grid_config)
         bottom_height = Field{Center, Center, Nothing}(underlying_grid)
         depths = fill(-20.0, (5, 4))
         depths[2, :] .= 0.0
@@ -1054,7 +1054,7 @@ end
 
         bathymetry_file = joinpath(tmp, "bathymetry.nc")
         write_bathymetry_file(bathymetry_file, underlying_grid, bottom_height)
-        grid = ImmersedBoundaryGrid(bathymetry_file, arch, grid_config.halo)
+        grid = ImmersedBoundaryGrid(bathymetry_file, architecture, grid_config.halo)
 
         # The mask comes from the same water_mask prepare_forcing uses, taken at the surface.
         mask = coastal_water_mask(grid, :south)
@@ -1091,7 +1091,7 @@ end
 
 @testset "Add rivers round-trip" begin
     mktempdir() do tmp
-        arch = CPU()
+        architecture = CPU()
         grid_config = EvenGrid(
             size = (5, 4, 2),
             halo = (1, 1, 1),
@@ -1099,7 +1099,7 @@ end
             latitude = (59.0, 59.4),
             z_faces = [-20.0, -10.0, 0.0],
         )
-        underlying_grid = LatitudeLongitudeGrid(arch, grid_config)
+        underlying_grid = LatitudeLongitudeGrid(architecture, grid_config)
         bottom_height = Field{Center, Center, Nothing}(underlying_grid)
         depths = fill(-20.0, (5, 4))
         depths[2, :] .= 0.0
@@ -1107,7 +1107,7 @@ end
 
         bathymetry_file = joinpath(tmp, "bathymetry.nc")
         write_bathymetry_file(bathymetry_file, underlying_grid, bottom_height)
-        grid = ImmersedBoundaryGrid(bathymetry_file, arch, grid_config.halo)
+        grid = ImmersedBoundaryGrid(bathymetry_file, architecture, grid_config.halo)
 
         longitudes = Array(Oceananigans.Grids.λnodes(grid, Center()))
         latitudes = Array(Oceananigans.Grids.φnodes(grid, Center()))

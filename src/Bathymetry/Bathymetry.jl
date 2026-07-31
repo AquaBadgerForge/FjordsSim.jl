@@ -35,7 +35,7 @@ locally if needed. This is the one source-specific step of the pipeline: everyth
 — regridding, smoothing and writing — is the same for every source.
 
 A new bathymetry source implements this method on its `AbstractBathymetryConfig` subtype; see
-`bathymetry_dataset(target_grid, config::DybdedataConfig)` in `src/Bathymetry/Geonorge.jl`
+`bathymetry_dataset(target_grid, config::DybdedataConfig)` in `src/Bathymetry/geonorge.jl`
 for the built-in one.
 """
 function bathymetry_dataset end
@@ -107,15 +107,15 @@ function write_bathymetry_file(filepath::String, target_grid, bottom_height)
         defDim(ds, "lat", Ny)
         defDim(ds, "zf", length(z_faces))
 
-        lon = defVar(ds, "lon", Float64, ("lon",))
-        lat = defVar(ds, "lat", Float64, ("lat",))
-        zf = defVar(ds, "z_faces", Float64, ("zf",))
-        hvar = defVar(ds, "h", Float32, ("lon", "lat"))
+        longitude_variable = defVar(ds, "lon", Float64, ("lon",))
+        latitude_variable = defVar(ds, "lat", Float64, ("lat",))
+        z_faces_variable = defVar(ds, "z_faces", Float64, ("zf",))
+        bottom_height_variable = defVar(ds, "h", Float32, ("lon", "lat"))
 
-        lon[:] = longitude
-        lat[:] = latitude
-        zf[:] = z_faces
-        hvar[:, :] = h
+        longitude_variable[:] = longitude
+        latitude_variable[:] = latitude
+        z_faces_variable[:] = z_faces
+        bottom_height_variable[:, :] = h
     finally
         close(ds)
     end
@@ -267,6 +267,6 @@ function expand_domain(domain, N, padding_cells)
     return (lower, upper)
 end
 
-include("Geonorge.jl")
+include("geonorge.jl")
 
 end  # module Bathymetry

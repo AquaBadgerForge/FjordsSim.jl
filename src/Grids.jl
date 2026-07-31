@@ -32,9 +32,9 @@ Base.@kwdef mutable struct EvenGrid <: AbstractGridConfig
     z_faces::Vector{Float64}
 end
 
-function LatitudeLongitudeGrid(arch, config::EvenGrid)
+function LatitudeLongitudeGrid(architecture, config::EvenGrid)
     return LatitudeLongitudeGrid(
-        arch;
+        architecture;
         size      = config.size,
         halo      = config.halo,
         longitude = config.longitude,
@@ -44,7 +44,7 @@ function LatitudeLongitudeGrid(arch, config::EvenGrid)
 end
 
 """
-        ImmersedBoundaryGrid(filepath::String, arch, halo)
+        ImmersedBoundaryGrid(filepath::String, architecture, halo)
 
 Construct an immersed-boundary `LatitudeLongitudeGrid` from a bathymetry NetCDF file.
 
@@ -84,7 +84,7 @@ In short, new files should be written as `lon`, `lat`, `z_faces`, and
 `h(lon, lat)` using bottom height, while older files with swapped horizontal
 axis vectors or positive depth values are still supported.
 """
-function ImmersedBoundaryGrid(filepath::String, arch, halo)
+function ImmersedBoundaryGrid(filepath::String, architecture, halo)
     ds = NCDataset(filepath)
     z_faces = ds["z_faces"][:]
     bottom_height = ds["h"][:, :]
@@ -113,7 +113,7 @@ function ImmersedBoundaryGrid(filepath::String, arch, halo)
     # Size should be for grid centers,
     # but z, latitude and langitude should be for faces
     underlying_grid =
-        LatitudeLongitudeGrid(arch; size=(Nx, Ny, Nz - 1), halo=halo, z=z_faces, latitude, longitude)
+        LatitudeLongitudeGrid(architecture; size=(Nx, Ny, Nz - 1), halo=halo, z=z_faces, latitude, longitude)
     bathymetry = Field{Center,Center,Nothing}(underlying_grid)
     set!(bathymetry, coalesce.(bottom_height, 0.0))
     fill_halo_regions!(bathymetry)

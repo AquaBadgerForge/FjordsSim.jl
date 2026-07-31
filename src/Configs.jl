@@ -18,7 +18,7 @@ Supertype for grid configurations. A concrete subtype describes how to build the
 grid.
 
 # Methods a subtype provides
-- `LatitudeLongitudeGrid(arch, config)`: build the grid. Required.
+- `LatitudeLongitudeGrid(architecture, config)`: build the grid. Required.
 
 `FjordSim.Grids.EvenGrid` is the built-in implementation.
 """
@@ -40,7 +40,7 @@ and the pipeline that turns it into a processed FjordSim bathymetry NetCDF.
   Optional, defaults to `(;)`.
 
 `FjordSim.Bathymetry.DybdedataConfig` is the built-in implementation, for Geonorge Sjøkart
-Dybdedata; `src/Bathymetry/Geonorge.jl` is the template to copy for a new source.
+Dybdedata; `src/Bathymetry/geonorge.jl` is the template to copy for a new source.
 """
 abstract type AbstractBathymetryConfig end
 
@@ -69,7 +69,7 @@ how to download and subset it.
 - `download_forcing(target_grid, config)`: fetch the source data. Only if it downloads.
 
 `FjordSim.Forcing.NorKystConfig` is the built-in implementation, for NorKyst-800m;
-`src/Forcing/NorKyst.jl` is the template to copy for a new dataset.
+`src/Forcing/norkyst.jl` is the template to copy for a new dataset.
 """
 abstract type AbstractForcingConfig end
 
@@ -97,7 +97,7 @@ entirely.
   defaults to `config.search_radius`.
 
 `FjordSim.Forcing.OF800RiversConfig` is the built-in implementation, for the OF800 Oslofjord
-river dataset; `src/Forcing/OF800Rivers.jl` is the template to copy for a new dataset.
+river dataset; `src/Forcing/of800_rivers.jl` is the template to copy for a new dataset.
 """
 abstract type AbstractRiverConfig end
 
@@ -156,7 +156,7 @@ struct SingleColumn <: AbstractGridConfig
     depth::Float64
 end
 
-Oceananigans.LatitudeLongitudeGrid(arch, config::SingleColumn) = ...  # new behavior
+Oceananigans.LatitudeLongitudeGrid(architecture, config::SingleColumn) = ...  # new behavior
 ```
 """
 Base.@kwdef mutable struct FjordConfig{

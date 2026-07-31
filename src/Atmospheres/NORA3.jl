@@ -55,11 +55,11 @@ end
 function MultiYearNORA3(metadata_filename::String, default_download_directory::String)
     filepath = joinpath(default_download_directory, metadata_filename)
     ds = NCDataset(filepath)
-    sz = NTuple{2, Int}(size(ds["air_temperature_2m"])[1:2])
+    dataset_size = NTuple{2, Int}(size(ds["air_temperature_2m"])[1:2])
     all_dates = ds["time"][:]
     close(ds)
 
-    return MultiYearNORA3(metadata_filename, default_download_directory, sz, all_dates)
+    return MultiYearNORA3(metadata_filename, default_download_directory, dataset_size, all_dates)
 end  # function
 
 available_variables(::MultiYearNORA3) = NORA3_variable_names
@@ -110,7 +110,7 @@ const NORA3NetCDFFTS = FlavorOfFTS{<:Any,<:Any,<:Any,<:Any,<:NORA3NetCDFBackend}
 
 new_backend(b::NORA3NetCDFBackend, start, length) = NORA3NetCDFBackend(start, length, b.metadata)
 
-function NORA3_time_indices(ds::MultiYearNORA3, dates, name)
+function nora3_time_indices(ds::MultiYearNORA3, dates, name)
     nora3_all_dates = all_dates(ds, name)
     indices = sizehint!(Int[], length(dates))
 
@@ -177,7 +177,7 @@ function NORA3FieldTimeSeries(
     name = metadata.name
 
     # Change the metadata to reflect the actual time indices
-    time_indices = NORA3_time_indices(dataset, metadata.dates, name)
+    time_indices = nora3_time_indices(dataset, metadata.dates, name)
     dates = all_dates(dataset, name)[time_indices]
     metadata = Metadata(metadata.name; dataset = metadata.dataset, dates, dir = metadata.dir)
 

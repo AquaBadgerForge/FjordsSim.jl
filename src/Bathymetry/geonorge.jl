@@ -536,9 +536,9 @@ function collect_linestring_coordinates!(samples::DepthSamples, line, bottom_hei
         return nothing
     end
 
-    npoints = ArchGDAL.ngeom(line)
+    n_points = ArchGDAL.ngeom(line)
 
-    for point_index in contour_point_indices(npoints, config.contour_stride)
+    for point_index in contour_point_indices(n_points, config.contour_stride)
         x, y, _ = ArchGDAL.getpoint(line, point_index)
         push!(samples.xs, x)
         push!(samples.ys, y)
@@ -548,8 +548,8 @@ function collect_linestring_coordinates!(samples::DepthSamples, line, bottom_hei
     return nothing
 end
 
-function contour_point_indices(npoints, stride)
-    last_index = npoints - 1
+function contour_point_indices(n_points, stride)
+    last_index = n_points - 1
     indices = collect(0:stride:last_index)
     isempty(indices) || last(indices) == last_index || push!(indices, last_index)
     return indices
