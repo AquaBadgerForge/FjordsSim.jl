@@ -37,5 +37,6 @@ FjordConfig(
         architecture         = :auto,
         parameters           = ["temperature", "salinity", "u_eastward", "v_northward"],
         years                = [2020],
+        rivers               = OF800RiversConfig(data_root = _data_root),
     ),
 )

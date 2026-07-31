@@ -26,7 +26,30 @@ struct ConstantForcing <: AbstractForcingConfig
     output_file::String
     plot_file::String
     temperature::Float64
+    rivers::Nothing
 end
+
+struct MinimalRivers <: AbstractRiverConfig
+    data_root::String
+    output_file::String
+    relaxation_timescale::Float64
+    search_radius::Int
+end
+
+# A river config the "Add rivers round-trip" testset drives `add_rivers` with, standing in for a
+# real dataset: fixed outlets and a value that counts up in time, so a misplaced write is
+# visible.
+struct StubRivers <: AbstractRiverConfig
+    data_root::String
+    output_file::String
+    relaxation_timescale::Float64
+    search_radius::Int
+    locations::Vector{FjordSim.Forcing.RiverLocation}
+    series::Dict{String,Matrix{Float32}}
+end
+
+FjordSim.Forcing.river_locations(config::StubRivers) = config.locations
+FjordSim.Forcing.river_series(config::StubRivers, times) = config.series
 
 # New behavior for a new grid config, added without touching Grids.jl.
 Oceananigans.LatitudeLongitudeGrid(arch, config::SingleColumnGrid) = LatitudeLongitudeGrid(
@@ -49,17 +72,22 @@ FjordSim.Forcing.forcing_variable_names(config::ConstantForcing) = Dict("tempera
         :AbstractGridConfig,
         :AbstractBathymetryConfig,
         :AbstractForcingConfig,
+        :AbstractRiverConfig,
         :EvenGrid,
         :DybdedataConfig,
         :NorKystConfig,
+        :OF800RiversConfig,
         :forcing_from_file,
         :forcing_path,
         :forcing_directory,
+        :river_forcing_path,
         :plot_path,
         :bathymetry_path,
         :prepare_bathymetry,
         :prepare_forcing,
         :download_forcing,
+        :add_rivers,
+        :download_rivers,
         :interpolation_architecture,
         :plot_bathymetry,
         :plot_forcing,
@@ -70,7 +98,11 @@ FjordSim.Forcing.forcing_variable_names(config::ConstantForcing) = Dict("tempera
         :forcing_source_grid,
         :forcing_variable_names,
         :forcing_monthly_filename,
+        :river_locations,
+        :river_series,
+        :river_search_radius,
         :ProjectedSourceGrid,
+        :RiverLocation,
         :geodatabase_path,
         :top_bottom_boundary_conditions,
         :coupled_hydrostatic_simulation,
@@ -320,6 +352,46 @@ end
     @test config.forcing_config.years == [2020, 2021]
 end
 
+@testset "OF800 rivers config" begin
+    rivers = OF800RiversConfig(data_root = "/data/oslofjord")
+
+    @test rivers isa AbstractRiverConfig
+    @test isconcretetype(typeof(rivers))
+    @test river_forcing_path(rivers) == "/data/oslofjord/forcing_rivers.nc"
+    @test FjordSim.Forcing.river_locations_path(rivers) == "/data/oslofjord/OF800_rivers.csv"
+    @test FjordSim.Forcing.river_series_path(rivers) == "/data/oslofjord/of800_rivers_v9_1990_2022_RA1.nc"
+    @test river_search_radius(rivers) == 10
+    @test rivers.relaxation_timescale == 3600.0
+
+    # Both source files download from per-file links by default; a folder link cannot work.
+    @test occursin("/scl/fi/", rivers.locations_url) && occursin("dl=1", rivers.locations_url)
+    @test occursin("/scl/fi/", rivers.series_url) && occursin("dl=1", rivers.series_url)
+
+    # An expired Dropbox `st` token answers with a login page and HTTP 200, so the download
+    # reports success. That page must be rejected and removed, not left to masquerade as data.
+    mktempdir() do tmp
+        page = joinpath(tmp, "OF800_rivers.csv")
+        write(page, "<!DOCTYPE html>\n<html><title>Log in to Dropbox</title></html>")
+        @test_throws ErrorException FjordSim.Forcing.validate_river_download(page, "https://example.invalid")
+        @test !isfile(page)
+
+        empty_file = joinpath(tmp, "empty.nc")
+        write(empty_file, "")
+        @test_throws ErrorException FjordSim.Forcing.validate_river_download(empty_file, "https://example.invalid")
+
+        # Real data is passed through untouched: the CSV header, and the HDF5 magic the
+        # NetCDF-4 series file starts with.
+        good_csv = joinpath(tmp, "good.csv")
+        write(good_csv, "River number,Name,LatOutlet,LonOutlet,Zero\n1,A,59.0,10.5,0\n")
+        @test FjordSim.Forcing.validate_river_download(good_csv, "https://example.invalid") == good_csv
+        @test isfile(good_csv)
+
+        good_nc = joinpath(tmp, "good.nc")
+        write(good_nc, UInt8[0x89, 0x48, 0x44, 0x46, 0x0d, 0x0a, 0x1a, 0x0a])
+        @test FjordSim.Forcing.validate_river_download(good_nc, "https://example.invalid") == good_nc
+    end
+end
+
 @testset "Config extensibility" begin
     data_root = joinpath(tempdir(), "fjordsim_extensibility_test")
 
@@ -327,12 +399,14 @@ end
     config = FjordConfig(
         grid_config = SingleColumnGrid(120.0),
         bathymetry_config = MinimalBathymetry(data_root, "column.nc", "column.png"),
-        forcing_config = ConstantForcing(data_root, "column_forcing.nc", "column_forcing.png", 8.0),
+        forcing_config = ConstantForcing(data_root, "column_forcing.nc", "column_forcing.png", 8.0, nothing),
     )
+    rivers = MinimalRivers(data_root, "column_rivers.nc", 3600.0, 10)
 
     @test config.grid_config isa AbstractGridConfig
     @test config.bathymetry_config isa AbstractBathymetryConfig
     @test config.forcing_config isa AbstractForcingConfig
+    @test rivers isa AbstractRiverConfig
 
     # Field types are still concrete, so the struct stays type-stable per instantiation.
     @test isconcretetype(typeof(config))
@@ -366,6 +440,10 @@ end
     @test plot_path(config.bathymetry_config) == joinpath(data_root, "column.png")
     @test forcing_path(config.forcing_config) == joinpath(data_root, "column_forcing.nc")
     @test plot_path(config.forcing_config) == joinpath(data_root, "column_forcing.png")
+    @test river_forcing_path(rivers) == joinpath(data_root, "column_rivers.nc")
+
+    # `river_search_radius` is the river pipeline's one optional hook.
+    @test river_search_radius(rivers) == 10
 
     # A method overloaded on the new grid config is picked up by existing call sites.
     grid = LatitudeLongitudeGrid(CPU(), config.grid_config)
@@ -385,6 +463,11 @@ end
     @test_throws MethodError prepare_bathymetry(grid, config.bathymetry_config)
     @test_throws MethodError forcing_time_steps(config.forcing_config)
     @test_throws MethodError forcing_source_grid(config.forcing_config, "unused.nc")
+    @test_throws MethodError river_locations(rivers)
+    @test_throws MethodError river_series(rivers, [DateTime(2020, 1, 1)])
+
+    # A forcing config carrying no rivers skips the step rather than needing a river dataset.
+    @test isnothing(add_rivers(grid, config.forcing_config))
 end
 
 @testset "FjordSim.jl" begin
@@ -920,5 +1003,185 @@ end
         write_bathymetry_file(other_file, other_underlying, other_bottom)
         other = ImmersedBoundaryGrid(other_file, arch, other_grid_config.halo)
         @test_throws DimensionMismatch forcing_from_file(forcing_config; grid = other, tracers = (:T, :S))
+    end
+end
+
+@testset "River cell snapping" begin
+    is_coastal_cell = FjordSim.Forcing.is_coastal_cell
+    nearest_coastal_cell = FjordSim.Forcing.nearest_coastal_cell
+    coastal_water_mask = FjordSim.Forcing.coastal_water_mask
+    river_cells = FjordSim.Forcing.river_cells
+
+    # A hand-built mask exercises the two rules on their own: a cell is coastal when it is water
+    # and touches land, so open water in the middle is not a valid river mouth.
+    mask = trues(5, 5)
+    mask[1, :] .= false          # a land column along the western edge
+    @test is_coastal_cell(mask, 1, 3) == false   # land itself
+    @test is_coastal_cell(mask, 2, 3) == true    # water touching the land column
+    @test is_coastal_cell(mask, 4, 3) == false   # open water, no land neighbour
+    @test is_coastal_cell(mask, 0, 3) == false   # outside the grid
+
+    # An open-water cell is pulled to the coast — column 2 is the only coastal column here, so
+    # the search has to walk out to it rather than stopping at the first water cell it meets.
+    @test nearest_coastal_cell(mask, 2, 3, 10) == (2, 3, 0.0)
+    @test nearest_coastal_cell(mask, 4, 3, 10) == (2, 3, 2.0)
+    @test isnothing(nearest_coastal_cell(mask, 5, 3, 1))  # coast is 3 cells away, radius is 1
+
+    # Ties are broken by iteration order — latitude offset outermost, ascending — so of the two
+    # cells one step away from (3, 3) the one with the lower j wins.
+    tie_mask = trues(5, 5)
+    tie_mask[3, 1] = false
+    tie_mask[3, 5] = false
+    @test nearest_coastal_cell(tie_mask, 3, 3, 10) == (3, 2, 1.0)
+
+    mktempdir() do tmp
+        arch = CPU()
+        # A 5x4 basin with a land column at i = 2, so columns 1 and 3 are coastal while columns
+        # 4 and 5 are open water. The land is off the domain edge because an outlet has to sit
+        # strictly inside the grid to be accepted at all.
+        grid_config = EvenGrid(
+            size = (5, 4, 2),
+            halo = (1, 1, 1),
+            longitude = (10.0, 10.5),
+            latitude = (59.0, 59.4),
+            z_faces = [-20.0, -10.0, 0.0],
+        )
+        underlying_grid = LatitudeLongitudeGrid(arch, grid_config)
+        bottom_height = Field{Center, Center, Nothing}(underlying_grid)
+        depths = fill(-20.0, (5, 4))
+        depths[2, :] .= 0.0
+        set!(bottom_height, depths)
+
+        bathymetry_file = joinpath(tmp, "bathymetry.nc")
+        write_bathymetry_file(bathymetry_file, underlying_grid, bottom_height)
+        grid = ImmersedBoundaryGrid(bathymetry_file, arch, grid_config.halo)
+
+        # The mask comes from the same water_mask prepare_forcing uses, taken at the surface.
+        mask = coastal_water_mask(grid, :south)
+        @test size(mask) == (5, 4)
+        @test mask[2, 1] == false
+        @test mask[1, 1] == true && mask[3, 1] == true
+
+        longitudes = Array(Oceananigans.Grids.λnodes(grid, Center()))
+        latitudes = Array(Oceananigans.Grids.φnodes(grid, Center()))
+
+        # An outlet on the land column relocates to the coast; one in open water does too; one
+        # outside the domain is dropped rather than clamped to the nearest edge cell.
+        locations = [
+            FjordSim.Forcing.RiverLocation(1, "on land", longitudes[2], latitudes[2]),
+            FjordSim.Forcing.RiverLocation(2, "open water", longitudes[4], latitudes[2]),
+            FjordSim.Forcing.RiverLocation(3, "outside", 20.0, latitudes[2]),
+        ]
+        cells = river_cells(grid, locations, :south, 10)
+        @test length(cells) == 2
+        @test [cell.location.id for cell in cells] == [1, 2]
+        @test (cells[1].i, cells[1].j, cells[1].distance) == (1, 2, 1.0)
+        @test (cells[2].i, cells[2].j, cells[2].distance) == (3, 2, 1.0)
+        @test all(mask[cell.i, cell.j] for cell in cells)
+
+        # An outlet sitting exactly on the outermost node counts as outside, matching the
+        # reference's strict bounds test.
+        edge = FjordSim.Forcing.RiverLocation(4, "on the edge", longitudes[1], latitudes[2])
+        @test isempty(river_cells(grid, [edge], :south, 10))
+
+        # With no reach, the on-land outlet is dropped too rather than written into land.
+        @test isempty(river_cells(grid, [locations[1]], :south, 0))
+    end
+end
+
+@testset "Add rivers round-trip" begin
+    mktempdir() do tmp
+        arch = CPU()
+        grid_config = EvenGrid(
+            size = (5, 4, 2),
+            halo = (1, 1, 1),
+            longitude = (10.0, 10.5),
+            latitude = (59.0, 59.4),
+            z_faces = [-20.0, -10.0, 0.0],
+        )
+        underlying_grid = LatitudeLongitudeGrid(arch, grid_config)
+        bottom_height = Field{Center, Center, Nothing}(underlying_grid)
+        depths = fill(-20.0, (5, 4))
+        depths[2, :] .= 0.0
+        set!(bottom_height, depths)
+
+        bathymetry_file = joinpath(tmp, "bathymetry.nc")
+        write_bathymetry_file(bathymetry_file, underlying_grid, bottom_height)
+        grid = ImmersedBoundaryGrid(bathymetry_file, arch, grid_config.halo)
+
+        longitudes = Array(Oceananigans.Grids.λnodes(grid, Center()))
+        latitudes = Array(Oceananigans.Grids.φnodes(grid, Center()))
+
+        # One outlet on the land column, which relocates to the coastal cell (1, 2). "N" is a
+        # variable this forcing file does not carry, so it must be skipped, not fail.
+        rivers = StubRivers(
+            tmp,
+            "forcing_rivers.nc",
+            3600.0,
+            10,
+            [FjordSim.Forcing.RiverLocation(7, "test river", longitudes[2], latitudes[2])],
+            Dict(
+                "T" => Float32[3.0 4.0],
+                "S" => Float32[0.0 0.0],
+                "N" => Float32[9.0 9.0],
+            ),
+        )
+        forcing_config = NorKystConfig(
+            data_root = tmp,
+            output_directory = "norkyst",
+            parameters = ["temperature", "salinity"],
+            years = [2020],
+            rivers = rivers,
+        )
+        @test forcing_config.rivers isa AbstractRiverConfig
+        @test isconcretetype(typeof(forcing_config))
+
+        ds = NCDataset(forcing_path(forcing_config), "c")
+        defDim(ds, "Nx", 5)
+        defDim(ds, "Ny", 4)
+        defDim(ds, "Nz", 2)
+        defDim(ds, "Nx_faces", 6)
+        defDim(ds, "Ny_faces", 5)
+        defDim(ds, "time", 2)
+        defVar(ds, "time", [DateTime(2020, 1, 1, 12), DateTime(2020, 1, 2, 12)], ("time",))
+        for name in ("T", "S", "u", "v")
+            dimensions = FjordSim.Forcing.forcing_dimension_names(name)
+            shape = (ds.dim[dimensions[1]], ds.dim[dimensions[2]], ds.dim[dimensions[3]], ds.dim[dimensions[4]])
+            defVar(ds, name, Float32, dimensions; attrib = ["_FillValue" => NaN32])[:, :, :, :] =
+                fill(1.0f0, shape)
+            defVar(ds, name * "_lambda", Float32, dimensions; attrib = ["_FillValue" => NaN32])[:, :, :, :] =
+                fill(2.0f-5, shape)
+        end
+        close(ds)
+
+        result = add_rivers(grid, forcing_config)
+        @test result.output_file == joinpath(tmp, "forcing_rivers.nc")
+        @test result.variables == ["S", "T"]  # "N" is not in the file, so it is skipped
+        @test length(result.cells) == 1
+        @test (result.cells[1].i, result.cells[1].j) == (1, 2)
+
+        NCDataset(result.output_file) do written
+            # The river cell carries the river values and the river lambda at the surface, for
+            # every time step.
+            @test written["T"][1, 2, 2, :] == Float32[3.0, 4.0]
+            @test written["S"][1, 2, 2, :] == Float32[0.0, 0.0]
+            @test all(written["T_lambda"][1, 2, 2, :] .≈ Float32(1 / 3600))
+            @test all(written["S_lambda"][1, 2, 2, :] .≈ Float32(1 / 3600))
+
+            # ...and nothing else moves: not the level below, not a neighbouring cell, not the
+            # variables the river dataset did not name.
+            @test written["T"][1, 2, 1, :] == Float32[1.0, 1.0]
+            @test all(written["T_lambda"][1, 2, 1, :] .== 2.0f-5)
+            @test written["T"][1, 3, 2, :] == Float32[1.0, 1.0]
+            @test all(written["T_lambda"][1, 3, 2, :] .== 2.0f-5)
+            @test all(written["u"][:, :, :, :] .== 1.0f0)
+            @test !haskey(written, "N")
+        end
+
+        # The prepared forcing itself is left alone, so the step can be re-run.
+        NCDataset(forcing_path(forcing_config)) do original
+            @test all(original["T"][:, :, :, :] .== 1.0f0)
+            @test all(original["T_lambda"][:, :, :, :] .== 2.0f-5)
+        end
     end
 end

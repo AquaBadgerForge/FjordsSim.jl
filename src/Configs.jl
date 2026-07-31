@@ -3,10 +3,12 @@ module Configs
 export AbstractGridConfig,
     AbstractBathymetryConfig,
     AbstractForcingConfig,
+    AbstractRiverConfig,
     FjordConfig,
     bathymetry_path,
     forcing_path,
     forcing_directory,
+    river_forcing_path,
     plot_path
 
 """
@@ -56,6 +58,8 @@ how to download and subset it.
 - `parameters`: source variable names to prepare.
 - `architecture`: `:auto`, `:cpu` or `:gpu`, resolved by `interpolation_architecture` to decide
   where `prepare_forcing` runs its interpolation kernel.
+- `rivers`: an `AbstractRiverConfig` read by `add_rivers`, or `nothing` for no rivers. Only
+  needed by a setup that adds rivers.
 
 # Methods a subtype provides
 - `forcing_time_steps(config)`: the downloaded time records, as `SourceRecord`s. Required.
@@ -68,6 +72,34 @@ how to download and subset it.
 `src/Forcing/NorKyst.jl` is the template to copy for a new dataset.
 """
 abstract type AbstractForcingConfig end
+
+"""
+    AbstractRiverConfig
+
+Supertype for river configurations. A concrete subtype describes one river dataset and how to
+turn it into river relaxation written on top of a forcing file prepared by `prepare_forcing`.
+
+Rivers are optional: a forcing config whose `rivers` field is `nothing` skips the step
+entirely.
+
+# Fields a subtype provides
+- `data_root`, `output_file`: resolved by `river_forcing_path`, the rivers-augmented copy of
+  the forcing file.
+- `relaxation_timescale`: seconds; its reciprocal is the lambda written at each river cell.
+- `search_radius`: read by the default `river_search_radius`.
+
+# Methods a subtype provides
+- `river_locations(config)`: the river outlets, as `RiverLocation`s. Required.
+- `river_series(config, times)`: FjordSim forcing variable name => a `(river, time)` matrix of
+  values, one row per `river_locations` entry. Required.
+- `download_rivers(config)`: fetch the source data. Only if it downloads.
+- `river_search_radius(config)`: how far to look for a coastal cell, in cells. Optional,
+  defaults to `config.search_radius`.
+
+`FjordSim.Forcing.OF800RiversConfig` is the built-in implementation, for the OF800 Oslofjord
+river dataset; `src/Forcing/OF800Rivers.jl` is the template to copy for a new dataset.
+"""
+abstract type AbstractRiverConfig end
 
 """
     bathymetry_path(config)
@@ -92,6 +124,15 @@ dataset downloads its source files into. An absolute `output_directory` is retur
 unchanged.
 """
 forcing_directory(config::AbstractForcingConfig) = joinpath(config.data_root, config.output_directory)
+
+"""
+    river_forcing_path(config)
+
+Resolve `config.output_file` against `config.data_root`: the rivers-augmented copy of the
+forcing file written by `add_rivers`. Defined for every `AbstractRiverConfig`, so a new river
+dataset inherits path resolution. An absolute `output_file` is returned unchanged.
+"""
+river_forcing_path(config::AbstractRiverConfig) = joinpath(config.data_root, config.output_file)
 
 """
     FjordConfig

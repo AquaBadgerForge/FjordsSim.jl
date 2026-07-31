@@ -20,7 +20,13 @@ import Oceananigans: on_architecture
 import Oceananigans.Fields: set!
 import Oceananigans.OutputReaders: new_backend
 
-using ..Configs: AbstractForcingConfig, FjordConfig, forcing_path, forcing_directory
+using ..Configs:
+    AbstractForcingConfig,
+    AbstractRiverConfig,
+    FjordConfig,
+    forcing_path,
+    forcing_directory,
+    river_forcing_path
 
 export forcing_from_file,
     prepare_forcing,
@@ -31,7 +37,14 @@ export forcing_from_file,
     forcing_variable_names,
     forcing_monthly_filename,
     ProjectedSourceGrid,
-    NorKystConfig
+    NorKystConfig,
+    add_rivers,
+    download_rivers,
+    river_locations,
+    river_series,
+    river_search_radius,
+    RiverLocation,
+    OF800RiversConfig
 
 """ Custom backend for FieldTimeSeries """
 struct NetCDFBackend <: AbstractInMemoryBackend{Int}
@@ -1149,6 +1162,8 @@ function define_forcing_dimensions(ds, target_grid, steps)
     return ds
 end
 
+include("Rivers.jl")
 include("NorKyst.jl")
+include("OF800Rivers.jl")
 
 end # module

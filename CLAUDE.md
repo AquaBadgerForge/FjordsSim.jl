@@ -17,6 +17,9 @@ julia --project scripts/forcing_download.jl --config configs/oslofjorden.jl
 
 # Regrid the downloaded forcing onto the fjord's grid (needs the bathymetry and download first)
 julia --project scripts/forcing_prepare.jl --config configs/oslofjorden.jl
+
+# Write river relaxation on top of the prepared forcing (needs forcing_prepare first)
+julia --project scripts/forcing_add_rivers.jl --config configs/oslofjorden.jl
 ```
 
 `--config` is the only option any script takes, and it is required — there is no default setup.
@@ -34,15 +37,18 @@ FjordSim is a Julia package that wraps [Oceananigans.jl](https://github.com/CliM
 A simulation is assembled from a grid, a bathymetry file, forcing, and atmospheric data. The
 modules, in `include` order from `src/FjordSim.jl`:
 
-1. **Configs** (`src/Configs.jl`) — the three abstract supertypes `AbstractGridConfig`,
-   `AbstractBathymetryConfig`, `AbstractForcingConfig`, plus `FjordConfig`, which holds one of
-   each (parametrically, so every instantiation stays concretely typed). A new grid,
-   bathymetry source or forcing dataset is added by subtyping the matching supertype and
-   overloading methods on it — `FjordConfig` and its callers are untouched. The path helpers
-   defined on the supertypes live here too, so a new source inherits them without loading the
-   built-in source's module: `bathymetry_path`, `forcing_path`, `forcing_directory`, and
-   `plot_path` (one method per supertype). Each supertype's docstring lists the fields and
-   hook methods a subtype must provide — see "Adding a new source" below.
+1. **Configs** (`src/Configs.jl`) — the abstract supertypes `AbstractGridConfig`,
+   `AbstractBathymetryConfig`, `AbstractForcingConfig` and `AbstractRiverConfig`, plus
+   `FjordConfig`, which holds one each of the first three (parametrically, so every
+   instantiation stays concretely typed). A river config hangs off the forcing config's
+   `rivers` field instead, where `nothing` means the setup has no rivers. A new grid,
+   bathymetry source, forcing dataset or river dataset is added by subtyping the matching
+   supertype and overloading methods on it — `FjordConfig` and its callers are untouched. The
+   path helpers defined on the supertypes live here too, so a new source inherits them without
+   loading the built-in source's module: `bathymetry_path`, `forcing_path`,
+   `forcing_directory`, `river_forcing_path`, and `plot_path` (one method per supertype). Each
+   supertype's docstring lists the fields and hook methods a subtype must provide — see
+   "Adding a new source" below.
 
 2. **Dataset adapters** (`src/FDatasets.jl`) — `DSForcing` and `DSResults` are NumericalEarth
    dataset wrappers for local FjordSim NetCDF files (forcing inputs and simulation outputs),
@@ -119,6 +125,41 @@ modules, in `include` order from `src/FjordSim.jl`:
    ~59° from east here; and `inpaint_mask!` cannot fill a fully masked depth level, so on this
    regional subset it either never terminates or silently writes zeros.
 
+   `Rivers.jl` (generic core) and `OF800Rivers.jl` (dataset adapter) are included into the same
+   `Forcing` module and hold the rivers step, which runs *after* `prepare_forcing`.
+   `add_rivers(target_grid, config::AbstractForcingConfig)` dispatches on `config.rivers` — a
+   `nothing` river config is a no-op, so a setup opts in by naming one. The pipeline:
+   `river_locations(rivers)` → snap each outlet to a grid cell (`river_cells`) → river values
+   for the forcing file's own time axis (`river_series`) → copy the forcing file to
+   `river_forcing_path(rivers)` → patch the copy's surface level (`write_rivers!`). The original
+   forcing file is never modified, so the step is re-runnable without redoing `forcing_prepare`.
+
+   Rivers enter as **relaxation, not as a mass flux**: each river cell gets its value and
+   `λ = 1 / relaxation_timescale` (1 hour by default) at the surface level for every time step,
+   which lands in the existing `|λ| < 1` regime — no new forcing term or λ convention. A river
+   cell inside the boundary relaxation band overrides that band's λ. Outlets are located by
+   independent nearest-node lookups in longitude and latitude, then moved to the nearest
+   *coastal* water cell — water with at least one land neighbour, so a river cannot be injected
+   into open water. An outlet outside the grid, or with no coastal cell within `search_radius`,
+   is dropped with a warning rather than written into land. The water mask comes from the same
+   `water_mask` that `prepare_forcing` uses, so "water" means the same thing in both.
+   `write_rivers!` reads, patches and writes back whole surface slabs because the file is
+   chunked one horizontal slab per `(level, time)`.
+
+   `OF800Rivers.jl` holds `OF800RiversConfig <: AbstractRiverConfig` and reads two files: an
+   outlet CSV (hand-parsed; the project carries no CSV reader and the file is a couple of dozen
+   rows) and a ROMS river NetCDF whose values repeat across `s_rho`, so only the top level is
+   read and whose `river` coordinate is offset by `OF800_RIVER_NUMBER_OFFSET` from the CSV's
+   numbering. `river_transport`, `river_Vshape` and `river_direction` are present in that file
+   but deliberately unused — the reference pipeline this ports does not do a discharge
+   conversion. `download_rivers` fetches both files from the per-file Dropbox links defaulted on
+   the config, skipping any file already present. Those links must be per-*file* `/scl/fi/` URLs
+   ending in `dl=1`: Dropbox renders folder listings client-side and serves a `/scl/fo/` folder
+   link as one whole-folder archive, and without `dl=1` it serves the web app. A link that is not
+   publicly shared answers HTTP 200 with a login page rather than failing, so
+   `validate_river_download` rejects and deletes a downloaded file that starts with `<` instead
+   of letting an HTML page masquerade as the data.
+
 7. **Boundary conditions** (`src/BoundaryConditions.jl`) — `top_bottom_boundary_conditions` creates
    wind/heat/salt flux fields at the top and quadratic bottom drag, returning a named tuple
    `(u, v, T, S)`.
@@ -143,7 +184,8 @@ modules, in `include` order from `src/FjordSim.jl`:
 
 Every pipeline is a generic function on the config supertype plus a small set of hooks. Add a
 source by subtyping and overloading the hooks — never by editing the generic function. The
-adapter files (`src/Bathymetry/Geonorge.jl`, `src/Forcing/NorKyst.jl`) are the templates.
+adapter files (`src/Bathymetry/Geonorge.jl`, `src/Forcing/NorKyst.jl`, `src/Forcing/OF800Rivers.jl`)
+are the templates.
 
 Grid — `AbstractGridConfig`:
 
@@ -168,10 +210,24 @@ Forcing — `AbstractForcingConfig`, consumed by `prepare_forcing`:
 | `download_forcing(target_grid, config)` | only if it downloads |
 | `source_field_grid(source, arch)`, `projected_target_nodes(longitude, latitude, source)` | only for a source grid that is not a regular projected grid; dispatch on the source-grid type, not the config |
 
+Rivers — `AbstractRiverConfig`, consumed by `add_rivers`:
+
+| Hook | Required | Default |
+|---|---|---|
+| `river_locations(config)` → `Vector{RiverLocation}` | yes | none |
+| `river_series(config, times)` → `Dict` FjordSim name => `(river, time)` matrix | yes | none |
+| `download_rivers(config)` | only if it downloads | none |
+| `river_search_radius(config)` → cells to search for a coastal cell | no | `config.search_radius` |
+
+A river config is not a `FjordConfig` field — it goes in the forcing config's `rivers` field,
+`nothing` for a setup with no rivers. A variable `river_series` returns that the forcing file
+does not carry is skipped with a warning, so one river dataset can serve setups that prepare
+different variables.
+
 Required fields are listed in each supertype's docstring in `src/Configs.jl`. Path resolution
-(`bathymetry_path`, `forcing_path`, `forcing_directory`, `plot_path`) and the plots come for
-free. A missing required hook surfaces as a `MethodError` naming it, which the
-"Config extensibility" testset asserts.
+(`bathymetry_path`, `forcing_path`, `forcing_directory`, `river_forcing_path`, `plot_path`) and
+the plots come for free. A missing required hook surfaces as a `MethodError` naming it, which
+the "Config extensibility" testset asserts.
 
 ## Setups
 
@@ -181,6 +237,10 @@ script whose last expression is a `FjordConfig`, so scripts load it with
 `~/FjordSim_data/<fjord>/`; the config fields naming files (`output_file`, `plot_file`,
 `geodatabase_file`, `output_directory`) are names relative to `data_root`, and setting one to an
 absolute path relocates just that file — which is how a single FileGDB copy is shared across fjords.
+A nested config carries its own `data_root` too, so it can be relocated independently, but
+`oslofjorden.jl` gives its `OF800RiversConfig` the same `_data_root` as the rest of the setup —
+the river data downloads there rather than being shared from elsewhere. `drammensfjorden.jl`
+names no `rivers`, so it defaults to `nothing` and the rivers step is a no-op.
 
 `examples/oslofjord.jl` is the end-to-end simulation script and does *not* go through
 `FjordConfig`; it builds the grid straight from a bathymetry NetCDF and wires the components

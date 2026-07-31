@@ -9,10 +9,13 @@ export
     AbstractGridConfig,
     AbstractBathymetryConfig,
     AbstractForcingConfig,
+    AbstractRiverConfig,
     # generic entry points
     prepare_bathymetry,
     prepare_forcing,
     download_forcing,
+    add_rivers,
+    download_rivers,
     forcing_from_file,
     interpolation_architecture,
     plot_bathymetry,
@@ -21,6 +24,7 @@ export
     bathymetry_path,
     forcing_path,
     forcing_directory,
+    river_forcing_path,
     plot_path,
     # extension hooks a new config subtype overloads
     bathymetry_dataset,
@@ -29,11 +33,16 @@ export
     forcing_source_grid,
     forcing_variable_names,
     forcing_monthly_filename,
+    river_locations,
+    river_series,
+    river_search_radius,
     ProjectedSourceGrid,
+    RiverLocation,
     # built-in sources
     EvenGrid,
     DybdedataConfig,
     NorKystConfig,
+    OF800RiversConfig,
     geodatabase_path,
     # boundary conditions
     top_bottom_boundary_conditions,
