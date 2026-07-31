@@ -1,6 +1,6 @@
 using FjordSim
 using FjordSim.Bathymetry: write_bathymetry_file
-using Dates: DateTime
+using Dates: DateTime, Hour
 using Test
 using ArchGDAL
 using NCDatasets
@@ -34,6 +34,15 @@ struct MinimalRivers <: AbstractRiverConfig
     output_file::String
     relaxation_timescale::Float64
     search_radius::Int
+end
+
+struct MinimalAtmosphere <: AbstractAtmosphereConfig
+    data_root::String
+    output_file::String
+    plot_file::String
+    output_directory::String
+    resolution::Float64
+    padding::Float64
 end
 
 # A river config the "Add rivers round-trip" testset drives `add_rivers` with, standing in for a
@@ -112,6 +121,19 @@ FjordSim.Forcing.forcing_variable_names(config::ConstantForcing) = Dict("tempera
         :NORA3PrescribedAtmosphere,
         :NORA3PrescribedRadiation,
         :MultiYearNORA3,
+        :AbstractAtmosphereConfig,
+        :prepare_atmosphere,
+        :download_atmosphere,
+        :plot_atmosphere,
+        :atmosphere_path,
+        :atmosphere_directory,
+        :atmosphere_time_steps,
+        :atmosphere_source_grid,
+        :atmosphere_variable_names,
+        :atmosphere_target_axes,
+        :ProjectedAtmosphereGrid,
+        :AtmosphereRecord,
+        :NORA3Config,
     ]
 
     for sym in exported_symbols
@@ -323,6 +345,35 @@ end
     @test forcing_monthly_filename(forcing_config, 2020, 3) == "NorKyst-800m_ZDEPTHS_avg_202003.nc"
     @test occursin("thredds.met.no", forcing_config.catalog_url)
 
+    # A setup states its own atmosphere directory and years; only the NORA3 endpoint, the
+    # prepared file names and the target resolution are defaulted.
+    @test_throws UndefKeywordError NORA3Config(data_root = data_root, years = [2020])
+    @test_throws UndefKeywordError NORA3Config(data_root = data_root, output_directory = "nora3")
+    @test_throws UndefKeywordError NORA3Config(output_directory = "nora3", years = [2020])
+
+    atmosphere_config = NORA3Config(data_root = data_root, output_directory = "nora3", years = [2020])
+    @test atmosphere_config isa AbstractAtmosphereConfig
+    @test isconcretetype(typeof(atmosphere_config))
+    @test atmosphere_path(atmosphere_config) == joinpath(data_root, "atmosphere.nc")
+    @test atmosphere_directory(atmosphere_config) == joinpath(data_root, "nora3")
+    @test plot_path(atmosphere_config) == joinpath(data_root, "atmosphere.png")
+    @test atmosphere_config.resolution == 0.02
+    @test atmosphere_config.padding == 0.1
+    @test occursin("thredds.met.no", atmosphere_config.opendap_url)
+
+    # ...and an absolute path relocates just that file, as for the other configs.
+    relocated_atmosphere = NORA3Config(
+        data_root = data_root,
+        output_directory = "nora3",
+        output_file = "/shared/atmosphere.nc",
+        years = [2020],
+    )
+    @test atmosphere_path(relocated_atmosphere) == "/shared/atmosphere.nc"
+    @test atmosphere_directory(relocated_atmosphere) == joinpath(data_root, "nora3")
+    @test atmosphere_directory(
+        NORA3Config(data_root = data_root, output_directory = "/nora3", years = [2020]),
+    ) == "/nora3"
+
     grid_config = EvenGrid(
         size = (2, 3, 2),
         halo = (1, 1, 1),
@@ -331,7 +382,7 @@ end
         z_faces = [-20.0, -10.0, 0.0],
     )
 
-    config = FjordConfig(; grid_config, bathymetry_config, forcing_config)
+    config = FjordConfig(; grid_config, bathymetry_config, forcing_config, atmosphere_config)
     grid = LatitudeLongitudeGrid(CPU(), config.grid_config)
 
     # `native_region!` derives the padded native region from the target grid: 4 cells of
@@ -347,9 +398,11 @@ end
     config.grid_config.size = (4, 6, 2)
     config.bathymetry_config.padding_cells = 0
     config.forcing_config.years = [2020, 2021]
+    config.atmosphere_config.years = [2020, 2021]
     @test config.grid_config.size == (4, 6, 2)
     @test config.bathymetry_config.padding_cells == 0
     @test config.forcing_config.years == [2020, 2021]
+    @test config.atmosphere_config.years == [2020, 2021]
 end
 
 @testset "OF800 rivers config" begin
@@ -400,17 +453,27 @@ end
         grid_config = SingleColumnGrid(120.0),
         bathymetry_config = MinimalBathymetry(data_root, "column.nc", "column.png"),
         forcing_config = ConstantForcing(data_root, "column_forcing.nc", "column_forcing.png", 8.0, nothing),
+        atmosphere_config = MinimalAtmosphere(
+            data_root,
+            "column_atmosphere.nc",
+            "column_atmosphere.png",
+            "column_source",
+            0.05,
+            0.1,
+        ),
     )
     rivers = MinimalRivers(data_root, "column_rivers.nc", 3600.0, 10)
 
     @test config.grid_config isa AbstractGridConfig
     @test config.bathymetry_config isa AbstractBathymetryConfig
     @test config.forcing_config isa AbstractForcingConfig
+    @test config.atmosphere_config isa AbstractAtmosphereConfig
     @test rivers isa AbstractRiverConfig
 
     # Field types are still concrete, so the struct stays type-stable per instantiation.
     @test isconcretetype(typeof(config))
     @test fieldtype(typeof(config), :grid_config) === SingleColumnGrid
+    @test fieldtype(typeof(config), :atmosphere_config) === MinimalAtmosphere
 
     # ...and the built-in types remain valid, i.e. FjordConfig is genuinely generic.
     @test FjordConfig(
@@ -441,6 +504,9 @@ end
     @test forcing_path(config.forcing_config) == joinpath(data_root, "column_forcing.nc")
     @test plot_path(config.forcing_config) == joinpath(data_root, "column_forcing.png")
     @test river_forcing_path(rivers) == joinpath(data_root, "column_rivers.nc")
+    @test atmosphere_path(config.atmosphere_config) == joinpath(data_root, "column_atmosphere.nc")
+    @test atmosphere_directory(config.atmosphere_config) == joinpath(data_root, "column_source")
+    @test plot_path(config.atmosphere_config) == joinpath(data_root, "column_atmosphere.png")
 
     # `river_search_radius` is the river pipeline's one optional hook.
     @test river_search_radius(rivers) == 10
@@ -465,9 +531,34 @@ end
     @test_throws MethodError forcing_source_grid(config.forcing_config, "unused.nc")
     @test_throws MethodError river_locations(rivers)
     @test_throws MethodError river_series(rivers, [DateTime(2020, 1, 1)])
+    @test_throws MethodError atmosphere_time_steps(config.atmosphere_config)
+    @test_throws MethodError atmosphere_source_grid(config.atmosphere_config, "unused.nc")
+    @test_throws MethodError atmosphere_variable_names(config.atmosphere_config)
+    @test_throws MethodError prepare_atmosphere(grid, config.atmosphere_config)
 
     # A forcing config carrying no rivers skips the step rather than needing a river dataset.
     @test isnothing(add_rivers(grid, config.forcing_config))
+
+    # ...and a setup naming no atmosphere skips both atmosphere steps the same way, which is why
+    # `atmosphere_config` defaults to `nothing`.
+    @test isnothing(prepare_atmosphere(grid, nothing))
+    @test isnothing(download_atmosphere(grid, nothing))
+    bare = FjordConfig(
+        grid_config = SingleColumnGrid(120.0),
+        bathymetry_config = MinimalBathymetry(data_root, "column.nc", "column.png"),
+        forcing_config = ConstantForcing(data_root, "f.nc", "f.png", 8.0, nothing),
+    )
+    @test isnothing(bare.atmosphere_config)
+    @test isnothing(download_atmosphere(bare))
+
+    # `atmosphere_target_axes` is generic over the grid config: it reads the domain through
+    # `x_domain`/`y_domain`, so the stub grid works, and both axes must come out uniformly spaced
+    # because `compute_faces` infers the spacing from the first difference.
+    longitude, latitude = atmosphere_target_axes(grid, config.atmosphere_config)
+    @test all(isapprox(longitude[2] - longitude[1]), diff(longitude))
+    @test all(isapprox(latitude[2] - latitude[1]), diff(latitude))
+    @test first(longitude) <= 10.0 && last(longitude) >= 11.0   # covers the stub grid's domain
+    @test first(latitude) <= 59.0 && last(latitude) >= 60.0
 end
 
 @testset "FjordSim.jl" begin
@@ -1183,5 +1274,242 @@ end
             @test all(original["T"][:, :, :, :] .== 1.0f0)
             @test all(original["T_lambda"][:, :, :, :] .== 2.0f-5)
         end
+    end
+end
+
+@testset "Atmosphere preparation helpers" begin
+    atmospheres = FjordSim.Atmospheres
+    uniform_centers = atmospheres.uniform_centers
+    nora3_runs = atmospheres.nora3_runs
+    nora3_month_dates = atmospheres.nora3_month_dates
+    grid_rotation_angle = atmospheres.grid_rotation_angle
+    rotate_to_east_north = atmospheres.rotate_to_east_north
+    interpolate_to_target! = atmospheres.interpolate_to_target!
+    projected_atmosphere_nodes = atmospheres.projected_atmosphere_nodes
+    validate_target_coverage = atmospheres.validate_target_coverage
+    validate_atmosphere_records = atmospheres.validate_atmosphere_records
+
+    # The prepared axis starts on a whole multiple of the resolution, is uniform, and covers the
+    # domain plus the padding on both sides.
+    centers = uniform_centers((10.2, 11.02), 0.1, 0.02)
+    @test first(centers) == 10.1
+    @test all(isapprox(0.02), diff(centers))
+    @test last(centers) >= 11.12
+    @test length(centers) == 52
+
+    config = NORA3Config(data_root = tempdir(), output_directory = "nora3", years = [2020])
+    @test_throws ArgumentError atmosphere_target_axes(
+        LatitudeLongitudeGrid(CPU(); size = (1, 1, 1), longitude = (10.0, 11.0), latitude = (59.0, 60.0), z = (-1.0, 0.0)),
+        NORA3Config(data_root = tempdir(), output_directory = "n", resolution = 0.0, years = [2020]),
+    )
+
+    # One run covers six hours, so a day needs its four runs plus the previous day's 18Z run for
+    # hours 00:00 to 03:00.
+    runs = nora3_runs(2020, 1)
+    @test first(runs) == DateTime(2019, 12, 31, 18)
+    @test last(runs) == DateTime(2020, 1, 31, 18)
+    @test length(runs) == 1 + 31 * 4
+
+    # Every hour of the month is supplied exactly once, with no gap and no duplicate — the
+    # property that lets all eight variables share one time axis.
+    january = nora3_month_dates(2020, 1)
+    @test length(january) == 31 * 24
+    @test first(january) == DateTime(2020, 1, 1, 0)
+    @test last(january) == DateTime(2020, 1, 31, 23)
+    @test allunique(january)
+    @test all(==(Hour(1)), diff(january))
+
+    # ...including across month and year boundaries, and in a leap February.
+    @test length(nora3_month_dates(2020, 2)) == 29 * 24
+    @test length(nora3_month_dates(2021, 2)) == 28 * 24
+    year = vcat((nora3_month_dates(2020, month) for month = 1:12)...)
+    @test length(year) == 366 * 24
+    @test allunique(year)
+    @test all(==(Hour(1)), diff(year))
+    @test first(year) == DateTime(2020, 1, 1, 0)
+    @test last(year) == DateTime(2020, 12, 31, 23)
+
+    # The URL layout is deterministic, so no catalog listing is needed.
+    @test atmospheres.nora3_url(config, DateTime(2020, 1, 1, 0), 4) ==
+          "https://thredds.met.no/thredds/dodsC/nora3/2020/01/01/00/fc2020010100_004_fp.nc"
+    @test atmospheres.nora3_monthly_filename(config, 2020, 3) == "NORA3_202003.nc"
+
+    # The rotation angle is measured from east to the source grid's local x axis.
+    east_aligned_longitude = [10.0 10.0; 10.1 10.1; 10.2 10.2]
+    east_aligned_latitude = [59.0 59.5; 59.0 59.5; 59.0 59.5]
+    @test all(isapprox(0.0), grid_rotation_angle(east_aligned_longitude, east_aligned_latitude))
+
+    north_aligned_longitude = [10.0 10.5; 10.0 10.5; 10.0 10.5]
+    north_aligned_latitude = [59.0 59.0; 59.1 59.1; 59.2 59.2]
+    @test all(isapprox(π / 2), grid_rotation_angle(north_aligned_longitude, north_aligned_latitude))
+
+    # The last column repeats the previous difference rather than being left undefined.
+    angle = grid_rotation_angle(east_aligned_longitude, east_aligned_latitude)
+    @test size(angle) == size(east_aligned_longitude)
+    @test angle[end, 1] == angle[end-1, 1]
+
+    # Rotating by zero is the identity; by π/2 sends (u, v) to (-v, u).
+    eastward, northward = rotate_to_east_north(zeros(2, 2), fill(3.0, 2, 2), fill(4.0, 2, 2))
+    @test all(eastward .== 3.0) && all(northward .== 4.0)
+    eastward, northward = rotate_to_east_north(fill(π / 2, 2, 2), fill(3.0, 2, 2), fill(4.0, 2, 2))
+    @test all(isapprox(-4.0), eastward) && all(isapprox(3.0), northward)
+
+    # Rotating and unrotating returns the original components.
+    angle = [0.3 -1.2; 2.0 0.7]
+    u = [1.0 -2.0; 3.0 0.5]
+    v = [-1.5 2.5; 0.0 4.0]
+    eastward, northward = rotate_to_east_north(angle, u, v)
+    back_u, back_v = rotate_to_east_north(-angle, eastward, northward)
+    @test all(isapprox.(back_u, u; atol = 1e-12))
+    @test all(isapprox.(back_v, v; atol = 1e-12))
+
+    # Bilinear interpolation is exact for a field linear in the projected coordinates.
+    source = ProjectedAtmosphereGrid(collect(0.0:100.0:400.0), collect(0.0:100.0:300.0), "+proj=longlat +datum=WGS84")
+    slab = Float32[1 + 2 * x + 3 * y for x in source.x, y in source.y]
+    x = [50.0 150.0; 250.0 375.0]
+    y = [25.0 175.0; 100.0 290.0]
+    output = Matrix{Float32}(undef, 2, 2)
+    interpolate_to_target!(output, slab, x, y, source)
+    expected = Float32[1 + 2 * x[index] + 3 * y[index] for index in eachindex(x)]
+    @test all(isapprox.(vec(output), expected; rtol = 1e-5))
+
+    # A target node outside the source window is refused rather than extrapolated, because the
+    # usual cause is a download that predates a change to `resolution` or `padding`.
+    @test isnothing(validate_target_coverage(x, y, source))
+    @test_throws ErrorException validate_target_coverage([500.0;;], [0.0;;], source)
+
+    # An empty or unsorted record axis is an error; a hole in it is a warning.
+    @test_throws ErrorException validate_atmosphere_records(AtmosphereRecord[])
+    contiguous = [AtmosphereRecord(DateTime(2020, 1, 1, hour), "a.nc", hour + 1) for hour = 0:3]
+    @test isnothing(validate_atmosphere_records(contiguous))
+    gapped = [
+        AtmosphereRecord(DateTime(2020, 1, 1, 0), "a.nc", 1),
+        AtmosphereRecord(DateTime(2020, 1, 1, 5), "a.nc", 2),
+    ]
+    @test_logs (:warn,) validate_atmosphere_records(gapped)
+end
+
+@testset "Atmosphere file round-trip" begin
+    atmospheres = FjordSim.Atmospheres
+    # The real NORA3 projection, so the coordinate transform is exercised for real.
+    proj4 = "+proj=lcc +lat_0=66.3 +lon_0=-42 +lat_1=66.3 +lat_2=66.3 +no_defs +R=6.371e+06"
+
+    mktempdir() do tmp
+        config = NORA3Config(data_root = tmp, output_directory = "nora3", years = [2020])
+        grid = LatitudeLongitudeGrid(
+            CPU();
+            size = (8, 10, 2),
+            longitude = (10.2, 11.02),
+            latitude = (59.0, 59.93),
+            z = (-10.0, 0.0),
+        )
+        longitude, latitude = atmosphere_target_axes(grid, config)
+
+        # A source window in projected meters that comfortably covers the prepared grid, found by
+        # projecting the prepared nodes and padding the result by two source cells.
+        probe = ProjectedAtmosphereGrid([0.0, 1.0], [0.0, 1.0], proj4)
+        probe_x, probe_y = atmospheres.projected_atmosphere_nodes(longitude, latitude, probe)
+        spacing = 3000.0
+        source_x = collect(
+            range(
+                (floor(minimum(probe_x) / spacing) - 2) * spacing,
+                step = spacing,
+                length = ceil(Int, (maximum(probe_x) - minimum(probe_x)) / spacing) + 5,
+            ),
+        )
+        source_y = collect(
+            range(
+                (floor(minimum(probe_y) / spacing) - 2) * spacing,
+                step = spacing,
+                length = ceil(Int, (maximum(probe_y) - minimum(probe_y)) / spacing) + 5,
+            ),
+        )
+        Nx, Ny = length(source_x), length(source_y)
+        x_matrix = repeat(source_x, 1, Ny)
+        y_matrix = repeat(reshape(source_y, 1, Ny), Nx, 1)
+
+        # Linear in the projected coordinates, so bilinear interpolation must reproduce it.
+        analytic(x, y) = 1.0 + 2.0e-5 * x + 3.0e-5 * y
+
+        # `MultiYearNORA3`'s default backend keeps ten time indices in memory, so the fixture
+        # needs at least that many steps.
+        dates = atmospheres.nora3_month_dates(2020, 1)[1:12]
+        mkpath(atmosphere_directory(config))
+        source_file = joinpath(atmosphere_directory(config), "NORA3_202001.nc")
+
+        NCDataset(source_file, "c") do ds
+            defDim(ds, "x", Nx)
+            defDim(ds, "y", Ny)
+            defDim(ds, "time", length(dates))
+            defVar(ds, "x", Float64, ("x",))[:] = source_x
+            defVar(ds, "y", Float64, ("y",))[:] = source_y
+            defVar(ds, "time", dates, ("time",))
+            defVar(ds, "projection_lambert", Int32, (); attrib = ["proj4" => proj4])
+            for variable in atmospheres.ATMOSPHERE_VARIABLES
+                written = defVar(ds, variable.name, Float32, ("x", "y", "time"))
+                for step = 1:length(dates)
+                    written[:, :, step] = Float32.(analytic.(x_matrix, y_matrix) .+ step)
+                end
+            end
+        end
+
+        result = prepare_atmosphere(grid, config)
+        @test result.output_file == atmosphere_path(config)
+        @test length(result.times) == length(dates)
+        @test result.times == dates
+        @test sort(result.variables) == sort([v.name for v in atmospheres.ATMOSPHERE_VARIABLES])
+
+        NCDataset(result.output_file) do ds
+            # The layout the simulation-time reader requires: (longitude, latitude, time) in
+            # Julia order, uniform 1D centers, CF time.
+            @test NCDatasets.dimnames(ds["air_temperature_2m"]) == ("lon", "lat", "time")
+            @test size(ds["air_temperature_2m"]) == (length(longitude), length(latitude), length(dates))
+            @test all(isapprox(ds["lon"][2] - ds["lon"][1]), diff(ds["lon"][:]))
+            @test all(isapprox(ds["lat"][2] - ds["lat"][1]), diff(ds["lat"][:]))
+            @test ds["time"][:] == dates
+            @test ds["air_temperature_2m"].attrib["units"] == "K"
+            @test ds["swrad"].attrib["units"] == "W m-2"
+
+            # Every variable is present and finite — an atmospheric field has no land mask to
+            # excuse a NaN.
+            for variable in atmospheres.ATMOSPHERE_VARIABLES
+                @test haskey(ds, variable.name)
+                @test all(isfinite, ds[variable.name][:, :, :])
+            end
+
+            # The regridded values match the analytic field at the prepared nodes.
+            source = ProjectedAtmosphereGrid(source_x, source_y, proj4)
+            node_x, node_y = atmospheres.projected_atmosphere_nodes(ds["lon"][:], ds["lat"][:], source)
+            for step in (1, 7, 12)
+                expected = Float32.(analytic.(node_x, node_y) .+ step)
+                @test all(isapprox.(ds["swrad"][:, :, step], expected; rtol = 1e-5))
+            end
+        end
+
+        # A second month cut to a different source window is refused rather than read with the
+        # first month's coordinates — the hazard when `padding` changes and the download skips
+        # months already present.
+        february = atmospheres.nora3_month_dates(2020, 2)[1:3]
+        NCDataset(joinpath(atmosphere_directory(config), "NORA3_202002.nc"), "c") do ds
+            defDim(ds, "x", Nx - 1)
+            defDim(ds, "y", Ny)
+            defDim(ds, "time", length(february))
+            defVar(ds, "x", Float64, ("x",))[:] = source_x[1:end-1]
+            defVar(ds, "y", Float64, ("y",))[:] = source_y
+            defVar(ds, "time", february, ("time",))
+            defVar(ds, "projection_lambert", Int32, (); attrib = ["proj4" => proj4])
+            for variable in atmospheres.ATMOSPHERE_VARIABLES
+                defVar(ds, variable.name, Float32, ("x", "y", "time"))[:, :, :] .= 1.0f0
+            end
+        end
+        @test_throws ErrorException prepare_atmosphere(grid, config)
+        rm(joinpath(atmosphere_directory(config), "NORA3_202002.nc"))
+
+        # ...and the produced file satisfies the reader contract end to end.
+        dataset = MultiYearNORA3(config)
+        @test dataset.size == (length(longitude), length(latitude))
+        @test dataset.all_dates == dates
+        @test_nowarn NORA3PrescribedAtmosphere(CPU(), Float32; dataset)
+        @test_nowarn NORA3PrescribedRadiation(CPU(), Float32; dataset)
     end
 end

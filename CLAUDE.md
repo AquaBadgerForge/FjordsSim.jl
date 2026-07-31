@@ -20,6 +20,12 @@ julia --project scripts/forcing_prepare.jl --config configs/oslofjorden.jl
 
 # Write river relaxation on top of the prepared forcing (needs forcing_prepare first)
 julia --project scripts/forcing_add_rivers.jl --config configs/oslofjorden.jl
+
+# Download and subset the configured atmosphere dataset (slow: ~10000 OPeNDAP reads per year)
+julia --project scripts/atmosphere_download.jl --config configs/oslofjorden.jl
+
+# Regrid the downloaded atmosphere onto a regular lon/lat grid (needs the download first)
+julia --project scripts/atmosphere_prepare.jl --config configs/oslofjorden.jl
 ```
 
 `--config` is the only option any script takes, and it is required — there is no default setup.
@@ -38,17 +44,18 @@ A simulation is assembled from a grid, a bathymetry file, forcing, and atmospher
 modules, in `include` order from `src/FjordSim.jl`:
 
 1. **Configs** (`src/Configs.jl`) — the abstract supertypes `AbstractGridConfig`,
-   `AbstractBathymetryConfig`, `AbstractForcingConfig` and `AbstractRiverConfig`, plus
-   `FjordConfig`, which holds one each of the first three (parametrically, so every
-   instantiation stays concretely typed). A river config hangs off the forcing config's
-   `rivers` field instead, where `nothing` means the setup has no rivers. A new grid,
-   bathymetry source, forcing dataset or river dataset is added by subtyping the matching
-   supertype and overloading methods on it — `FjordConfig` and its callers are untouched. The
-   path helpers defined on the supertypes live here too, so a new source inherits them without
-   loading the built-in source's module: `bathymetry_path`, `forcing_path`,
-   `forcing_directory`, `river_forcing_path`, and `plot_path` (one method per supertype). Each
-   supertype's docstring lists the fields and hook methods a subtype must provide — see
-   "Adding a new source" below.
+   `AbstractBathymetryConfig`, `AbstractForcingConfig`, `AbstractRiverConfig` and
+   `AbstractAtmosphereConfig`, plus `FjordConfig`, which holds a grid, bathymetry, forcing and
+   atmosphere config (parametrically, so every instantiation stays concretely typed).
+   `atmosphere_config` defaults to `nothing`, so a setup opts in by naming one. A river config
+   hangs off the forcing config's `rivers` field instead, where `nothing` means the setup has no
+   rivers. A new grid, bathymetry source, forcing dataset, river dataset or atmosphere dataset is
+   added by subtyping the matching supertype and overloading methods on it — `FjordConfig` and its
+   callers are untouched. The path helpers defined on the supertypes live here too, so a new
+   source inherits them without loading the built-in source's module: `bathymetry_path`,
+   `forcing_path`, `forcing_directory`, `river_forcing_path`, `atmosphere_path`,
+   `atmosphere_directory`, and `plot_path` (one method per supertype). Each supertype's docstring
+   lists the fields and hook methods a subtype must provide — see "Adding a new source" below.
 
 2. **Dataset adapters** (`src/Datasets.jl`) — `ForcingDataset` and `ResultsDataset` are NumericalEarth
    dataset wrappers for local FjordSim NetCDF files (forcing inputs and simulation outputs),
@@ -75,10 +82,67 @@ modules, in `include` order from `src/FjordSim.jl`:
    and wrapped by `GeonorgeBathymetry <: AbstractStaticBathymetry`, which implements the
    NumericalEarth dataset interface.
 
-5. **Atmosphere** (`src/Atmospheres/Atmospheres.jl`, `src/Atmospheres/NORA3.jl`) — `MultiYearNORA3` is
-   a dataset wrapper for NORA3 reanalysis NetCDF. `NORA3PrescribedAtmosphere` and
-   `NORA3PrescribedRadiation` construct NumericalEarth `PrescribedAtmosphere`/`PrescribedRadiation`
-   objects backed by `NORA3FieldTimeSeries`. Default data path: `~/FjordSim_data/NORA3/NORA3.nc`.
+5. **Atmosphere** (`src/Atmospheres/Atmospheres.jl` generic core, `src/Atmospheres/nora3_source.jl`
+   dataset adapter included flat into the same module, `src/Atmospheres/NORA3.jl` a nested
+   `module NORA3` holding the read side).
+
+   The read side: `MultiYearNORA3` is a dataset wrapper for a prepared atmosphere NetCDF.
+   `NORA3PrescribedAtmosphere` and `NORA3PrescribedRadiation` construct NumericalEarth
+   `PrescribedAtmosphere`/`PrescribedRadiation` objects backed by `NORA3FieldTimeSeries`.
+   `MultiYearNORA3(config)` resolves a setup's own prepared file through `atmosphere_path`;
+   `default_nora3_dataset()` is the legacy shared `~/FjordSim_data/NORA3/NORA3.nc`.
+
+   `prepare_atmosphere(target_grid, config::AbstractAtmosphereConfig)` regrids the downloaded files
+   onto a regular lon/lat grid: `atmosphere_variable_names(config)` picks the variables →
+   `atmosphere_time_steps(config)` gives the hourly `AtmosphereRecord`s →
+   `atmosphere_source_grid(config, filepath)` gives the downloaded geometry →
+   `atmosphere_target_axes` derives the prepared axes from `x_domain`/`y_domain` grown by
+   `config.padding` and sampled at `config.resolution` → `projected_atmosphere_nodes` projects them
+   into the source projection in one bulk GDAL call → one bilinear `interpolate_to_target!` per
+   variable per step → streaming NetCDF write. `download_atmosphere(config::FjordConfig)` is the
+   generic download driver, mirroring `download_forcing`.
+
+   The prepared file's layout is a **contract**, fixed by the read side: `Float32` variables of
+   shape `(lon, lat, time)`, uniformly spaced 1D `lon`/`lat` centers (`compute_faces` infers the
+   spacing from the first difference), a CF-encoded `time`, and exactly the eight names and units
+   in `ATMOSPHERE_VARIABLES`. Air temperature is **Kelvin** and both radiative fluxes are
+   **downwelling**, because that is what NumericalEarth consumes — `PrescribedRadiation` applies
+   its own surface albedo, so a net flux would count it twice.
+
+   Interpolation is deliberately *not* reused from `Forcing`: `Atmospheres` is included before
+   `Forcing`, and `Forcing`'s machinery is 3D, depth-oriented and mask-driven, whereas atmospheric
+   fields are 2D and defined everywhere including over land. The cost is ~15 duplicated lines of the
+   ArchGDAL transform in `projected_target_nodes`; the benefit is a self-contained module with no
+   dummy depth level, no all-true mask, and no `architecture` field — the prepared grid is ~50x60,
+   so there is nothing worth a GPU.
+
+   `nora3_source.jl` holds `NORA3Config <: AbstractAtmosphereConfig` and the MET Norway NORA3
+   download. NORA3 is served one file per forecast lead hour of a 6-hourly run, and the archive
+   layout is deterministic, so no catalog listing is needed. The download owns everything that
+   depends on the forecast structure and writes one gap-free hourly file per month already carrying
+   the eight prepared names, which makes `prepare_atmosphere` a pure regrid — re-running it at a
+   different `resolution` costs no re-download.
+
+   Two non-obvious pieces. **Which lead supplies which hour**: leads 4..9 of one run cover six
+   consecutive hours, so the four daily runs tile a day exactly with no overlap and no dedup pass —
+   hours 04..09 from 00Z, 10..15 from 06Z, 16..21 from 12Z, 22..23 from 18Z, and 00..03 from the
+   *previous* day's 18Z run. **De-accumulation**: the flux accumulators restart at every run
+   (downwelling longwave for 09:00 reads 11_181_925 J/m² as lead 9 of the 00Z run but 3_734_820 J/m²
+   as lead 3 of the 06Z run), so `process_run` walks leads 3..9 carrying the previous lead's values
+   forward and every difference stays inside one run. Each increment is labelled at the *end* of its
+   interval, which is what puts the fluxes on the same hourly axis as the instantaneous fields —
+   the reference Python pipeline this ports labels them at the midpoint and so needs a second
+   `time_acc` axis, which `MultiYearNORA3` cannot read.
+
+   Winds arrive relative to the Lambert grid axes and are rotated on the native grid before
+   anything is interpolated. `grid_rotation_angle` derives the angle by finite differences of the 2D
+   longitude/latitude fields, so it carries over to any curvilinear source that publishes them; the
+   analytic Lambert alternative would need the projection parameters. In the Oslofjord region it
+   gives about -48°, matching the meridian convergence `(10.6 - (-42)) * sin(66.3°)`.
+
+   met.no's aggregated `nora3_subset_atmos` collections are **not** usable here: they lack
+   `specific_humidity_2m` and carry only *net* radiation, and net longwave cannot be inverted to
+   downwelling.
 
 6. **Forcing** (`src/Forcing/Forcing.jl` generic core, `src/Forcing/norkyst.jl` dataset adapter,
    included into the same `Forcing` module).
@@ -224,10 +288,25 @@ A river config is not a `FjordConfig` field — it goes in the forcing config's 
 does not carry is skipped with a warning, so one river dataset can serve setups that prepare
 different variables.
 
+Atmosphere — `AbstractAtmosphereConfig`, consumed by `prepare_atmosphere`:
+
+| Hook | Required |
+|---|---|
+| `atmosphere_time_steps(config)` → `Vector{AtmosphereRecord}` | yes |
+| `atmosphere_source_grid(config, filepath)` → source grid, e.g. `ProjectedAtmosphereGrid` | yes |
+| `atmosphere_variable_names(config)` → `Dict` downloaded name => prepared name | yes |
+| `download_atmosphere(target_grid, config)` | only if it downloads |
+
+The prepared variable names and units are *not* a hook — they are fixed by the read side in
+`ATMOSPHERE_VARIABLES`. A source whose download already normalizes names (as NORA3's does, since
+five of its eight variables are derived rather than copied) returns the identity mapping. The
+core's `grid_rotation_angle` and `rotate_to_east_north` are available to any adapter whose source
+gives wind relative to its own grid axes.
+
 Required fields are listed in each supertype's docstring in `src/Configs.jl`. Path resolution
-(`bathymetry_path`, `forcing_path`, `forcing_directory`, `river_forcing_path`, `plot_path`) and
-the plots come for free. A missing required hook surfaces as a `MethodError` naming it, which
-the "Config extensibility" testset asserts.
+(`bathymetry_path`, `forcing_path`, `forcing_directory`, `river_forcing_path`, `atmosphere_path`,
+`atmosphere_directory`, `plot_path`) and the plots come for free. A missing required hook surfaces
+as a `MethodError` naming it, which the "Config extensibility" testset asserts.
 
 ## Setups
 
@@ -240,7 +319,9 @@ absolute path relocates just that file — which is how a single FileGDB copy is
 A nested config carries its own `data_root` too, so it can be relocated independently, but
 `oslofjorden.jl` gives its `OF800RiversConfig` the same `_data_root` as the rest of the setup —
 the river data downloads there rather than being shared from elsewhere. `drammensfjorden.jl`
-names no `rivers`, so it defaults to `nothing` and the rivers step is a no-op.
+names no `rivers`, so it defaults to `nothing` and the rivers step is a no-op — and it names no
+`atmosphere_config` either, which defaults to `nothing` and makes both atmosphere steps no-ops the
+same way.
 
 `examples/oslofjord.jl` is the end-to-end simulation script and does *not* go through
 `FjordConfig`; it builds the grid straight from a bathymetry NetCDF and wires the components

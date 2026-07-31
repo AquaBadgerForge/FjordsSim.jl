@@ -1,6 +1,6 @@
 module Plotting
 
-export plot_bathymetry, plot_forcing
+export plot_bathymetry, plot_forcing, plot_atmosphere
 
 using CairoMakie
 using NCDatasets
@@ -9,7 +9,13 @@ using Oceananigans.Architectures: on_architecture
 using Oceananigans.Fields: interior
 using Oceananigans.Grids: x_domain, y_domain
 
-using ..Configs: AbstractBathymetryConfig, AbstractForcingConfig, forcing_path, plot_path
+using ..Configs:
+    AbstractBathymetryConfig,
+    AbstractForcingConfig,
+    AbstractAtmosphereConfig,
+    forcing_path,
+    atmosphere_path,
+    plot_path
 
 # Logical figure pixels per grid cell, and fixed margin for title/labels/colorbar. Sized from
 # the grid so every cell is rendered as a distinct, unambiguous block rather than being blurred
@@ -18,6 +24,9 @@ const BATHYMETRY_PLOT_PIXELS_PER_CELL = 6
 const BATHYMETRY_PLOT_MARGIN = (300, 150)
 const FORCING_PLOT_PIXELS_PER_CELL = 3
 const FORCING_PLOT_MARGIN = (200, 150)
+const ATMOSPHERE_PLOT_PIXELS_PER_CELL = 6
+const ATMOSPHERE_PLOT_MARGIN = (200, 200)
+const ATMOSPHERE_PLOT_COLUMNS = 4
 
 # Surface fields worth eyeballing after preparation, with the colormap suiting each.
 const FORCING_PLOT_PANELS = (
@@ -26,6 +35,18 @@ const FORCING_PLOT_PANELS = (
     (name = "u", label = "u (m s⁻¹)", colormap = :balance),
     (name = "v", label = "v (m s⁻¹)", colormap = :balance),
     (name = "T_lambda", label = "T relaxation rate (s⁻¹)", colormap = :viridis),
+)
+
+# Every variable of a prepared atmosphere file, with the colormap suiting each.
+const ATMOSPHERE_PLOT_PANELS = (
+    (name = "air_temperature_2m", label = "Air temperature (K)", colormap = :thermal),
+    (name = "specific_humidity_2m", label = "Specific humidity (kg kg⁻¹)", colormap = :viridis),
+    (name = "air_pressure_at_sea_level", label = "Sea level pressure (Pa)", colormap = :viridis),
+    (name = "precipitation", label = "Precipitation (kg m⁻² s⁻¹)", colormap = :dense),
+    (name = "u_wind_10m", label = "u wind (m s⁻¹)", colormap = :balance),
+    (name = "v_wind_10m", label = "v wind (m s⁻¹)", colormap = :balance),
+    (name = "swrad", label = "Downwelling shortwave (W m⁻²)", colormap = :solar),
+    (name = "lwrad", label = "Downwelling longwave (W m⁻²)", colormap = :solar),
 )
 
 """
@@ -186,6 +207,69 @@ function plot_forcing(grid, config::AbstractForcingConfig)
         end
 
         Label(figure[0, :], "Prepared $(dataset_label(config)) forcing, surface level at $date", fontsize = 20)
+        save(plot_file, figure)
+    end
+
+    return plot_file
+end
+
+"""
+    plot_atmosphere(config::AbstractAtmosphereConfig)
+
+Write a diagnostic plot of the prepared atmosphere file at `atmosphere_path(config)` to
+`plot_path(config)`: one panel per `ATMOSPHERE_PLOT_PANELS` entry present in the file, at the first
+time step. Returns the plot path.
+
+Unlike `plot_forcing` this takes no grid, because the prepared file carries its own `lon` and `lat`
+axes — the atmosphere grid is independent of the ocean grid.
+"""
+function plot_atmosphere(config::AbstractAtmosphereConfig)
+    atmosphere_file = atmosphere_path(config)
+    plot_file = prepare_plot_file(config)
+
+    NCDataset(atmosphere_file) do ds
+        panels = [panel for panel in ATMOSPHERE_PLOT_PANELS if haskey(ds, panel.name)]
+        isempty(panels) && error("$atmosphere_file holds none of the expected atmosphere variables")
+
+        longitude = Array(ds["lon"][:])
+        latitude = Array(ds["lat"][:])
+        columns = min(length(panels), ATMOSPHERE_PLOT_COLUMNS)
+        rows = cld(length(panels), columns)
+        figure = Figure(
+            size = (
+                columns * (length(longitude) * ATMOSPHERE_PLOT_PIXELS_PER_CELL + ATMOSPHERE_PLOT_MARGIN[1]),
+                rows * (length(latitude) * ATMOSPHERE_PLOT_PIXELS_PER_CELL + ATMOSPHERE_PLOT_MARGIN[2]),
+            ),
+        )
+        date = ds["time"][1]
+
+        for (position, panel) in enumerate(panels)
+            # Two figure rows per panel row: the heatmap and its horizontal colorbar.
+            row = 2 * cld(position, columns) - 1
+            column = mod1(position, columns)
+            data = Float32.(coalesce.(ds[panel.name][:, :, 1], NaN32))
+
+            axis = Axis(
+                figure[row, column];
+                xlabel = "Longitude",
+                ylabel = column == 1 ? "Latitude" : "",
+                title = panel.name,
+            )
+            finite = filter(isfinite, data)
+            colorrange = isempty(finite) || allequal(finite) ? (0, 1) : extrema(finite)
+            plot = heatmap!(
+                axis,
+                longitude,
+                latitude,
+                data;
+                colormap = panel.colormap,
+                colorrange,
+                nan_color = :ivory,
+            )
+            Colorbar(figure[row+1, column], plot; label = panel.label, vertical = false)
+        end
+
+        Label(figure[0, :], "Prepared $(dataset_label(config)) atmosphere at $date", fontsize = 20)
         save(plot_file, figure)
     end
 

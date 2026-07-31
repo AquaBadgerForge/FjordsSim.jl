@@ -3,6 +3,7 @@ module NORA3
 export NORA3PrescribedAtmosphere, NORA3PrescribedRadiation, MultiYearNORA3
 
 using ...Utils: compute_faces
+using ...Configs: AbstractAtmosphereConfig, atmosphere_path
 
 using Oceananigans
 using Oceananigans.Units
@@ -50,6 +51,26 @@ struct MultiYearNORA3{D}
     default_download_directory::String
     size::NTuple{2, Int}
     all_dates::Vector{D}
+end
+
+"""
+    MultiYearNORA3(config::AbstractAtmosphereConfig)
+
+The prepared atmosphere file of a setup, as a reader dataset.
+
+`default_nora3_dataset()` points at the shared `~/FjordSim_data/NORA3/NORA3.nc`, but a file
+written by `prepare_atmosphere` is specific to one setup — it is regridded onto that setup's own
+box — so a setup resolves its own through `atmosphere_path`. Pass the result to
+`NORA3PrescribedAtmosphere` or `NORA3PrescribedRadiation` as their `dataset` keyword.
+"""
+function MultiYearNORA3(config::AbstractAtmosphereConfig)
+    filepath = atmosphere_path(config)
+    isfile(filepath) || error(
+        "Prepared atmosphere $filepath does not exist. " *
+        "Run scripts/atmosphere_prepare.jl for this config first.",
+    )
+
+    return MultiYearNORA3(basename(filepath), dirname(filepath))
 end
 
 function MultiYearNORA3(metadata_filename::String, default_download_directory::String)

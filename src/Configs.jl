@@ -4,11 +4,14 @@ export AbstractGridConfig,
     AbstractBathymetryConfig,
     AbstractForcingConfig,
     AbstractRiverConfig,
+    AbstractAtmosphereConfig,
     FjordConfig,
     bathymetry_path,
     forcing_path,
     forcing_directory,
     river_forcing_path,
+    atmosphere_path,
+    atmosphere_directory,
     plot_path
 
 """
@@ -102,19 +105,59 @@ river dataset; `src/Forcing/of800_rivers.jl` is the template to copy for a new d
 abstract type AbstractRiverConfig end
 
 """
+    AbstractAtmosphereConfig
+
+Supertype for atmosphere configurations. A concrete subtype describes one atmospheric
+reanalysis dataset, how to download it and how to regrid it onto the regular longitude/latitude
+grid the simulation-time reader consumes.
+
+The prepared file is what `FjordSim.Atmospheres.NORA3.MultiYearNORA3` reads, so its layout is a
+fixed contract rather than a dataset detail: variables of shape `(longitude, latitude, time)`,
+uniformly spaced 1D `lon` and `lat` cell centers, and a CF-encoded `time`. `prepare_atmosphere`
+writes it; a subtype only supplies the dataset-specific parts.
+
+Unlike the forcing grid, the atmosphere grid is independent of the ocean grid — NumericalEarth
+interpolates between them — so it only has to cover the ocean domain with a margin.
+
+# Fields a subtype provides
+- `data_root`, `output_file`, `plot_file`: resolved by `atmosphere_path` and `plot_path`.
+- `output_directory`: resolved by `atmosphere_directory`; the directory the download writes its
+  intermediate files into. Only needed by a dataset that downloads.
+- `resolution`: target grid spacing in degrees.
+- `padding`: degrees of margin added around the ocean domain, read by
+  `atmosphere_target_axes`.
+
+# Methods a subtype provides
+- `atmosphere_time_steps(config)`: the downloaded time records, as `AtmosphereRecord`s.
+  Required.
+- `atmosphere_source_grid(config, filepath)`: geometry of the downloaded data, e.g. a
+  `ProjectedAtmosphereGrid`. Required.
+- `atmosphere_variable_names(config)`: source variable name => prepared variable name.
+  Required.
+- `download_atmosphere(target_grid, config)`: fetch the source data. Only if it downloads.
+
+`FjordSim.Atmospheres.NORA3Config` is the built-in implementation, for the MET Norway NORA3
+reanalysis; `src/Atmospheres/nora3_source.jl` is the template to copy for a new dataset.
+"""
+abstract type AbstractAtmosphereConfig end
+
+"""
     bathymetry_path(config)
     forcing_path(config)
+    atmosphere_path(config)
     plot_path(config)
 
 Resolve `config.output_file` and `config.plot_file` against `config.data_root`. Defined for
-every `AbstractBathymetryConfig` and `AbstractForcingConfig`, so a new bathymetry source or
-forcing dataset inherits path resolution. A field holding an absolute path is returned
-unchanged, relocating that file outside `data_root`.
+every `AbstractBathymetryConfig`, `AbstractForcingConfig` and `AbstractAtmosphereConfig`, so a
+new bathymetry source, forcing dataset or atmosphere dataset inherits path resolution. A field
+holding an absolute path is returned unchanged, relocating that file outside `data_root`.
 """
 bathymetry_path(config::AbstractBathymetryConfig) = joinpath(config.data_root, config.output_file)
 forcing_path(config::AbstractForcingConfig) = joinpath(config.data_root, config.output_file)
+atmosphere_path(config::AbstractAtmosphereConfig) = joinpath(config.data_root, config.output_file)
 plot_path(config::AbstractBathymetryConfig) = joinpath(config.data_root, config.plot_file)
 plot_path(config::AbstractForcingConfig) = joinpath(config.data_root, config.plot_file)
+plot_path(config::AbstractAtmosphereConfig) = joinpath(config.data_root, config.plot_file)
 
 """
     forcing_directory(config)
@@ -135,6 +178,15 @@ dataset inherits path resolution. An absolute `output_file` is returned unchange
 river_forcing_path(config::AbstractRiverConfig) = joinpath(config.data_root, config.output_file)
 
 """
+    atmosphere_directory(config)
+
+Resolve `config.output_directory` against `config.data_root`: the directory an atmosphere
+dataset downloads its intermediate files into. An absolute `output_directory` is returned
+unchanged.
+"""
+atmosphere_directory(config::AbstractAtmosphereConfig) = joinpath(config.data_root, config.output_directory)
+
+"""
     FjordConfig
 
 Complete setup configuration for one fjord, as returned by the files in `configs/`.
@@ -148,6 +200,8 @@ functions taking it are untouched. Each instantiation still has concrete field t
 - `grid_config`: any `AbstractGridConfig`.
 - `bathymetry_config`: any `AbstractBathymetryConfig`.
 - `forcing_config`: any `AbstractForcingConfig`.
+- `atmosphere_config`: any `AbstractAtmosphereConfig`, or `nothing` for a setup that prepares no
+  atmosphere. Defaults to `nothing`, so a setup opts in by naming one.
 
 # Example
 
@@ -163,10 +217,12 @@ Base.@kwdef mutable struct FjordConfig{
     G<:AbstractGridConfig,
     B<:AbstractBathymetryConfig,
     F<:AbstractForcingConfig,
+    A,
 }
     grid_config::G
     bathymetry_config::B
     forcing_config::F
+    atmosphere_config::A = nothing
 end
 
 end  # module Configs

@@ -39,4 +39,13 @@ FjordConfig(
         years                = [2020],
         rivers               = OF800RiversConfig(data_root = _data_root),
     ),
+    atmosphere_config = NORA3Config(
+        data_root        = _data_root,
+        output_directory = "nora3",
+        output_file      = "atmosphere.nc",
+        plot_file        = "atmosphere.png",
+        resolution       = 0.02,
+        padding          = 0.1,
+        years            = [2020],
+    ),
 )
