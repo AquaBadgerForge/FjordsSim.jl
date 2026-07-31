@@ -60,6 +60,14 @@ prepare_plot_file(config) = let file = plot_path(config)
 end
 
 """
+    dataset_label(config)
+
+The dataset a config names, for plot titles: its type name without the `Config` suffix, so
+`NorKystConfig` reads as "NorKyst".
+"""
+dataset_label(config) = replace(string(nameof(typeof(config))), r"Config$" => "")
+
+"""
     plot_bathymetry(grid, bottom_height, config::AbstractBathymetryConfig; title, figure_size)
 
 Write a diagnostic bathymetry plot to `plot_path(config)`: bottom height with land blanked out,
@@ -177,7 +185,7 @@ function plot_forcing(grid, config::AbstractForcingConfig)
             Colorbar(figure[2, column], plot; label = panel.label, vertical = false)
         end
 
-        Label(figure[0, :], "Prepared $(nameof(typeof(config))) forcing, surface level at $date", fontsize = 20)
+        Label(figure[0, :], "Prepared $(dataset_label(config)) forcing, surface level at $date", fontsize = 20)
         save(plot_file, figure)
     end
 

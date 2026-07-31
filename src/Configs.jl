@@ -54,6 +54,8 @@ how to download and subset it.
 - `relaxation_edge`, `relaxation_cells`, `relaxation_timescale`: read by the generic
   `water_mask` and `relaxation_lambda`.
 - `parameters`: source variable names to prepare.
+- `architecture`: `:auto`, `:cpu` or `:gpu`, resolved by `interpolation_architecture` to decide
+  where `prepare_forcing` runs its interpolation kernel.
 
 # Methods a subtype provides
 - `forcing_time_steps(config)`: the downloaded time records, as `SourceRecord`s. Required.

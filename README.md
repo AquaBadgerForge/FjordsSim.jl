@@ -74,7 +74,8 @@ fields and hooks it expects.
 
 ## Prepare input data
 
-Every script takes the setup to prepare via `--config`, which is required:
+Every script takes the setup to prepare via `--config`, which is required and is the only option
+— everything else is stated in the config:
 
 ```bash
 # Bathymetry: downloads the Geonorge Sjøkart FileGDB on first use (~2.3 GB), regrids it onto the
@@ -91,6 +92,11 @@ julia --project scripts/forcing_prepare.jl --config configs/oslofjorden.jl
 
 The scripts are thin CLI wrappers: the work is `prepare_bathymetry`, `download_forcing` and
 `prepare_forcing`, each a generic function on the matching config supertype.
+
+The forcing config's `architecture` field decides where the regridding interpolation runs:
+`:auto` (the default) uses the GPU when one is usable and the CPU otherwise, so the same config
+works on a compute node and a laptop; `:cpu` and `:gpu` pin it, and `:gpu` errors rather than
+silently falling back to a ~12x slower CPU run.
 
 ## Run an example Oslofjord simulation
 

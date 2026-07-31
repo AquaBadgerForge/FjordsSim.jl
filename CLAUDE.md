@@ -19,7 +19,8 @@ julia --project scripts/forcing_download.jl --config configs/oslofjorden.jl
 julia --project scripts/forcing_prepare.jl --config configs/oslofjorden.jl
 ```
 
-`--config` is required by every script — there is no default setup.
+`--config` is the only option any script takes, and it is required — there is no default setup.
+Every other knob, including which device the forcing interpolation runs on, is a config field.
 
 Activate the environment before running scripts interactively:
 ```julia
@@ -94,10 +95,13 @@ modules, in `include` order from `src/FjordSim.jl`:
    (`ProjectedSourceGrid`, `source_field_grid`) → relaxation lambdas along `relaxation_edge` →
    streaming NetCDF write. Only the three hooks are dataset-specific; the rest is shared.
 
-   The `architecture` keyword selects where the interpolation kernel runs (`GPU()` is ~12x faster
-   than a single-threaded `CPU()`); `target_grid` must stay on the CPU because building the masks
-   walks `peripheral_node` cell by cell. `scripts/forcing_prepare.jl` picks the GPU when
-   `CUDA.functional()` and takes `--cpu` to override.
+   Where the interpolation kernel runs is the config's `architecture` field (`:auto`, `:cpu`,
+   `:gpu`), resolved by `interpolation_architecture` — `:auto` picks the GPU when
+   `CUDA.functional()`, which is ~12x faster than a single-threaded `CPU()`, and `:gpu` errors
+   rather than silently falling back. `target_grid` must stay on the CPU regardless, because
+   building the masks walks `peripheral_node` cell by cell. A `Symbol` rather than a live
+   `CPU()`/`GPU()` keeps config field types concrete and the config files loadable on a machine
+   with no GPU.
 
    `download_forcing(config::FjordConfig)` is the generic download driver: it builds the setup's
    grid on the CPU and dispatches on the forcing config, so a dataset only implements

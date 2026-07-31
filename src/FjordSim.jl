@@ -14,6 +14,7 @@ export
     prepare_forcing,
     download_forcing,
     forcing_from_file,
+    interpolation_architecture,
     plot_bathymetry,
     plot_forcing,
     # path resolution, defined on the config supertypes

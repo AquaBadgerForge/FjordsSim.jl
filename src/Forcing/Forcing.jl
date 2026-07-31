@@ -13,6 +13,7 @@ using Dates: DateTime, Day, Millisecond, Second
 import Dates
 using Adapt
 using ArchGDAL
+using CUDA  # needed for GPU() to be usable, and for CUDA.functional()
 using NCDatasets
 
 import Oceananigans: on_architecture
@@ -24,6 +25,7 @@ using ..Configs: AbstractForcingConfig, FjordConfig, forcing_path, forcing_direc
 export forcing_from_file,
     prepare_forcing,
     download_forcing,
+    interpolation_architecture,
     forcing_time_steps,
     forcing_source_grid,
     forcing_variable_names,
@@ -253,6 +255,36 @@ const RELAXATION_EDGES = (:south, :north, :west, :east)
 const FORCING_MAX_GAP = 6
 const MILLISECONDS_PER_DAY = 86_400_000
 
+"""
+    interpolation_architecture(config)
+
+Where `prepare_forcing` runs its interpolation kernel, from `config.architecture`:
+
+- `:auto`: the GPU when one is usable, else the CPU. The default, so one setup runs unchanged on
+  a GPU machine and on a laptop.
+- `:gpu`: the GPU, erroring when none is usable rather than silently running ~12x slower.
+- `:cpu`: the CPU.
+
+Only the kernel moves; `target_grid` and the masks stay on the CPU because building them walks
+`peripheral_node` cell by cell.
+"""
+interpolation_architecture(config::AbstractForcingConfig) =
+    interpolation_architecture(Val(config.architecture))
+
+interpolation_architecture(::Val{:cpu}) = CPU()
+interpolation_architecture(::Val{:auto}) = CUDA.functional() ? GPU() : CPU()
+
+function interpolation_architecture(::Val{:gpu})
+    CUDA.functional() || error(
+        "architecture = :gpu was requested but no usable GPU was found. " *
+        "Use :auto to fall back to the CPU, or :cpu to ask for it explicitly.",
+    )
+    return GPU()
+end
+
+interpolation_architecture(::Val{selector}) where {selector} =
+    throw(ArgumentError("architecture must be one of (:auto, :cpu, :gpu), got :$selector"))
+
 # --- Extension hooks ---
 
 """
@@ -425,7 +457,7 @@ struct PreparedVariable
 end
 
 """
-    prepare_forcing(target_grid, config::AbstractForcingConfig; architecture = CPU())
+    prepare_forcing(target_grid, config::AbstractForcingConfig)
 
 Regrid the source files already downloaded into `forcing_directory(config)` onto `target_grid`,
 and write a forcing NetCDF at `forcing_path(config)` that `forcing_from_file` reads directly.
@@ -442,11 +474,12 @@ treats as land are written as `NaN`, which `forcing_from_file` reads back as the
 sentinel the forcing kernel skips. Days missing from the download are interpolated between their
 neighbours.
 
-`architecture` selects where the interpolation kernel runs and is independent of `target_grid`,
-which must stay on the CPU: building the masks walks `peripheral_node` cell by cell, which needs
-scalar access to the bathymetry. Only the target nodes, mask and output buffer are moved to
-`architecture`, and only the finished slab comes back for each write, so a GPU run keeps the same
-streaming memory profile.
+`config.architecture` selects where the interpolation kernel runs, via
+`interpolation_architecture`, and is independent of `target_grid`, which must stay on the CPU:
+building the masks walks `peripheral_node` cell by cell, which needs scalar access to the
+bathymetry. Only the target nodes, mask and output buffer are moved to the interpolation device,
+and only the finished slab comes back for each write, so a GPU run keeps the same streaming
+memory profile.
 
 Relaxation lambdas are `1 / config.relaxation_timescale` in the `config.relaxation_cells`-wide
 band along `config.relaxation_edge` and zero elsewhere, so only that band relaxes towards the
@@ -467,7 +500,8 @@ interpolating against a `RectilinearGrid` in projected meters; see `source_field
 # Returns
 A named tuple with `output_file`, `times` and `variables` (the written variable names).
 """
-function prepare_forcing(target_grid, config::AbstractForcingConfig; architecture = CPU())
+function prepare_forcing(target_grid, config::AbstractForcingConfig)
+    architecture = interpolation_architecture(config)
     variable_names = forcing_variable_names(config)
     source_names = [name for name in config.parameters if haskey(variable_names, name)]
     isempty(source_names) && error(

@@ -60,6 +60,7 @@ FjordSim.Forcing.forcing_variable_names(config::ConstantForcing) = Dict("tempera
         :prepare_bathymetry,
         :prepare_forcing,
         :download_forcing,
+        :interpolation_architecture,
         :plot_bathymetry,
         :plot_forcing,
         # extension hooks a new config subtype overloads
@@ -244,6 +245,30 @@ end
     @test forcing_config.relaxation_edge === :south
     @test forcing_config.relaxation_cells == 10
     @test forcing_config.relaxation_timescale == 86400.0
+
+    # Where the interpolation runs is a config field, not a command-line flag. `:auto` is the
+    # default so one setup runs on a GPU machine and a laptop alike; `:cpu` is honoured
+    # regardless of the hardware present, which is what makes this assertion machine-independent.
+    @test forcing_config.architecture === :auto
+    @test interpolation_architecture(
+        NorKystConfig(
+            data_root = data_root,
+            output_directory = "norkyst",
+            architecture = :cpu,
+            parameters = ["temperature"],
+            years = [2020],
+        ),
+    ) == CPU()
+    # An unknown selector is rejected up front rather than falling back to some default.
+    @test_throws ArgumentError interpolation_architecture(
+        NorKystConfig(
+            data_root = data_root,
+            output_directory = "norkyst",
+            architecture = :tpu,
+            parameters = ["temperature"],
+            years = [2020],
+        ),
+    )
 
     # ...and an absolute path relocates just that file, as for the bathymetry config.
     relocated = NorKystConfig(

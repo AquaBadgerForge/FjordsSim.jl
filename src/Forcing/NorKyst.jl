@@ -42,6 +42,8 @@ overrides `data_root` for that entry only.
   `:south`, `:north`, `:west` or `:east`.
 - `relaxation_cells`: Width of the relaxation band in grid cells.
 - `relaxation_timescale`: Relaxation timescale in seconds; the written lambda is its inverse.
+- `architecture`: Where `prepare_forcing` interpolates — `:auto`, `:cpu` or `:gpu`, resolved by
+  `interpolation_architecture`. `:auto` keeps one config usable on a GPU machine and a laptop.
 - `catalog_url`: THREDDS catalog URL listing available files.
 - `opendap_url`: OPeNDAP base URL for streaming data.
 - `parameters`: Variable names to extract (e.g. `["temperature", "salinity"]`). Required.
@@ -55,6 +57,7 @@ Base.@kwdef mutable struct NorKystConfig <: AbstractForcingConfig
     relaxation_edge::Symbol = :south
     relaxation_cells::Int = 10
     relaxation_timescale::Float64 = 86400.0
+    architecture::Symbol = :auto
     catalog_url::String = NORKYST_CATALOG_URL
     opendap_url::String = NORKYST_OPENDAP_URL
     parameters::Vector{String}
