@@ -93,7 +93,7 @@ function forcing_time_steps(config::NorKystConfig)
     directory = forcing_directory(config)
     isdir(directory) || error(
         "NorKyst directory $directory does not exist. " *
-        "Run scripts/forcing_download.jl for this config first.",
+        "Run `julia --project -m FjordSim download_forcing` for this setup first.",
     )
 
     records = SourceRecord[]

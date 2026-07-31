@@ -168,6 +168,7 @@ function river_cells(target_grid, locations, edge, radius)
 end
 
 """
+    add_rivers(config::FjordConfig)
     add_rivers(target_grid, config::AbstractForcingConfig)
 
 Write river relaxation on top of the forcing file prepared by `prepare_forcing`, into the copy
@@ -178,7 +179,36 @@ Rivers enter as relaxation, not as a mass flux: each river cell gets its value a
 inside the `|λ| < 1` regime of `ForcingFromFile`, so the river cells relax toward the river
 values while the rest of the domain keeps whatever `prepare_forcing` wrote — including the
 boundary relaxation band, which a river cell landing inside it would override.
+
+The `FjordConfig` method is the setup-level driver: it reads the grid from the processed
+bathymetry, so the river cells are snapped against the same land mask the forcing was written
+with, and downloads the river data first. The original forcing file is never modified, so the
+step can be re-run without redoing `prepare_forcing`.
 """
+function add_rivers(config::FjordConfig)
+    rivers = config.forcing_config.rivers
+    isnothing(rivers) && return nothing
+
+    bathymetry_file = bathymetry_path(config.bathymetry_config)
+    isfile(bathymetry_file) || error(
+        "Processed bathymetry $bathymetry_file does not exist. " *
+        "Run `julia --project -m FjordSim prepare_bathymetry` for this setup first.",
+    )
+
+    download_rivers(rivers)
+
+    # The grid stays on the CPU: building the land masks walks `peripheral_node` cell by cell.
+    grid = ImmersedBoundaryGrid(bathymetry_file, CPU(), config.grid_config.halo)
+    result = add_rivers(grid, config.forcing_config)
+
+    @info "Placed $(length(result.cells)) of $(length(river_locations(rivers))) rivers"
+    @info "Patched variables: $(join(result.variables, ", "))"
+    @info "Time range: $(first(result.times)) to $(last(result.times)) ($(length(result.times)) steps)"
+    @info "Forcing with rivers saved to $(result.output_file)"
+
+    return result
+end
+
 add_rivers(target_grid, config::AbstractForcingConfig) = add_rivers(target_grid, config, config.rivers)
 
 add_rivers(target_grid, config::AbstractForcingConfig, ::Nothing) = nothing
@@ -186,7 +216,8 @@ add_rivers(target_grid, config::AbstractForcingConfig, ::Nothing) = nothing
 function add_rivers(target_grid, config::AbstractForcingConfig, rivers::AbstractRiverConfig)
     forcing_file = forcing_path(config)
     isfile(forcing_file) || error(
-        "Forcing file $forcing_file does not exist. Run scripts/forcing_prepare.jl for this config first.",
+        "Forcing file $forcing_file does not exist. " *
+        "Run `julia --project -m FjordSim prepare_forcing` for this setup first.",
     )
 
     times = NCDataset(forcing_file) do ds

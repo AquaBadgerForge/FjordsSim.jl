@@ -36,28 +36,110 @@ There are several options:
 
 ## Setups (work in progress)
 
-Each fjord is described by a `FjordConfig` in a Julia file under `configs/`
-(`oslofjorden.jl`, `drammensfjorden.jl`), which groups a grid, a bathymetry, and a forcing
-configuration:
+Each fjord is a function in `src/Setups/` (`oslofjorden.jl`, `drammensfjorden.jl`) returning a
+`FjordConfig`, which groups a grid, a bathymetry, a forcing and an atmosphere configuration:
 
 ```julia
-FjordConfig(
-    grid_config       = EvenGrid(size = (150, 200, 11), longitude = (10.20, 10.45), ...),
-    bathymetry_config = DybdedataConfig(data_root = _data_root, output_file = "bathymetry.nc", ...),
-    forcing_config    = NorKystConfig(data_root = _data_root, years = [2020]),
-)
+function drammensfjorden()
+    data_root = joinpath(homedir(), "FjordSim_data", "drammensfjorden")
+
+    return FjordConfig(
+        grid_config       = EvenGrid(size = (150, 200, 11), longitude = (10.20, 10.45), ...),
+        bathymetry_config = DybdedataConfig(data_root = data_root, output_file = "bathymetry.nc", ...),
+        forcing_config    = NorKystConfig(data_root = data_root, years = [2020]),
+    )
+end
 ```
+
+`setup_names()` lists the registered setups and `fjord_config(name)` returns one by name; that is
+what `--config` resolves.
 
 By default, input data goes to `$HOME/FjordSim_data/<fjord>/` and results to
 `$HOME/FjordSim_results/<fjord>/`. The config fields naming individual files are relative to the
 setup's `data_root`; setting one to an absolute path relocates just that file, which is how a
 single copy of the Geonorge database is shared between fjords.
 
-To add a fjord, copy an existing config and adjust it.
+To add a fjord to the package, copy an existing setup file into `src/Setups/`, adjust it, and add it
+to the `SETUPS` registry in `src/Setups/Setups.jl`.
+
+### A fjord outside the package
+
+A fjord does not have to live in FjordSim. Put the `FjordConfig` in a standalone `.jl` file whose
+last expression is the config, and pass its path to `--config`:
+
+```julia
+# ~/fjords/hardangerfjorden.jl
+using FjordSim
+
+data_root = joinpath(homedir(), "FjordSim_data", "hardangerfjorden")
+
+FjordConfig(
+    grid_config = EvenGrid(
+        size      = (200, 300, 12),
+        halo      = (7, 7, 7),
+        longitude = (5.3, 6.5),
+        latitude  = (59.9, 60.5),
+        # Nz + 1 faces, bottom to top, ending at 0.0.
+        z_faces   = [
+            -800.0, -600.0, -400.0, -250.0, -150.0, -100.0,
+            -50.0, -25.0, -15.0, -10.0, -5.0, -2.0, 0.0,
+        ],
+    ),
+    bathymetry_config = DybdedataConfig(
+        data_root   = data_root,
+        output_file = "bathymetry.nc",
+        plot_file   = "bathymetry.png",
+        # Reuse the 2.3 GB Geonorge FileGDB already downloaded for another fjord instead of
+        # fetching a second copy.
+        geodatabase_file = joinpath(
+            homedir(), "FjordSim_data", "oslofjorden",
+            "Basisdata_0000_Norge_25833_Dybdedata_FGDB.gdb",
+        ),
+    ),
+    forcing_config = NorKystConfig(
+        data_root            = data_root,
+        output_directory     = "norkyst",
+        output_file          = "forcing.nc",
+        plot_file            = "forcing.png",
+        relaxation_edge      = :west,
+        relaxation_cells     = 10,
+        relaxation_timescale = 86400.0,
+        architecture         = :auto,
+        parameters           = ["temperature", "salinity", "u_eastward", "v_northward"],
+        years                = [2020],
+    ),
+)
+```
+
+```bash
+julia --project -m FjordSim prepare_bathymetry --config ~/fjords/hardangerfjorden.jl
+```
+
+or, equivalently, from the REPL:
+
+```julia
+using FjordSim
+config = fjord_config(expanduser("~/fjords/hardangerfjorden.jl"))
+prepare_bathymetry(config)
+```
+
+Three things to know:
+
+- **The `.jl` suffix decides how `--config` reads its argument.** Anything ending in `.jl` is loaded
+  as a file; anything else is looked up in the registry, so a misspelled setup name reports the
+  available setups rather than a missing file.
+- **The file's last expression must be the `FjordConfig`** — no `return`, no trailing assignment. A
+  file evaluating to anything else is rejected up front instead of failing inside a pipeline later.
+- **The file is evaluated in `Main`**, so it needs its own `using FjordSim`. `~` and relative paths
+  are expanded.
+
+Registering a fjord only buys the shorter `--config <name>`, its appearance in `--help`, and
+coverage by the tests that loop over `setup_names()`. For a one-off fjord, the standalone file is
+the better choice.
 
 To add a new kind of grid, bathymetry source, or forcing dataset, define a struct subtyping
 `AbstractGridConfig`, `AbstractBathymetryConfig`, or `AbstractForcingConfig` and overload that
-supertype's hooks — `FjordConfig`, the generic pipelines and the scripts stay unchanged. Each
+supertype's hooks — `FjordConfig`, the generic pipelines and the command line stay unchanged. Each
 pipeline is one generic function plus a handful of dispatch points:
 
 | Pipeline | Generic entry point | Hooks a new source implements |
@@ -74,24 +156,47 @@ fields and hooks it expects.
 
 ## Prepare input data
 
-Every script takes the setup to prepare via `--config`, which is required and is the only option
-— everything else is stated in the config:
+Every step takes the setup to prepare via `--config`, which is required and is the only option
+— everything else is stated in the setup:
 
 ```bash
 # Bathymetry: downloads the Geonorge Sjøkart FileGDB on first use (~2.3 GB), regrids it onto the
 # configured grid, and writes the bathymetry NetCDF plus a diagnostic plot
-julia --project scripts/bathymetry_prepare.jl --config configs/oslofjorden.jl
+julia --project -m FjordSim prepare_bathymetry --config oslofjorden
 
 # Forcing: downloads and subsets the configured dataset (NorKyst-800m) over the setup's region
 # and years
-julia --project scripts/forcing_download.jl --config configs/oslofjorden.jl
+julia --project -m FjordSim download_forcing --config oslofjorden
 
 # Forcing: regrids the download onto the simulation grid, writing the forcing NetCDF and a plot
-julia --project scripts/forcing_prepare.jl --config configs/oslofjorden.jl
+julia --project -m FjordSim prepare_forcing --config oslofjorden
+
+# Rivers: writes river relaxation into a copy of the prepared forcing
+julia --project -m FjordSim add_rivers --config oslofjorden
+
+# Atmosphere: downloads and subsets NORA3, then regrids it onto a regular lon/lat grid.
+# The download is by far the slowest step — a year is close to 10000 OPeNDAP reads — and skips
+# any month already on disk, so an interrupted run resumes.
+julia --project -m FjordSim download_atmosphere --config oslofjorden
+julia --project -m FjordSim prepare_atmosphere --config oslofjorden
+
+# All of the above, with the setups they accept
+julia --project -m FjordSim --help
 ```
 
-The scripts are thin CLI wrappers: the work is `prepare_bathymetry`, `download_forcing` and
-`prepare_forcing`, each a generic function on the matching config supertype.
+`-m` is Julia 1.12's package entry point. Each subcommand is named after the function it calls, so
+the same steps run from the REPL:
+
+```julia
+using FjordSim
+config = oslofjorden()
+prepare_bathymetry(config)
+download_forcing(config)
+prepare_forcing(config)
+```
+
+A step the setup does not configure — `add_rivers` on a setup with no rivers, the atmosphere steps
+on a setup with no atmosphere — does nothing rather than failing.
 
 The forcing config's `architecture` field decides where the regridding interpolation runs:
 `:auto` (the default) uses the GPU when one is usable and the CPU otherwise, so the same config

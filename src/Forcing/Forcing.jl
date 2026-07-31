@@ -24,9 +24,11 @@ using ..Configs:
     AbstractForcingConfig,
     AbstractRiverConfig,
     FjordConfig,
+    bathymetry_path,
     forcing_path,
     forcing_directory,
     river_forcing_path
+using ..Plotting: plot_forcing
 
 export forcing_from_file,
     prepare_forcing,
@@ -550,6 +552,39 @@ function prepare_forcing(target_grid, config::AbstractForcingConfig)
     @info "Finished preparing forcing"
 
     return (; output_file, times = [step.date for step in steps], variables = [variable.name for variable in variables])
+end
+
+"""
+    prepare_forcing(config::FjordConfig)
+
+Regrid the forcing a whole setup names onto its simulation grid, and write the diagnostic plot.
+
+This is the setup-level driver, the same shape as `download_forcing(config::FjordConfig)`. The
+grid comes from the processed bathymetry rather than the grid config, so the output's land mask
+matches the model exactly, which means `prepare_bathymetry` must have run first. It stays on the
+CPU regardless of `config.forcing_config.architecture` — that field selects where the
+interpolation kernel runs, and building the masks needs scalar access to the bathymetry.
+
+# Returns
+The `prepare_forcing(target_grid, config)` named tuple with `plot_file` added.
+"""
+function prepare_forcing(config::FjordConfig)
+    bathymetry_file = bathymetry_path(config.bathymetry_config)
+    isfile(bathymetry_file) || error(
+        "Processed bathymetry $bathymetry_file does not exist. " *
+        "Run `julia --project -m FjordSim prepare_bathymetry` for this setup first.",
+    )
+
+    grid = ImmersedBoundaryGrid(bathymetry_file, CPU(), config.grid_config.halo)
+    result = prepare_forcing(grid, config.forcing_config)
+    plot_file = plot_forcing(grid, config.forcing_config)
+
+    @info "Prepared variables: $(join(result.variables, ", "))"
+    @info "Time range: $(first(result.times)) to $(last(result.times)) ($(length(result.times)) steps)"
+    @info "Forcing file saved to $(result.output_file)"
+    @info "Forcing plot saved to $plot_file"
+
+    return (; result..., plot_file)
 end
 
 """

@@ -189,7 +189,8 @@ atmosphere_directory(config::AbstractAtmosphereConfig) = joinpath(config.data_ro
 """
     FjordConfig
 
-Complete setup configuration for one fjord, as returned by the files in `configs/`.
+Complete setup configuration for one fjord, as returned by the setup functions in
+`FjordSim.Setups`.
 
 The fields are parametric over the abstract config supertypes rather than fixed to the
 built-in types, so a new grid, bathymetry source or forcing dataset only needs a struct

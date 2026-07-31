@@ -50,6 +50,11 @@ export
     ProjectedAtmosphereGrid,
     RiverLocation,
     AtmosphereRecord,
+    # setups
+    fjord_config,
+    setup_names,
+    oslofjorden,
+    drammensfjorden,
     # built-in sources
     EvenGrid,
     DybdedataConfig,
@@ -103,22 +108,30 @@ end
 include("Configs.jl")
 include("Datasets.jl")
 include("Utils.jl")
+# Plotting comes before the pipelines that call it: their setup-level drivers plot as their last
+# step, and Plotting itself only needs Configs.
+include("Plotting.jl")
 include("Bathymetry/Bathymetry.jl")
 include("Atmospheres/Atmospheres.jl")
 include("Forcing/Forcing.jl")
 include("BoundaryConditions.jl")
 include("Grids.jl")
-include("Plotting.jl")
+# Setups builds every config type, so it comes after all of them — Grids' EvenGrid included.
+include("Setups/Setups.jl")
+# CLI names every driver and every setup, so it comes last.
+include("CLI.jl")
 
 using .Configs
 using .Datasets
 using .Utils
+using .Plotting
 using .Bathymetry
 using .Atmospheres
 using .Forcing
 using .BoundaryConditions
 using .Grids
-using .Plotting
+using .Setups
+using .CLI
 
 function coupled_hydrostatic_simulation(
     grid,
@@ -164,5 +177,23 @@ function coupled_hydrostatic_simulation(
     coupled_simulation = Simulation(coupled_model; Δt, stop_time)
     return coupled_simulation
 end  # function coupled_hydrostatic_simulation
+
+"""
+    main(args)
+
+Entry point for `julia --project -m FjordSim SUBCOMMAND --config SETUP`. Returns a process exit
+code; see `FjordSim.CLI.USAGE` for the subcommands.
+
+Deliberately *not* exported. Julia's startup runs `Main.main` after a script's body whenever that
+binding resolves to an entry point, so exporting this would make every `using FjordSim` in a
+script — `test/runtests.jl`, `examples/oslofjord.jl` — run the CLI on the way out.
+"""
+function main(args)
+    return CLI.main(args)
+end
+
+# Bare `@main`, applied after the definition: `@main function main(args) ... end` expands to a
+# *call*, which would run the CLI while the package precompiles.
+@main
 
 end  # module

@@ -12,10 +12,13 @@ using Oceananigans
 using Oceananigans.Architectures: on_architecture
 using Oceananigans.Fields: interior
 using Oceananigans.Grids: x_domain, y_domain, znodes
+using Printf: @printf
+using Statistics: mean
 
 using NumericalEarth.DataWrangling: Metadatum, metadata_path
 
-using ..Configs: AbstractBathymetryConfig, bathymetry_path
+using ..Configs: AbstractBathymetryConfig, FjordConfig, bathymetry_path
+using ..Plotting: plot_bathymetry
 
 # Matches the fixed loop count and neighbor threshold used in the Oslofjord notebook's
 # post-regrid gap-filling pass.
@@ -80,6 +83,55 @@ function prepare_bathymetry(target_grid, config::AbstractBathymetryConfig; regri
     @info "Finished preparing bathymetry"
 
     return (; dataset, raw_file = metadata_path(metadata), output_file, bottom_height)
+end
+
+"""
+    prepare_bathymetry(config::FjordConfig)
+
+Prepare the bathymetry a whole setup names: build its grid, regrid the source onto it, write the
+processed NetCDF and the diagnostic plot.
+
+This is the setup-level driver, the same shape as `download_forcing(config::FjordConfig)`. The
+grid is built on the CPU because that is what the rest of the preparation pipeline reads, and
+`bathymetry_path`'s directory is created here since this is the first step of a setup and nothing
+has written into `data_root` yet.
+
+# Returns
+The `prepare_bathymetry(target_grid, config)` named tuple with `plot_file` added.
+"""
+function prepare_bathymetry(config::FjordConfig)
+    grid = LatitudeLongitudeGrid(CPU(), config.grid_config)
+    mkpath(dirname(bathymetry_path(config.bathymetry_config)))
+    print_grid_extents(grid)
+
+    result = prepare_bathymetry(grid, config.bathymetry_config)
+    plot_file = plot_bathymetry(grid, result.bottom_height, config.bathymetry_config)
+
+    @info "Raw bathymetry saved to $(result.raw_file)"
+    @info "Processed FjordSim bathymetry saved to $(result.output_file)"
+    @info "Bathymetry plot saved to $plot_file"
+
+    return (; result..., plot_file)
+end
+
+"""
+    print_grid_extents(grid)
+
+Print the cell side lengths of `grid` in meters. The grid config states its extent in degrees, so
+this is the only place the resulting resolution becomes visible before a long regrid starts.
+"""
+function print_grid_extents(grid)
+    dx = xspacings(grid)
+    dy = yspacings(grid)
+    dz = zspacings(grid)
+
+    println("Grid cell side extents (m):")
+    @printf("  N = (%d, %d, %d)\n", grid.Nx, grid.Ny, grid.Nz)
+    @printf("  Δx min/max/mean = %.3f / %.3f / %.3f\n", minimum(dx), maximum(dx), mean(dx))
+    @printf("  Δy min/max/mean = %.3f / %.3f / %.3f\n", minimum(dy), maximum(dy), mean(dy))
+    @printf("  Δz min/max/mean = %.3f / %.3f / %.3f\n", minimum(dz), maximum(dz), mean(dz))
+
+    return nothing
 end
 
 """

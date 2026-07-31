@@ -1,0 +1,60 @@
+"""
+    oslofjorden()
+
+The Oslofjord setup: Geonorge Sjøkart Dybdedata bathymetry, NorKyst-800m forcing with OF800
+rivers, and NORA3 atmosphere, on a 240 x 520 x 18 grid covering 10.2-11.02°E, 59.0-59.93°N.
+
+The river config gets the same `data_root` as the rest of the setup, so the river data downloads
+alongside it rather than being shared from elsewhere.
+"""
+function oslofjorden()
+    data_root = joinpath(homedir(), "FjordSim_data", "oslofjorden")
+
+    return FjordConfig(
+        grid_config = EvenGrid(
+            size      = (240, 520, 18),
+            halo      = (7, 7, 7),
+            longitude = (10.2, 11.02),
+            latitude  = (59.0, 59.93),
+            z_faces   = [
+                -450.0, -400.0, -350.0, -300.0, -250.0, -200.0, -150.0, -100.0,
+                -75.0, -50.0, -25.0, -15.0, -10.0, -7.5, -5.0, -3.0, -2.0, -1.0, 0.0,
+            ],
+        ),
+        bathymetry_config = DybdedataConfig(
+            data_root             = data_root,
+            output_file           = "bathymetry.nc",
+            plot_file             = "bathymetry.png",
+            raw_resolution_factor = 2,
+            padding_cells         = 2,
+            include_contours      = false,
+            contour_stride        = 10,
+            interpolation_passes  = 1,
+            major_basins          = 1,
+            geonorge_cache        = true,
+            regrid_cache          = false,
+        ),
+        forcing_config = NorKystConfig(
+            data_root            = data_root,
+            output_directory     = "norkyst",
+            output_file          = "forcing.nc",
+            plot_file            = "forcing.png",
+            relaxation_edge      = :south,
+            relaxation_cells     = 10,
+            relaxation_timescale = 86400.0,
+            architecture         = :auto,
+            parameters           = ["temperature", "salinity", "u_eastward", "v_northward"],
+            years                = [2020],
+            rivers               = OF800RiversConfig(data_root = data_root),
+        ),
+        atmosphere_config = NORA3Config(
+            data_root        = data_root,
+            output_directory = "nora3",
+            output_file      = "atmosphere.nc",
+            plot_file        = "atmosphere.png",
+            resolution       = 0.02,
+            padding          = 0.1,
+            years            = [2020],
+        ),
+    )
+end

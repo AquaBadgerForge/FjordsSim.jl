@@ -10,30 +10,46 @@ julia --project test/runtests.jl
 julia --project examples/oslofjord.jl
 
 # Prepare bathymetry for a configured fjord (downloads the Geonorge GDB on first use)
-julia --project scripts/bathymetry_prepare.jl --config configs/drammensfjorden.jl
+julia --project -m FjordSim prepare_bathymetry --config drammensfjorden
 
 # Download and subset the configured forcing dataset for a fjord
-julia --project scripts/forcing_download.jl --config configs/oslofjorden.jl
+julia --project -m FjordSim download_forcing --config oslofjorden
 
 # Regrid the downloaded forcing onto the fjord's grid (needs the bathymetry and download first)
-julia --project scripts/forcing_prepare.jl --config configs/oslofjorden.jl
+julia --project -m FjordSim prepare_forcing --config oslofjorden
 
-# Write river relaxation on top of the prepared forcing (needs forcing_prepare first)
-julia --project scripts/forcing_add_rivers.jl --config configs/oslofjorden.jl
+# Write river relaxation on top of the prepared forcing (needs prepare_forcing first)
+julia --project -m FjordSim add_rivers --config oslofjorden
 
 # Download and subset the configured atmosphere dataset (slow: ~10000 OPeNDAP reads per year)
-julia --project scripts/atmosphere_download.jl --config configs/oslofjorden.jl
+julia --project -m FjordSim download_atmosphere --config oslofjorden
 
 # Regrid the downloaded atmosphere onto a regular lon/lat grid (needs the download first)
-julia --project scripts/atmosphere_prepare.jl --config configs/oslofjorden.jl
+julia --project -m FjordSim prepare_atmosphere --config oslofjorden
+
+# The subcommands and the setups they accept
+julia --project -m FjordSim --help
 ```
 
-`--config` is the only option any script takes, and it is required — there is no default setup.
-Every other knob, including which device the forcing interpolation runs on, is a config field.
+`--config` is the only option, and it is required — there is no default setup. It takes a
+registered setup name (`FjordSim.Setups.SETUPS`) or a path to an out-of-tree `.jl` config file
+whose last expression is a `FjordConfig`. Every other knob, including which device the forcing
+interpolation runs on, is a config field.
 
-Activate the environment before running scripts interactively:
+`-m` is Julia 1.12's package entry point, which is why `Project.toml` has `[compat] julia = "1.12"`.
+The equivalent without `-m` is
+`julia --project -e 'using FjordSim; FjordSim.main(ARGS)' -- prepare_forcing --config oslofjorden`.
+
+Each subcommand is a `FjordConfig` method on the generic function of the same name, so the same
+steps run from the REPL, which is also how to debug one:
 ```julia
 using Pkg; Pkg.activate(".")
+using FjordSim
+config = oslofjorden()
+prepare_bathymetry(config)
+
+using Debugger        # step through a step
+@enter prepare_forcing(config)
 ```
 
 ## Architecture
@@ -65,7 +81,14 @@ modules, in `include` order from `src/FjordSim.jl`:
    named tuples, `cell_advection_timescale_coupled_model` for the time-step wizard, plus
    `compute_faces` and NetCDF/JLD2 helpers.
 
-4. **Bathymetry** (`src/Bathymetry/Bathymetry.jl` generic core, `src/Bathymetry/geonorge.jl`
+4. **Plotting** (`src/Plotting.jl`) — `plot_bathymetry(grid, bottom_height, config)`,
+   `plot_forcing(grid, config)` and `plot_atmosphere(config)`, all dispatching on the config
+   *supertypes* so a new source inherits them, writing to `plot_path(config)`. Shares
+   `default_figure_size` and `plot_axes`. It is included *before* the pipelines rather than after
+   them because each pipeline's setup-level driver plots as its last step, and `Plotting` itself
+   only needs `Configs`, so there is no cycle.
+
+5. **Bathymetry** (`src/Bathymetry/Bathymetry.jl` generic core, `src/Bathymetry/geonorge.jl`
    source adapter, included into the same `Bathymetry` module).
    `prepare_bathymetry(target_grid, config::AbstractBathymetryConfig)` is the generic pipeline:
    `bathymetry_dataset(target_grid, config)` (the one source-specific step) →
@@ -82,7 +105,7 @@ modules, in `include` order from `src/FjordSim.jl`:
    and wrapped by `GeonorgeBathymetry <: AbstractStaticBathymetry`, which implements the
    NumericalEarth dataset interface.
 
-5. **Atmosphere** (`src/Atmospheres/Atmospheres.jl` generic core, `src/Atmospheres/nora3_source.jl`
+6. **Atmosphere** (`src/Atmospheres/Atmospheres.jl` generic core, `src/Atmospheres/nora3_source.jl`
    dataset adapter included flat into the same module, `src/Atmospheres/NORA3.jl` a nested
    `module NORA3` holding the read side).
 
@@ -144,7 +167,7 @@ modules, in `include` order from `src/FjordSim.jl`:
    `specific_humidity_2m` and carry only *net* radiation, and net longwave cannot be inverted to
    downwelling.
 
-6. **Forcing** (`src/Forcing/Forcing.jl` generic core, `src/Forcing/norkyst.jl` dataset adapter,
+7. **Forcing** (`src/Forcing/Forcing.jl` generic core, `src/Forcing/norkyst.jl` dataset adapter,
    included into the same `Forcing` module).
 
    The read side loads river/relaxation forcing from NetCDF via `forcing_from_file`. The
@@ -175,7 +198,10 @@ modules, in `include` order from `src/FjordSim.jl`:
 
    `download_forcing(config::FjordConfig)` is the generic download driver: it builds the setup's
    grid on the CPU and dispatches on the forcing config, so a dataset only implements
-   `download_forcing(target_grid, config)`. `scripts/forcing_download.jl` is a thin CLI over it.
+   `download_forcing(target_grid, config)`. `prepare_forcing(config::FjordConfig)` and
+   `add_rivers(config::FjordConfig)` are the matching setup-level drivers for the other two steps;
+   both take the grid from the processed bathymetry so the land mask matches the model, which is
+   why they require `prepare_bathymetry` to have run.
 
    `norkyst.jl` holds `NorKystConfig <: AbstractForcingConfig` (THREDDS endpoints, variables,
    years, output names, relaxation zone), `forcing_monthly_filename`, the three hook methods, and
@@ -224,25 +250,47 @@ modules, in `include` order from `src/FjordSim.jl`:
    `validate_river_download` rejects and deletes a downloaded file that starts with `<` instead
    of letting an HTML page masquerade as the data.
 
-7. **Boundary conditions** (`src/BoundaryConditions.jl`) — `top_bottom_boundary_conditions` creates
+8. **Boundary conditions** (`src/BoundaryConditions.jl`) — `top_bottom_boundary_conditions` creates
    wind/heat/salt flux fields at the top and quadratic bottom drag, returning a named tuple
    `(u, v, T, S)`.
 
-8. **Grids** (`src/Grids.jl`) — `EvenGrid <: AbstractGridConfig` (size, halo, longitude, latitude,
+9. **Grids** (`src/Grids.jl`) — `EvenGrid <: AbstractGridConfig` (size, halo, longitude, latitude,
    `z_faces`) with `LatitudeLongitudeGrid(architecture, config::EvenGrid)`, and a constructor
    `ImmersedBoundaryGrid(filepath, architecture, halo)` that reads the processed bathymetry NetCDF and
    returns an `ImmersedBoundaryGrid` wrapping a `LatitudeLongitudeGrid` with `PartialCellBottom`.
    The loader still accepts legacy files with positive depths or swapped `lon`/`lat` axes.
 
-9. **Plotting** (`src/Plotting.jl`) — `plot_bathymetry(grid, bottom_height, config)` and
-   `plot_forcing(grid, config)`, both dispatching on the config *supertypes* so a new source
-   inherits them, writing to `plot_path(config)`. Shares `default_figure_size` and `plot_axes`.
+10. **Setups** (`src/Setups/Setups.jl` registry, one lowercase file per fjord beside it) — the
+    built-in fjords, each a zero-arg function returning a fresh `FjordConfig`: `oslofjorden()`,
+    `drammensfjorden()`. `SETUPS` maps a name to its function, `setup_names()` lists them sorted,
+    and `fjord_config(name_or_path)` resolves either a registered name or a path to an out-of-tree
+    `.jl` config file (evaluated in `Main`). Included after `Grids` because it constructs every
+    config type, `EvenGrid` included.
 
-10. **Top-level** (`src/FjordSim.jl`) — re-exports the public API and defines
+    A setup is a *function*, not a `const`, for two reasons that both fail silently otherwise:
+    `DybdedataConfig`'s `raw_directory` defaults to the scratch path `Bathymetry.__init__` fills
+    in, which is still `""` during precompilation; and the config structs are mutable and
+    `native_region!` edits the bathymetry config, so a shared instance would leak state between
+    steps.
+
+11. **CLI** (`src/CLI.jl`) — `SUBCOMMANDS` maps each subcommand to the driver it calls, one `USAGE`
+    string, a pure `parse_arguments` returning `(; subcommand, config, help)` and throwing
+    `ArgumentError`, and `main(args)` returning a process exit code. Included last, since it names
+    every driver and every setup. `parse_arguments` deliberately does not `exit`: printing and exit
+    codes live in `main`, which keeps the help path testable.
+
+12. **Top-level** (`src/FjordSim.jl`) — re-exports the public API, defines
     `coupled_hydrostatic_simulation`, which assembles a `HydrostaticFreeSurfaceModel` inside an
-    `OceanSeaIceModel` (NumericalEarth) and returns a `Simulation`. Also patches
-    `compute_bounding_indices` from NumericalEarth to prevent off-by-one errors with custom
-    longitude/latitude grids.
+    `OceanSeaIceModel` (NumericalEarth) and returns a `Simulation`, and defines `main` plus a bare
+    `@main` for `julia -m FjordSim`. Also patches `compute_bounding_indices` from NumericalEarth to
+    prevent off-by-one errors with custom longitude/latitude grids.
+
+    Two non-obvious things about the entry point. `main` is **not exported**: Julia's startup runs
+    `Main.main` after a script's body whenever that binding resolves to an entry point, so
+    exporting it would make every `using FjordSim` in a script — `test/runtests.jl`,
+    `examples/oslofjord.jl` — run the CLI on the way out. And the `@main` is bare, *after* the
+    definition: `@main function main(args) ... end` expands to a **call**, which would run the CLI
+    while the package precompiles.
 
 ## Adding a new source
 
@@ -310,18 +358,31 @@ as a `MethodError` naming it, which the "Config extensibility" testset asserts.
 
 ## Setups
 
-`configs/` holds one Julia file per fjord (`oslofjorden.jl`, `drammensfjorden.jl`). Each file is a
-script whose last expression is a `FjordConfig`, so scripts load it with
-`config = include(abspath(path))`. Data paths are built from a per-setup `data_root` under
-`~/FjordSim_data/<fjord>/`; the config fields naming files (`output_file`, `plot_file`,
+`src/Setups/` holds one lowercase file per fjord (`oslofjorden.jl`, `drammensfjorden.jl`), each
+defining a zero-arg function that returns a fresh `FjordConfig`, plus `Setups.jl` with the `SETUPS`
+registry. Adding a fjord is a **two-place** edit: the new file, and its entry in `SETUPS` — the
+registry is keyed by a runtime string from `--config`, so there is no dispatch alternative. A fjord
+that should not live in the package can instead be a standalone `.jl` file whose last expression is
+a `FjordConfig`, passed as `--config path/to/it.jl` and loaded by `fjord_config`.
+
+Data paths are built from a per-setup `data_root` under `~/FjordSim_data/<fjord>/`, computed inside
+the setup function with `homedir()`; the config fields naming files (`output_file`, `plot_file`,
 `geodatabase_file`, `output_directory`) are names relative to `data_root`, and setting one to an
 absolute path relocates just that file — which is how a single FileGDB copy is shared across fjords.
 A nested config carries its own `data_root` too, so it can be relocated independently, but
-`oslofjorden.jl` gives its `OF800RiversConfig` the same `_data_root` as the rest of the setup —
-the river data downloads there rather than being shared from elsewhere. `drammensfjorden.jl`
+`oslofjorden()` gives its `OF800RiversConfig` the same `data_root` as the rest of the setup —
+the river data downloads there rather than being shared from elsewhere. `drammensfjorden()`
 names no `rivers`, so it defaults to `nothing` and the rivers step is a no-op — and it names no
 `atmosphere_config` either, which defaults to `nothing` and makes both atmosphere steps no-ops the
 same way.
+
+Each preparation step is a `FjordConfig` method on the generic function of the same name —
+`prepare_bathymetry`, `download_forcing`, `prepare_forcing`, `add_rivers`, `download_atmosphere`,
+`prepare_atmosphere` — living beside the pipeline it drives. Each builds the grid, checks the step
+before it has run, calls the generic pipeline, plots, and logs where the output went. A step the
+setup opts out of returns `nothing` rather than raising, matching the `::Nothing` methods of the
+lower arities; "you asked for a step this setup does not configure" is reported by `CLI.main`,
+because that is user input rather than a pipeline condition.
 
 `examples/oslofjord.jl` is the end-to-end simulation script and does *not* go through
 `FjordConfig`; it builds the grid straight from a bathymetry NetCDF and wires the components

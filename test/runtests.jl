@@ -134,6 +134,10 @@ FjordSim.Forcing.forcing_variable_names(config::ConstantForcing) = Dict("tempera
         :ProjectedAtmosphereGrid,
         :AtmosphereRecord,
         :NORA3Config,
+        :fjord_config,
+        :setup_names,
+        :oslofjorden,
+        :drammensfjorden,
     ]
 
     for sym in exported_symbols
@@ -150,6 +154,9 @@ FjordSim.Forcing.forcing_variable_names(config::ConstantForcing) = Dict("tempera
         (:Datasets, :ForcingDataset),
         (:Datasets, :ResultsDataset),
         (:Datasets, :last_date),
+        (:Setups, :fjord_config),
+        (:Setups, :setup_names),
+        (:CLI, :parse_arguments),
     ]
 
     for (module_name, sym) in submodule_exports
@@ -158,6 +165,8 @@ FjordSim.Forcing.forcing_variable_names(config::ConstantForcing) = Dict("tempera
     end
 
     @test isdefined(FjordSim, :Bathymetry)
+    @test isdefined(FjordSim, :Setups)
+    @test isdefined(FjordSim, :CLI)
 end
 
 @testset "Backward Compatibility — Function Signatures" begin
@@ -403,6 +412,178 @@ end
     @test config.bathymetry_config.padding_cells == 0
     @test config.forcing_config.years == [2020, 2021]
     @test config.atmosphere_config.years == [2020, 2021]
+end
+
+@testset "Setup registry" begin
+    @test setup_names() == ["drammensfjorden", "oslofjorden"]  # sorted: Dict order is unspecified
+    @test sort(collect(keys(FjordSim.Setups.SETUPS))) == setup_names()
+
+    # A misspelled name must say which setups exist, not fall through to the file branch.
+    @test_throws ArgumentError fjord_config("nordfjorden")
+    message = try
+        fjord_config("nordfjorden")
+    catch exception
+        exception.msg
+    end
+    @test all(occursin(name, message) for name in setup_names())
+
+    # A path that looks like a config file but is not there fails as a file, not as a bad name.
+    @test_throws ArgumentError fjord_config(joinpath(tempdir(), "no_such_setup.jl"))
+
+    # An out-of-tree config file is loaded by path, so a fjord need not live in the package.
+    mktempdir() do tmp
+        external = joinpath(tmp, "hardangerfjorden.jl")
+        write(
+            external,
+            """
+            using FjordSim
+            FjordConfig(
+                grid_config = EvenGrid(
+                    size = (8, 8, 2), halo = (3, 3, 3),
+                    longitude = (5.5, 5.6), latitude = (60.0, 60.1),
+                    z_faces = [-20.0, -10.0, 0.0],
+                ),
+                bathymetry_config = DybdedataConfig(
+                    data_root = $(repr(tmp)), output_file = "b.nc", plot_file = "b.png",
+                ),
+                forcing_config = NorKystConfig(
+                    data_root = $(repr(tmp)), output_directory = "norkyst",
+                    output_file = "f.nc", plot_file = "f.png",
+                    parameters = ["temperature"], years = [2020],
+                ),
+            )
+            """,
+        )
+
+        external_config = fjord_config(external)
+        @test external_config isa FjordConfig
+        @test external_config.grid_config.size == (8, 8, 2)
+        @test bathymetry_path(external_config.bathymetry_config) == joinpath(tmp, "b.nc")
+        @test isnothing(external_config.atmosphere_config)  # defaults apply to a file config too
+
+        # A file whose last expression is not a FjordConfig has to say so, rather than failing
+        # later inside a pipeline with an unrelated error.
+        not_a_config = joinpath(tmp, "not_a_config.jl")
+        write(not_a_config, "42\n")
+        @test_throws ArgumentError fjord_config(not_a_config)
+    end
+
+    for name in setup_names()
+        config = fjord_config(name)
+        data_root = joinpath(homedir(), "FjordSim_data", name)
+
+        @test config isa FjordConfig
+        @test isconcretetype(typeof(config))  # every instantiation stays concretely typed
+        @test config.bathymetry_config.data_root == data_root
+        @test config.forcing_config.data_root == data_root
+        @test bathymetry_path(config.bathymetry_config) == joinpath(data_root, "bathymetry.nc")
+        @test forcing_path(config.forcing_config) == joinpath(data_root, "forcing.nc")
+        @test startswith(forcing_directory(config.forcing_config), data_root)
+
+        # Built inside the function, so the scratch path `__init__` fills in is already there. A
+        # config built at precompile time would carry an empty `raw_directory` instead.
+        @test isdir(config.bathymetry_config.raw_directory)
+
+        grid_config = config.grid_config
+        @test length(grid_config.z_faces) == grid_config.size[3] + 1
+        @test issorted(grid_config.z_faces)  # bottom to top, as ImmersedBoundaryGrid expects
+        @test last(grid_config.z_faces) == 0.0
+        @test grid_config.longitude[1] < grid_config.longitude[2]
+        @test grid_config.latitude[1] < grid_config.latitude[2]
+    end
+
+    # Each call returns a fresh config: the structs are mutable and `native_region!` edits the
+    # bathymetry config, so a cached `const` instance would leak state between steps.
+    first_call = oslofjorden()
+    second_call = oslofjorden()
+    @test first_call !== second_call
+    @test first_call.bathymetry_config !== second_call.bathymetry_config
+    first_call.grid_config.size = (1, 1, 1)
+    @test second_call.grid_config.size != (1, 1, 1)
+
+    oslo = oslofjorden()
+    @test oslo.forcing_config.rivers isa OF800RiversConfig
+    @test oslo.atmosphere_config isa NORA3Config
+    # The river data downloads under the setup's own root rather than being shared from elsewhere.
+    @test oslo.forcing_config.rivers.data_root == oslo.forcing_config.data_root
+    @test atmosphere_path(oslo.atmosphere_config) ==
+          joinpath(oslo.atmosphere_config.data_root, "atmosphere.nc")
+
+    drammen = drammensfjorden()
+    @test isnothing(drammen.forcing_config.rivers)     # so add_rivers is a no-op for it
+    @test isnothing(drammen.atmosphere_config)         # ...and so are both atmosphere steps
+end
+
+@testset "CLI" begin
+    parse_arguments = FjordSim.CLI.parse_arguments
+
+    # `--config VALUE` and `--config=VALUE` are the same, in either order around the subcommand.
+    @test parse_arguments(["prepare_forcing", "--config", "oslofjorden"]) ==
+          (subcommand = "prepare_forcing", config = "oslofjorden", help = false)
+    @test parse_arguments(["prepare_forcing", "--config=oslofjorden"]) ==
+          parse_arguments(["prepare_forcing", "--config", "oslofjorden"])
+    @test parse_arguments(["--config", "oslofjorden", "prepare_forcing"]) ==
+          parse_arguments(["prepare_forcing", "--config", "oslofjorden"])
+
+    @test_throws ArgumentError parse_arguments(String[])                              # no subcommand
+    @test_throws ArgumentError parse_arguments(["prepare_forcing"])                   # no --config
+    @test_throws ArgumentError parse_arguments(["prepare_forcing", "--config"])       # no value
+    @test_throws ArgumentError parse_arguments(["prepare_forcing", "--config="])      # empty value
+    @test_throws ArgumentError parse_arguments(["prepare_forcing", "--gpu", "--config", "oslofjorden"])
+    @test_throws ArgumentError parse_arguments(["prepare_forcing", "add_rivers", "--config", "oslofjorden"])
+    @test_throws ArgumentError FjordSim.CLI.subcommand_driver("frobnicate")
+
+    # `--help` returns a sentinel instead of exiting, which is what makes it testable at all.
+    @test parse_arguments(["-h"]).help
+    @test parse_arguments(["--help"]).help
+    @test parse_arguments(["prepare_forcing", "--config", "oslofjorden", "--help"]).help
+
+    subcommands = FjordSim.CLI.subcommand_names()
+    @test subcommands == [
+        "prepare_bathymetry",
+        "download_forcing",
+        "prepare_forcing",
+        "add_rivers",
+        "download_atmosphere",
+        "prepare_atmosphere",
+    ]
+    for name in subcommands
+        @test occursin(name, FjordSim.CLI.USAGE)  # the usage text cannot drift from the table
+    end
+    for name in setup_names()
+        @test occursin(name, FjordSim.CLI.USAGE)
+    end
+
+    # Every subcommand resolves to a driver that takes a whole setup. This is the assertion that
+    # catches a driver method that was never defined, without running any of them.
+    config = drammensfjorden()
+    for name in subcommands
+        @test hasmethod(FjordSim.CLI.subcommand_driver(name), Tuple{typeof(config)})
+    end
+
+    @test isdefined(FjordSim, :main)
+    @test hasmethod(FjordSim.main, Tuple{Vector{String}})
+    # Exporting `main` would make Julia run the CLI after the body of any script that says
+    # `using FjordSim` — including this test file.
+    @test !(:main in names(FjordSim))
+    @test FjordSim.main(["--help"]) === 0            # must be an exit code, not a driver's result
+    @test FjordSim.main(["frobnicate", "--config", "oslofjorden"]) == 2
+    @test FjordSim.main(["prepare_forcing", "--config", "nordfjorden"]) == 2
+    @test FjordSim.main(String[]) == 2
+
+    # A step the setup opts out of is a no-op through the FjordConfig arity too, matching
+    # `add_rivers(grid, config, ::Nothing)` and `prepare_atmosphere(grid, ::Nothing)`. Rooted in a
+    # temporary directory so nothing can touch the real ~/FjordSim_data.
+    mktempdir() do tmp
+        config = drammensfjorden()
+        config.bathymetry_config.data_root = tmp
+        config.forcing_config.data_root = tmp
+
+        @test isnothing(add_rivers(config))
+        @test isnothing(prepare_atmosphere(config))
+        @test isnothing(download_atmosphere(config))
+        @test FjordSim.main(["add_rivers", "--config", joinpath(tmp, "unused.jl")]) == 2
+    end
 end
 
 @testset "OF800 rivers config" begin

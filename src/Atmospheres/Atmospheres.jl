@@ -24,6 +24,7 @@ using ..Configs:
     FjordConfig,
     atmosphere_path,
     atmosphere_directory
+using ..Plotting: plot_atmosphere
 
 include("NORA3.jl")
 
@@ -412,6 +413,42 @@ function prepare_atmosphere(target_grid, config::AbstractAtmosphereConfig)
 end
 
 prepare_atmosphere(target_grid, ::Nothing) = nothing
+
+"""
+    prepare_atmosphere(config::FjordConfig)
+
+Regrid the atmosphere a whole setup names onto a regular longitude/latitude grid, and write the
+diagnostic plot. Returns `nothing` when the setup names no atmosphere.
+
+This is the setup-level driver, the same shape as `download_atmosphere(config::FjordConfig)`. It
+needs no bathymetry: the prepared grid is derived from the setup's longitude/latitude domain
+rather than from the ocean grid's land mask, so unlike `prepare_forcing` it does not depend on
+`prepare_bathymetry`. It does read the files `download_atmosphere` wrote.
+
+# Returns
+The `prepare_atmosphere(target_grid, config)` named tuple with `plot_file` added.
+"""
+function prepare_atmosphere(config::FjordConfig)
+    atmosphere_config = config.atmosphere_config
+    isnothing(atmosphere_config) && return nothing
+
+    source_directory = atmosphere_directory(atmosphere_config)
+    isdir(source_directory) || error(
+        "Atmosphere source directory $source_directory does not exist. " *
+        "Run `julia --project -m FjordSim download_atmosphere` for this setup first.",
+    )
+
+    grid = LatitudeLongitudeGrid(CPU(), config.grid_config)
+    result = prepare_atmosphere(grid, atmosphere_config)
+    plot_file = plot_atmosphere(atmosphere_config)
+
+    @info "Prepared variables: $(join(result.variables, ", "))"
+    @info "Time range: $(first(result.times)) to $(last(result.times)) ($(length(result.times)) steps)"
+    @info "Atmosphere file saved to $(result.output_file)"
+    @info "Atmosphere plot saved to $plot_file"
+
+    return (; result..., plot_file)
+end
 
 """
     validate_atmosphere_records(records)

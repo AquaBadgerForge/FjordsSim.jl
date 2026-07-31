@@ -21,40 +21,9 @@
                 "-O0"
             ]
         },
-        {
-            "type": "julia",
-            "request": "launch",
-            "name": "bathymetry_prepare",
-            "program": "${workspaceFolder}/scripts/bathymetry_prepare.jl",
-            "stopOnEntry": false,
-            "juliaAdditionalArgs": [
-                "-O0"
-            ],
-            "env": {
-                "FJORDSIM_RUN_MAIN": "1"
-            },
-            "args":[
-                "--config",
-                "configs/oslofjorden.jl",
-            ]
-        },
-        {
-            "type": "julia",
-            "request": "launch",
-            "name": "download norkyst",
-            "program": "${workspaceFolder}/scripts/forcing_download_norkyst.jl",
-            "stopOnEntry": false,
-            "juliaAdditionalArgs": [
-                "--project=${workspaceFolder}",
-                "-O0"
-            ],
-            "env": {
-                "FJORDSIM_RUN_MAIN": "1"
-            },
-            "args":[
-                "--config",
-                "configs/oslofjorden.jl",
-            ]
-        },
+        // The preparation steps have no launch config: the Julia debugger's `launch` request needs
+        // a program file, and they are package functions now. Debug them from the Julia REPL:
+        //   using FjordSim, Debugger
+        //   @enter prepare_bathymetry(oslofjorden())
     ]
 }

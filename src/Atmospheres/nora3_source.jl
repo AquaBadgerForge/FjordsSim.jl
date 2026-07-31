@@ -144,7 +144,7 @@ function atmosphere_time_steps(config::NORA3Config)
     output_directory = atmosphere_directory(config)
     isdir(output_directory) || error(
         "NORA3 download directory $output_directory does not exist. " *
-        "Run scripts/atmosphere_download.jl for this config first.",
+        "Run `julia --project -m FjordSim download_atmosphere` for this setup first.",
     )
 
     records = AtmosphereRecord[]
@@ -161,7 +161,8 @@ function atmosphere_time_steps(config::NORA3Config)
 
     isempty(records) && error(
         "No downloaded NORA3 files found in $output_directory for years " *
-        "$(join(config.years, ", ")). Run scripts/atmosphere_download.jl for this config first.",
+        "$(join(config.years, ", ")). " *
+        "Run `julia --project -m FjordSim download_atmosphere` for this setup first.",
     )
     sort!(records, by = record -> record.date)
 

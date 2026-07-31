@@ -67,7 +67,7 @@ function MultiYearNORA3(config::AbstractAtmosphereConfig)
     filepath = atmosphere_path(config)
     isfile(filepath) || error(
         "Prepared atmosphere $filepath does not exist. " *
-        "Run scripts/atmosphere_prepare.jl for this config first.",
+        "Run `julia --project -m FjordSim prepare_atmosphere` for this setup first.",
     )
 
     return MultiYearNORA3(basename(filepath), dirname(filepath))
