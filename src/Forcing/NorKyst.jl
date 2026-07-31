@@ -1,49 +1,157 @@
-#!/usr/bin/env julia
+# NorKyst-800m adapter: the source-specific half of the forcing pipeline. Copy this file's
+# shape to add a new forcing dataset — it owns a config subtype, its own download, and the
+# three hook methods `forcing_time_steps`, `forcing_source_grid` and `forcing_variable_names`
+# (plus `download_forcing` if it fetches data). Everything else comes from the generic core
+# in Forcing.jl.
 
 using Downloads
-using FjordSim
-using NCDatasets
 
-function parse_args(args = ARGS)
-    config_path = nothing
+const NORKYST_CATALOG_URL = "https://thredds.met.no/thredds/catalog/fou-hi/norkyst800m/catalog.xml"
+const NORKYST_OPENDAP_URL = "https://thredds.met.no/thredds/dodsC/fou-hi/norkyst800m/"
 
-    i = 1
-    while i <= length(args)
-        arg = args[i]
-        if arg == "--config"
-            i == length(args) && error("--config requires a value")
-            config_path = args[i + 1]
-            i += 2
-        elseif startswith(arg, "--config=")
-            config_path = split(arg, "=", limit = 2)[2]
-            i += 1
-        elseif arg in ("-h", "--help")
-            print_usage()
-            exit(0)
-        else
-            error("Unknown argument: $arg")
+# NorKyst variable names and the FjordSim forcing names they become. Only the intersection of
+# this mapping with `config.parameters` is prepared.
+const NORKYST_VARIABLE_NAMES = Dict(
+    "temperature" => "T",
+    "salinity" => "S",
+    "u_eastward" => "u",
+    "v_northward" => "v",
+)
+# Scalar NorKyst variable whose `proj4` attribute defines the projected X/Y coordinates.
+const NORKYST_PROJECTION_VARIABLE = "projection_stere"
+
+"""
+    NorKystConfig
+
+Configuration for downloading and subsetting NorKyst-800m reanalysis data.
+
+A setup states where its forcing goes, which variables to extract and which years to cover.
+Only `catalog_url` and `opendap_url` are defaulted, being the NorKyst dataset's own public
+endpoints.
+
+`output_directory`, `output_file` and `plot_file` are names relative to `data_root`, resolved
+by `forcing_directory`, `forcing_path` and `plot_path`. Setting one to an absolute path
+overrides `data_root` for that entry only.
+
+# Fields
+- `data_root`: Directory holding this setup's forcing files. Required.
+- `output_directory`: Name of the directory where monthly NetCDF files are written. Required.
+- `output_file`: Name of the prepared forcing NetCDF written by `prepare_forcing`.
+- `plot_file`: Name of the diagnostic forcing plot.
+- `relaxation_edge`: Lateral boundary the forcing relaxes towards NorKyst on, one of
+  `:south`, `:north`, `:west` or `:east`.
+- `relaxation_cells`: Width of the relaxation band in grid cells.
+- `relaxation_timescale`: Relaxation timescale in seconds; the written lambda is its inverse.
+- `catalog_url`: THREDDS catalog URL listing available files.
+- `opendap_url`: OPeNDAP base URL for streaming data.
+- `parameters`: Variable names to extract (e.g. `["temperature", "salinity"]`). Required.
+- `years`: Calendar years to download. Required.
+"""
+Base.@kwdef mutable struct NorKystConfig <: AbstractForcingConfig
+    data_root::String
+    output_directory::String
+    output_file::String = "forcing.nc"
+    plot_file::String = "forcing.png"
+    relaxation_edge::Symbol = :south
+    relaxation_cells::Int = 10
+    relaxation_timescale::Float64 = 86400.0
+    catalog_url::String = NORKYST_CATALOG_URL
+    opendap_url::String = NORKYST_OPENDAP_URL
+    parameters::Vector{String}
+    years::Vector{Int}
+end
+
+"""
+    forcing_monthly_filename(config::NorKystConfig, year, month)
+
+Name of the combined monthly NorKyst-800m NetCDF file written for `year` and `month`.
+"""
+forcing_monthly_filename(config::NorKystConfig, year, month) =
+    "NorKyst-800m_ZDEPTHS_avg_$(year)$(lpad(month, 2, '0')).nc"
+
+"""
+    forcing_variable_names(config::NorKystConfig)
+
+The NorKyst variables this dataset can supply and the FjordSim forcing names they become.
+"""
+forcing_variable_names(config::NorKystConfig) = NORKYST_VARIABLE_NAMES
+
+"""
+    forcing_time_steps(config::NorKystConfig)
+
+Every time record of every downloaded monthly file for `config.years`, sorted by date with
+duplicates dropped. Errors if the directory or the files are missing.
+"""
+function forcing_time_steps(config::NorKystConfig)
+    directory = forcing_directory(config)
+    isdir(directory) || error(
+        "NorKyst directory $directory does not exist. " *
+        "Run scripts/forcing_download.jl for this config first.",
+    )
+
+    records = SourceRecord[]
+    for year in config.years, month = 1:12
+        filepath = joinpath(directory, forcing_monthly_filename(config, year, month))
+        isfile(filepath) || continue
+        NCDataset(filepath) do ds
+            for (index, date) in enumerate(ds["time"][:])
+                push!(records, SourceRecord(DateTime(date), filepath, index))
+            end
         end
     end
 
-    isnothing(config_path) && error("--config PATH is required")
+    isempty(records) && error("No NorKyst monthly files for years $(config.years) found in $directory.")
+    sort!(records; by = record -> record.date)
 
-    config = include(abspath(config_path))
-    return (
-        config = config,
-        config_path = abspath(config_path),
-    )
+    return unique(record -> record.date, records)
 end
 
-function print_usage()
-    println("""
-    Download and combine NorKyst-800m monthly data for configured years.
+"""
+    forcing_source_grid(config::NorKystConfig, filepath)
 
-    Usage:
-      julia --project scripts/forcing_download_norkyst.jl --config PATH
+Read the projected coordinates, depth levels and projection of a downloaded NorKyst subset.
+Errors unless the projected coordinates are regularly spaced, which `source_field_grid` needs in
+order to express them as a `RectilinearGrid`.
+"""
+function forcing_source_grid(config::NorKystConfig, filepath)
+    return NCDataset(filepath) do ds
+        x = Array{Float64}(ds["X"][:])
+        y = Array{Float64}(ds["Y"][:])
+        depths = Array{Float64}(ds["depth"][:])
+        proj4 = NCDatasets.variable(ds, NORKYST_PROJECTION_VARIABLE).attrib["proj4"]
 
-    Options:
-      --config PATH      Setup config (Julia file). Required, e.g. configs/oslofjorden.jl
-    """)
+        length(x) >= 2 && length(y) >= 2 ||
+            error("NorKyst subset in $filepath is too small to interpolate from: $(length(x))x$(length(y)).")
+        all(difference -> isapprox(difference, x[2] - x[1]), diff(x)) &&
+            all(difference -> isapprox(difference, y[2] - y[1]), diff(y)) ||
+            error("NorKyst projected coordinates in $filepath are not regularly spaced.")
+
+        return ProjectedSourceGrid(x, y, depths, proj4)
+    end
+end
+
+# --- Download ---
+
+"""
+    download_forcing(target_grid, config::NorKystConfig)
+
+Download the NorKyst-800m months covering `config.years`, each combined into one NetCDF file
+in `forcing_directory(config)` subset to the lon/lat box of `target_grid`. A month whose file
+already exists is skipped, so an interrupted download resumes.
+"""
+function download_forcing(target_grid, config::NorKystConfig)
+    output_directory = forcing_directory(config)
+    mkpath(output_directory)
+
+    @info "Downloading NorKyst-800m years $(join(config.years, ", ")) to $output_directory"
+
+    files = list_opendap_files(catalog_url = config.catalog_url)
+    for year in config.years, month = 1:12
+        process_month(year, month, target_grid, config; files)
+    end
+
+    @info "Finished downloading NorKyst-800m forcing"
+    return output_directory
 end
 
 function list_opendap_files(; catalog_url)
@@ -70,8 +178,8 @@ end
     NorKystSubset
 
 The spatial window of a NorKyst dataset selected by a setup, plus the variables to extract.
-Derived from a `FjordConfig` by `subset_ranges` and passed to every function that writes the
-subset out.
+Derived from a target grid and a `NorKystConfig` by `subset_ranges` and passed to every
+function that writes the subset out.
 
 # Fields
 - `ranges`: Index range per dataset dimension covering the requested lon/lat box.
@@ -86,9 +194,17 @@ struct NorKystSubset{M<:AbstractArray,S<:Tuple}
     parameters::Vector{String}
 end
 
-function subset_ranges(ds, config::FjordConfig)
-    latitude_range = config.grid_config.latitude
-    longitude_range = config.grid_config.longitude
+"""
+    subset_ranges(ds, target_grid, config::NorKystConfig)
+
+The NorKyst index window covering the lon/lat domain of `target_grid`.
+
+The bounds come from `x_domain`/`y_domain` rather than a grid config's own fields, so any
+`AbstractGridConfig` works; they are the same face bounds an `EvenGrid` is built from.
+"""
+function subset_ranges(ds, target_grid, config::NorKystConfig)
+    longitude_range = x_domain(target_grid)
+    latitude_range = y_domain(target_grid)
 
     latitude_variable = variable(ds, "lat")
     longitude_variable = variable(ds, "lon")
@@ -106,7 +222,7 @@ function subset_ranges(ds, config::FjordConfig)
 
     spatial_dimensions = dimnames(latitude_variable)
     subset_mask = mask[(ranges[dimension] for dimension in spatial_dimensions)...]
-    return NorKystSubset(ranges, subset_mask, spatial_dimensions, config.forcing_config.parameters)
+    return NorKystSubset(ranges, subset_mask, spatial_dimensions, config.parameters)
 end
 
 function variable_indices(variable, ranges)
@@ -303,40 +419,39 @@ function write_time_dependent_coordinates!(output, source, subset::NorKystSubset
     end
 end
 
-function process_month(year, month, config::FjordConfig; files = nothing)
-    forcing_config = config.forcing_config
-    files = isnothing(files) ? list_opendap_files(catalog_url = forcing_config.catalog_url) : files
+function process_month(year, month, target_grid, config::NorKystConfig; files = nothing)
+    files = isnothing(files) ? list_opendap_files(catalog_url = config.catalog_url) : files
     month_string = ".$(year)$(lpad(month, 2, '0'))"
     year_month = month_string[2:end]
-    output_path = joinpath(norkyst_directory(forcing_config), norkyst_monthly_filename(year, month))
+    output_path = joinpath(forcing_directory(config), forcing_monthly_filename(config, year, month))
 
     if isfile(output_path)
-        println("Skipping $year_month (already exists)")
+        @info "Skipping $year_month (already exists)"
         return output_path
     end
 
-    println("Processing $year_month...")
+    @info "Processing $year_month..."
     monthly_files = sort([file for file in files if occursin(month_string, file)])
 
     if isempty(monthly_files)
-        println("  No files found for $year_month, skipping.")
+        @info "  No files found for $year_month, skipping."
         return nothing
     end
 
-    urls = [joinpath(forcing_config.opendap_url, file) for file in monthly_files]
-    println("  Opening $(length(urls)) datasets...")
+    urls = [joinpath(config.opendap_url, file) for file in monthly_files]
+    @info "  Opening $(length(urls)) datasets..."
 
     datasets = NCDataset[]
     try
         for url in urls
             push!(datasets, NCDataset(url))
-            println("    Opened: $url")
+            @info "    Opened: $url"
         end
 
-        subset = subset_ranges(first(datasets), config)
+        subset = subset_ranges(first(datasets), target_grid, config)
         total_time = sum(time_length, datasets)
 
-        println("  Writing output to: $output_path")
+        @info "  Writing output to: $output_path"
         output = define_output_file(output_path, first(datasets), subset, total_time)
         try
             time_start = 1
@@ -354,31 +469,6 @@ function process_month(year, month, config::FjordConfig; files = nothing)
         foreach(close, datasets)
     end
 
-    println("Finished $year_month\n")
+    @info "Finished $year_month"
     return output_path
-end
-
-function main()
-    args = parse_args()
-    config = args.config
-    forcing_config = config.forcing_config
-    output_directory = norkyst_directory(forcing_config)
-    mkpath(output_directory)
-
-    println("Processing years: $(join(forcing_config.years, ", "))")
-    println("Config: $(args.config_path)")
-    println("Output directory: $output_directory\n")
-
-    files = list_opendap_files(catalog_url = forcing_config.catalog_url)
-    for year in forcing_config.years
-        for month in 1:12
-            process_month(year, month, config; files)
-        end
-    end
-
-    println("All done.")
-end
-
-if abspath(PROGRAM_FILE) == @__FILE__() || get(ENV, "FJORDSIM_RUN_MAIN", "") == "1"
-    main()
 end

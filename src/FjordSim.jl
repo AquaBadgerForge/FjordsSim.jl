@@ -4,26 +4,36 @@ export
     # oceananigans methods
     ImmersedBoundaryGrid,
     LatitudeLongitudeGrid,
-    # configs
+    # config supertypes and the setup container
     FjordConfig,
     AbstractGridConfig,
     AbstractBathymetryConfig,
     AbstractForcingConfig,
+    # generic entry points
+    prepare_bathymetry,
+    prepare_forcing,
+    download_forcing,
+    forcing_from_file,
+    plot_bathymetry,
+    plot_forcing,
+    # path resolution, defined on the config supertypes
+    bathymetry_path,
+    forcing_path,
+    forcing_directory,
+    plot_path,
+    # extension hooks a new config subtype overloads
+    bathymetry_dataset,
+    regrid_options,
+    forcing_time_steps,
+    forcing_source_grid,
+    forcing_variable_names,
+    forcing_monthly_filename,
+    ProjectedSourceGrid,
+    # built-in sources
     EvenGrid,
     DybdedataConfig,
     NorKystConfig,
-    # bathymetry
-    prepare_geonorge_bathymetry,
-    bathymetry_path,
-    plot_path,
     geodatabase_path,
-    # forcings
-    forcing_from_file,
-    forcing_path,
-    forcing_plot_path,
-    prepare_norkyst_forcing,
-    norkyst_directory,
-    norkyst_monthly_filename,
     # boundary conditions
     top_bottom_boundary_conditions,
     # simulations
@@ -70,11 +80,12 @@ end
 include("Configs.jl")
 include("FDatasets.jl")
 include("Utils.jl")
-include("Bathymetry.jl")
+include("Bathymetry/Bathymetry.jl")
 include("Atmospheres/Atmospheres.jl")
-include("Forcing.jl")
+include("Forcing/Forcing.jl")
 include("BoundaryConditions.jl")
 include("Grids.jl")
+include("Plotting.jl")
 
 using .Configs
 using .FDatasets
@@ -84,6 +95,7 @@ using .Atmospheres
 using .Forcing
 using .BoundaryConditions
 using .Grids
+using .Plotting
 
 function coupled_hydrostatic_simulation(
     grid,

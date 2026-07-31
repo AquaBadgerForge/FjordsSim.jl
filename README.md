@@ -53,23 +53,44 @@ By default, input data goes to `$HOME/FjordSim_data/<fjord>/` and results to
 setup's `data_root`; setting one to an absolute path relocates just that file, which is how a
 single copy of the Geonorge database is shared between fjords.
 
-To add a fjord, copy an existing config and adjust it. To add a new kind of grid, bathymetry
-source, or forcing dataset, define a struct subtyping `AbstractGridConfig`,
-`AbstractBathymetryConfig`, or `AbstractForcingConfig` and overload the relevant methods on it —
-`FjordConfig` itself stays unchanged.
+To add a fjord, copy an existing config and adjust it.
+
+To add a new kind of grid, bathymetry source, or forcing dataset, define a struct subtyping
+`AbstractGridConfig`, `AbstractBathymetryConfig`, or `AbstractForcingConfig` and overload that
+supertype's hooks — `FjordConfig`, the generic pipelines and the scripts stay unchanged. Each
+pipeline is one generic function plus a handful of dispatch points:
+
+| Pipeline | Generic entry point | Hooks a new source implements |
+|---|---|---|
+| Grid | — | `LatitudeLongitudeGrid(arch, config)` |
+| Bathymetry | `prepare_bathymetry(target_grid, config)` | `bathymetry_dataset(target_grid, config)`; optionally `regrid_options(config)` |
+| Forcing | `prepare_forcing(target_grid, config)`, `download_forcing(config)` | `forcing_time_steps`, `forcing_source_grid`, `forcing_variable_names`; `download_forcing(target_grid, config)` if it downloads |
+
+Path resolution (`bathymetry_path`, `forcing_path`, `forcing_directory`, `plot_path`) and the
+diagnostic plots (`plot_bathymetry`, `plot_forcing`) are defined on the supertypes, so a new
+source inherits them. `src/Bathymetry/Geonorge.jl` and `src/Forcing/NorKyst.jl` are the built-in
+adapters and the templates to copy; each supertype's docstring in `src/Configs.jl` lists the
+fields and hooks it expects.
 
 ## Prepare input data
 
-Both scripts take the setup to prepare via `--config`, which is required:
+Every script takes the setup to prepare via `--config`, which is required:
 
 ```bash
 # Bathymetry: downloads the Geonorge Sjøkart FileGDB on first use (~2.3 GB), regrids it onto the
 # configured grid, and writes the bathymetry NetCDF plus a diagnostic plot
 julia --project scripts/bathymetry_prepare.jl --config configs/oslofjorden.jl
 
-# Forcing: downloads and subsets NorKyst-800m over the configured region and years
-julia --project scripts/forcing_download_norkyst.jl --config configs/oslofjorden.jl
+# Forcing: downloads and subsets the configured dataset (NorKyst-800m) over the setup's region
+# and years
+julia --project scripts/forcing_download.jl --config configs/oslofjorden.jl
+
+# Forcing: regrids the download onto the simulation grid, writing the forcing NetCDF and a plot
+julia --project scripts/forcing_prepare.jl --config configs/oslofjorden.jl
 ```
+
+The scripts are thin CLI wrappers: the work is `prepare_bathymetry`, `download_forcing` and
+`prepare_forcing`, each a generic function on the matching config supertype.
 
 ## Run an example Oslofjord simulation
 

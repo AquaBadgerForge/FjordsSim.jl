@@ -12,8 +12,8 @@ julia --project examples/oslofjord.jl
 # Prepare bathymetry for a configured fjord (downloads the Geonorge GDB on first use)
 julia --project scripts/bathymetry_prepare.jl --config configs/drammensfjorden.jl
 
-# Download and subset NorKyst-800m forcing for a configured fjord
-julia --project scripts/forcing_download_norkyst.jl --config configs/oslofjorden.jl
+# Download and subset the configured forcing dataset for a fjord
+julia --project scripts/forcing_download.jl --config configs/oslofjorden.jl
 
 # Regrid the downloaded forcing onto the fjord's grid (needs the bathymetry and download first)
 julia --project scripts/forcing_prepare.jl --config configs/oslofjorden.jl
@@ -37,7 +37,11 @@ modules, in `include` order from `src/FjordSim.jl`:
    `AbstractBathymetryConfig`, `AbstractForcingConfig`, plus `FjordConfig`, which holds one of
    each (parametrically, so every instantiation stays concretely typed). A new grid,
    bathymetry source or forcing dataset is added by subtyping the matching supertype and
-   overloading methods on it — `FjordConfig` and its callers are untouched.
+   overloading methods on it — `FjordConfig` and its callers are untouched. The path helpers
+   defined on the supertypes live here too, so a new source inherits them without loading the
+   built-in source's module: `bathymetry_path`, `forcing_path`, `forcing_directory`, and
+   `plot_path` (one method per supertype). Each supertype's docstring lists the fields and
+   hook methods a subtype must provide — see "Adding a new source" below.
 
 2. **Dataset adapters** (`src/FDatasets.jl`) — `DSForcing` and `DSResults` are NumericalEarth
    dataset wrappers for local FjordSim NetCDF files (forcing inputs and simulation outputs),
@@ -47,48 +51,65 @@ modules, in `include` order from `src/FjordSim.jl`:
    named tuples, `cell_advection_timescale_coupled_model` for the time-step wizard, plus
    `compute_faces` and NetCDF/JLD2 helpers.
 
-4. **Bathymetry** (`src/Bathymetry.jl`) — `DybdedataConfig <: AbstractBathymetryConfig` describes
-   one setup's Geonorge Sjøkart Dybdedata bathymetry. `prepare_geonorge_bathymetry(target_grid, config)`
-   runs the pipeline: derive the native region from the target grid (`native_region!`) → download
-   and extract the FileGDB if absent (`ensure_geodatabase`, ~2.3 GB) → sample `dybdepunkt` points and
-   optionally `dybdekurve` contours in EPSG:25833 → transform the point cloud to WGS84 in one bulk
-   GDAL call → grid to a raster and burn in land features (`landareal`, `skjer`) →
-   `NumericalEarth.regrid_bathymetry` → `smooth_bathymetry_gaps!` → processed NetCDF. The
-   intermediate raw dataset is cached in `Scratch` storage and wrapped by
-   `GeonorgeBathymetry <: AbstractStaticBathymetry`, which implements the NumericalEarth dataset
-   interface. `bathymetry_path`/`plot_path` are defined on `AbstractBathymetryConfig`, so a new
-   bathymetry source inherits path resolution.
+4. **Bathymetry** (`src/Bathymetry/Bathymetry.jl` generic core, `src/Bathymetry/Geonorge.jl`
+   source adapter, included into the same `Bathymetry` module).
+   `prepare_bathymetry(target_grid, config::AbstractBathymetryConfig)` is the generic pipeline:
+   `bathymetry_dataset(target_grid, config)` (the one source-specific step) →
+   `NumericalEarth.regrid_bathymetry` with `regrid_options(config)` → `smooth_bathymetry_gaps!` →
+   `write_bathymetry_file`. The core also owns the smoothing kernels and the
+   `center_coordinates`/`expand_domain`/`vertical_faces` domain helpers.
+
+   `Geonorge.jl` holds `DybdedataConfig <: AbstractBathymetryConfig` and the Geonorge Sjøkart
+   Dybdedata implementation of the two hooks: derive the native region from the target grid
+   (`native_region!`) → download and extract the FileGDB if absent (`ensure_geodatabase`,
+   ~2.3 GB) → sample `dybdepunkt` points and optionally `dybdekurve` contours in EPSG:25833 →
+   transform the point cloud to WGS84 in one bulk GDAL call → grid to a raster and burn in land
+   features (`landareal`, `skjer`). The intermediate raw dataset is cached in `Scratch` storage
+   and wrapped by `GeonorgeBathymetry <: AbstractStaticBathymetry`, which implements the
+   NumericalEarth dataset interface.
 
 5. **Atmosphere** (`src/Atmospheres/Atmospheres.jl`, `src/Atmospheres/NORA3.jl`) — `MultiYearNORA3` is
    a dataset wrapper for NORA3 reanalysis NetCDF. `NORA3PrescribedAtmosphere` and
    `NORA3PrescribedRadiation` construct NumericalEarth `PrescribedAtmosphere`/`PrescribedRadiation`
    objects backed by `NORA3FieldTimeSeries`. Default data path: `~/FjordSim_data/NORA3/NORA3.nc`.
 
-6. **Forcing** (`src/Forcing.jl`) — loads river/relaxation forcing from NetCDF via
-   `forcing_from_file`. The `ForcingFromFile` struct carries two `FieldTimeSeries`
-   (values + lambdas) and dispatches to flux, advection, or relaxation terms based on the sign of
-   lambda: `λ > 1` → x-flux, `λ < -1` → y-flux, `|λ| < 1` → relaxation. Uses a custom
-   `NetCDFBackend` keeping 2 time indices in memory. `forcing_from_file` takes either a
-   `filepath` keyword or an `AbstractForcingConfig` positionally, resolved by `forcing_path`.
-   Also holds `NorKystConfig <: AbstractForcingConfig` (THREDDS endpoints, variables, years,
-   output names, relaxation zone) with `norkyst_directory`/`norkyst_monthly_filename` and
-   `forcing_path`/`forcing_plot_path`, plus `prepare_norkyst_forcing(target_grid, config)`,
-   which regrids the downloaded monthly files onto the simulation grid: daily time axis with
-   gaps interpolated between neighbouring days → land mask from `peripheral_node` (so it matches
-   the model, including `PartialCellBottom` and the velocity-face wall convention), with the open
+6. **Forcing** (`src/Forcing/Forcing.jl` generic core, `src/Forcing/NorKyst.jl` dataset adapter,
+   included into the same `Forcing` module).
+
+   The read side loads river/relaxation forcing from NetCDF via `forcing_from_file`. The
+   `ForcingFromFile` struct carries two `FieldTimeSeries` (values + lambdas) and dispatches to
+   flux, advection, or relaxation terms based on the sign of lambda: `λ > 1` → x-flux,
+   `λ < -1` → y-flux, `|λ| < 1` → relaxation. Uses a custom `NetCDFBackend` keeping 2 time
+   indices in memory. `forcing_from_file` takes either a `filepath` keyword or an
+   `AbstractForcingConfig` positionally, resolved by `forcing_path`.
+
+   `prepare_forcing(target_grid, config::AbstractForcingConfig)` regrids the downloaded source
+   files onto the simulation grid: `forcing_variable_names(config)` picks the variables →
+   `forcing_time_steps(config)` completed by `daily_time_steps` to a gap-free daily axis →
+   `forcing_source_grid(config, filepath)` → land mask from `peripheral_node` (so it matches the
+   model, including `PartialCellBottom` and the velocity-face wall convention), with the open
    `relaxation_edge` row restored → source mask filled from the nearest valid cell (`SourceFill`)
    → one trilinear `Oceananigans.Fields.interpolate` per target cell in a `launch!` kernel,
-   against the NorKyst subset expressed as a `RectilinearGrid` in projected meters → relaxation
-   lambdas along `relaxation_edge` → streaming NetCDF write.
+   against the source subset expressed as a `RectilinearGrid` in projected meters
+   (`ProjectedSourceGrid`, `source_field_grid`) → relaxation lambdas along `relaxation_edge` →
+   streaming NetCDF write. Only the three hooks are dataset-specific; the rest is shared.
 
    The `architecture` keyword selects where the interpolation kernel runs (`GPU()` is ~12x faster
    than a single-threaded `CPU()`); `target_grid` must stay on the CPU because building the masks
    walks `peripheral_node` cell by cell. `scripts/forcing_prepare.jl` picks the GPU when
    `CUDA.functional()` and takes `--cpu` to override.
-   The download itself lives in `scripts/forcing_download_norkyst.jl`; the CLI wrapper and
-   diagnostic plot for preparation live in `scripts/forcing_prepare.jl`.
 
-   Two library functions deliberately *not* used, documented in `prepare_norkyst_forcing` and
+   `download_forcing(config::FjordConfig)` is the generic download driver: it builds the setup's
+   grid on the CPU and dispatches on the forcing config, so a dataset only implements
+   `download_forcing(target_grid, config)`. `scripts/forcing_download.jl` is a thin CLI over it.
+
+   `NorKyst.jl` holds `NorKystConfig <: AbstractForcingConfig` (THREDDS endpoints, variables,
+   years, output names, relaxation zone), `forcing_monthly_filename`, the three hook methods, and
+   the NorKyst download: list the THREDDS catalog → open the month's OPeNDAP datasets → subset to
+   the target grid's lon/lat box (`subset_ranges`, `NorKystSubset`) → write one combined monthly
+   NetCDF.
+
+   Two library functions deliberately *not* used, documented in `prepare_forcing` and
    `SourceFill`: NumericalEarth's dataset path (`native_grid`, `set!(field, metadata)`,
    `DatasetRestoring`) always builds a `LatitudeLongitudeGrid`, but the NorKyst grid is rotated
    ~59° from east here; and `inpaint_mask!` cannot fill a fully masked depth level, so on this
@@ -104,11 +125,49 @@ modules, in `include` order from `src/FjordSim.jl`:
    returns an `ImmersedBoundaryGrid` wrapping a `LatitudeLongitudeGrid` with `PartialCellBottom`.
    The loader still accepts legacy files with positive depths or swapped `lon`/`lat` axes.
 
-9. **Top-level** (`src/FjordSim.jl`) — re-exports the public API and defines
-   `coupled_hydrostatic_simulation`, which assembles a `HydrostaticFreeSurfaceModel` inside an
-   `OceanSeaIceModel` (NumericalEarth) and returns a `Simulation`. Also patches
-   `compute_bounding_indices` from NumericalEarth to prevent off-by-one errors with custom
-   longitude/latitude grids.
+9. **Plotting** (`src/Plotting.jl`) — `plot_bathymetry(grid, bottom_height, config)` and
+   `plot_forcing(grid, config)`, both dispatching on the config *supertypes* so a new source
+   inherits them, writing to `plot_path(config)`. Shares `default_figure_size` and `plot_axes`.
+
+10. **Top-level** (`src/FjordSim.jl`) — re-exports the public API and defines
+    `coupled_hydrostatic_simulation`, which assembles a `HydrostaticFreeSurfaceModel` inside an
+    `OceanSeaIceModel` (NumericalEarth) and returns a `Simulation`. Also patches
+    `compute_bounding_indices` from NumericalEarth to prevent off-by-one errors with custom
+    longitude/latitude grids.
+
+## Adding a new source
+
+Every pipeline is a generic function on the config supertype plus a small set of hooks. Add a
+source by subtyping and overloading the hooks — never by editing the generic function. The
+adapter files (`src/Bathymetry/Geonorge.jl`, `src/Forcing/NorKyst.jl`) are the templates.
+
+Grid — `AbstractGridConfig`:
+
+| Hook | Required |
+|---|---|
+| `LatitudeLongitudeGrid(arch, config)` | yes |
+
+Bathymetry — `AbstractBathymetryConfig`, consumed by `prepare_bathymetry`:
+
+| Hook | Required | Default |
+|---|---|---|
+| `bathymetry_dataset(target_grid, config)` → NumericalEarth dataset | yes | none |
+| `regrid_options(config)` → NamedTuple for `regrid_bathymetry` | no | `(;)` |
+
+Forcing — `AbstractForcingConfig`, consumed by `prepare_forcing`:
+
+| Hook | Required |
+|---|---|
+| `forcing_time_steps(config)` → `Vector{SourceRecord}` | yes |
+| `forcing_source_grid(config, filepath)` → source grid | yes |
+| `forcing_variable_names(config)` → `Dict` source name => FjordSim name | yes |
+| `download_forcing(target_grid, config)` | only if it downloads |
+| `source_field_grid(source, arch)`, `projected_target_nodes(longitude, latitude, source)` | only for a source grid that is not a regular projected grid; dispatch on the source-grid type, not the config |
+
+Required fields are listed in each supertype's docstring in `src/Configs.jl`. Path resolution
+(`bathymetry_path`, `forcing_path`, `forcing_directory`, `plot_path`) and the plots come for
+free. A missing required hook surfaces as a `MethodError` naming it, which the
+"Config extensibility" testset asserts.
 
 ## Setups
 
@@ -139,7 +198,8 @@ kernel must follow these rules:
 - Always index fields with three indices: `field[i, j, k]` — 2D indexing appears to work on some
   fields by coincidence but is unsupported and will break
 
-`src/Forcing.jl` already demonstrates the correct pattern; match it when adding new forcings.
+`src/Forcing/Forcing.jl` already demonstrates the correct pattern; match it when adding new
+forcings.
 
 ## Type Stability
 

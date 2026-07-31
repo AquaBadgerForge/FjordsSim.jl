@@ -22,6 +22,9 @@ struct MinimalBathymetry <: AbstractBathymetryConfig
 end
 
 struct ConstantForcing <: AbstractForcingConfig
+    data_root::String
+    output_file::String
+    plot_file::String
     temperature::Float64
 end
 
@@ -34,6 +37,9 @@ Oceananigans.LatitudeLongitudeGrid(arch, config::SingleColumnGrid) = LatitudeLon
     latitude = (59.0, 60.0),
     z = [-config.depth, -config.depth / 2, 0.0],
 )
+
+# One forcing hook overloaded on the new forcing config, without touching Forcing.jl.
+FjordSim.Forcing.forcing_variable_names(config::ConstantForcing) = Dict("temperature" => "T")
 
 @testset "Backward Compatibility — API Exports" begin
     # Verify all exported symbols are present in the public interface
@@ -48,8 +54,23 @@ Oceananigans.LatitudeLongitudeGrid(arch, config::SingleColumnGrid) = LatitudeLon
         :NorKystConfig,
         :forcing_from_file,
         :forcing_path,
-        :forcing_plot_path,
-        :prepare_norkyst_forcing,
+        :forcing_directory,
+        :plot_path,
+        :bathymetry_path,
+        :prepare_bathymetry,
+        :prepare_forcing,
+        :download_forcing,
+        :plot_bathymetry,
+        :plot_forcing,
+        # extension hooks a new config subtype overloads
+        :bathymetry_dataset,
+        :regrid_options,
+        :forcing_time_steps,
+        :forcing_source_grid,
+        :forcing_variable_names,
+        :forcing_monthly_filename,
+        :ProjectedSourceGrid,
+        :geodatabase_path,
         :top_bottom_boundary_conditions,
         :coupled_hydrostatic_simulation,
         :recursive_merge,
@@ -212,14 +233,14 @@ end
         parameters = ["temperature", "salinity"],
         years = [2020],
     )
-    @test norkyst_directory(forcing_config) == joinpath(data_root, "norkyst")
+    @test forcing_directory(forcing_config) == joinpath(data_root, "norkyst")
     @test forcing_config.parameters == ["temperature", "salinity"]
 
     # The prepared forcing file, its plot and the relaxation zone are defaulted, since there is
     # one prepared forcing file per setup and the notebook-derived relaxation matches both
     # current setups.
     @test forcing_path(forcing_config) == joinpath(data_root, "forcing.nc")
-    @test forcing_plot_path(forcing_config) == joinpath(data_root, "forcing.png")
+    @test plot_path(forcing_config) == joinpath(data_root, "forcing.png")
     @test forcing_config.relaxation_edge === :south
     @test forcing_config.relaxation_cells == 10
     @test forcing_config.relaxation_timescale == 86400.0
@@ -233,8 +254,8 @@ end
         years = [2020],
     )
     @test forcing_path(relocated) == "/shared/forcing.nc"
-    @test forcing_plot_path(relocated) == joinpath(data_root, "forcing.png")
-    @test norkyst_directory(
+    @test plot_path(relocated) == joinpath(data_root, "forcing.png")
+    @test forcing_directory(
         NorKystConfig(
             data_root = data_root,
             output_directory = "/nk",
@@ -242,7 +263,7 @@ end
             years = [2020],
         ),
     ) == "/nk"
-    @test norkyst_monthly_filename(2020, 3) == "NorKyst-800m_ZDEPTHS_avg_202003.nc"
+    @test forcing_monthly_filename(forcing_config, 2020, 3) == "NorKyst-800m_ZDEPTHS_avg_202003.nc"
     @test occursin("thredds.met.no", forcing_config.catalog_url)
 
     grid_config = EvenGrid(
@@ -281,7 +302,7 @@ end
     config = FjordConfig(
         grid_config = SingleColumnGrid(120.0),
         bathymetry_config = MinimalBathymetry(data_root, "column.nc", "column.png"),
-        forcing_config = ConstantForcing(8.0),
+        forcing_config = ConstantForcing(data_root, "column_forcing.nc", "column_forcing.png", 8.0),
     )
 
     @test config.grid_config isa AbstractGridConfig
@@ -314,14 +335,31 @@ end
         ),
     ) isa FjordConfig
 
-    # Path resolution is inherited from AbstractBathymetryConfig — no new methods needed.
+    # Path resolution is inherited from the config supertypes — no new methods needed, and
+    # `plot_path` serves bathymetry and forcing configs through separate methods.
     @test bathymetry_path(config.bathymetry_config) == joinpath(data_root, "column.nc")
     @test plot_path(config.bathymetry_config) == joinpath(data_root, "column.png")
+    @test forcing_path(config.forcing_config) == joinpath(data_root, "column_forcing.nc")
+    @test plot_path(config.forcing_config) == joinpath(data_root, "column_forcing.png")
 
     # A method overloaded on the new grid config is picked up by existing call sites.
     grid = LatitudeLongitudeGrid(CPU(), config.grid_config)
     @test size(grid) == (1, 1, 2)
     @test collect(Oceananigans.Grids.znodes(grid, Face())) == [-120.0, -60.0, 0.0]
+
+    # `regrid_options` is the one optional hook, so a source that configures nothing inherits
+    # an empty option set rather than having to implement it.
+    @test regrid_options(config.bathymetry_config) === (;)
+
+    # A forcing hook overloaded on the new config is picked up by the generic pipeline...
+    @test forcing_variable_names(config.forcing_config) == Dict("temperature" => "T")
+
+    # ...while a required hook that is not implemented fails as a missing method, naming what
+    # the new subtype still owes, rather than silently doing nothing.
+    @test_throws MethodError bathymetry_dataset(grid, config.bathymetry_config)
+    @test_throws MethodError prepare_bathymetry(grid, config.bathymetry_config)
+    @test_throws MethodError forcing_time_steps(config.forcing_config)
+    @test_throws MethodError forcing_source_grid(config.forcing_config, "unused.nc")
 end
 
 @testset "FjordSim.jl" begin
@@ -813,7 +851,7 @@ end
             years = [2020],
         )
 
-        # A file in exactly the layout prepare_norkyst_forcing writes: staggered variables on
+        # A file in exactly the layout prepare_forcing writes: staggered variables on
         # face dimensions, land as the NaN fill value, times decodable to DateTime.
         ds = NCDataset(forcing_path(forcing_config), "c")
         defDim(ds, "Nx", 2)
