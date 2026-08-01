@@ -6,9 +6,16 @@ rivers, and NORA3 atmosphere, on a 240 x 520 x 18 grid covering 10.2-11.02°E, 5
 
 The river config gets the same `data_root` as the rest of the setup, so the river data downloads
 alongside it rather than being shared from elsewhere.
+
+It also names a `simulation_config`, so `run_simulation` works once the preparation steps have
+run. `SimulationConfig` has no defaults, so every knob the simulation uses — buoyancy, closure,
+advection, tracers, coriolis, sea ice, the run length and the wizard settings — is stated here
+and nowhere else. Results go to `~/FjordSim_results/oslofjorden/`, separate from the input data
+root.
 """
 function oslofjorden()
     data_root = joinpath(homedir(), "FjordSim_data", "oslofjorden")
+    FT = Oceananigans.defaults.FloatType
 
     return FjordConfig(
         grid_config = EvenGrid(
@@ -55,6 +62,32 @@ function oslofjorden()
             resolution       = 0.02,
             padding          = 0.1,
             years            = [2020],
+        ),
+        simulation_config = SimulationConfig(
+            results_root            = joinpath(homedir(), "FjordSim_results", "oslofjorden"),
+            output_file             = "snapshots_ocean.nc",
+            architecture            = :auto,
+            buoyancy                = SeawaterBuoyancy(FT, equation_of_state = TEOS10EquationOfState(FT)),
+            closure                 = (
+                CATKEVerticalDiffusivity(minimum_tke = 7e-6),
+                HorizontalScalarBiharmonicDiffusivity(ν = 15, κ = 10),
+            ),
+            tracer_advection        = (T = WENO(), S = WENO()),
+            momentum_advection      = WENOVectorInvariant(FT),
+            tracers                 = (:T, :S),
+            initial_conditions      = (T = 5.0, S = 33.0),
+            coriolis                = HydrostaticSphericalCoriolis(FT),
+            sea_ice                 = FreezingLimitedOceanTemperature(),
+            biogeochemistry         = nothing,
+            free_surface_cfl        = 0.7,
+            bottom_drag_coefficient = 0.003,
+            stop_time               = 365days,
+            output_interval         = 1hour,
+            progress_interval       = 1hour,
+            overwrite_existing      = true,
+            time_step_cfl           = 0.1,
+            max_time_step           = 3minutes,
+            max_time_step_change    = 1.01,
         ),
     )
 end

@@ -7,12 +7,13 @@ using ..Setups: fjord_config, setup_names
 using ..Bathymetry: prepare_bathymetry
 using ..Atmospheres: prepare_atmosphere, download_atmosphere
 using ..Forcing: prepare_forcing, download_forcing, add_rivers
+using ..Simulations: run_simulation
 
 """
 Every subcommand, named exactly like the function it calls, so `-m FjordSim prepare_forcing` and
 `prepare_forcing(config)` in the REPL are the same thing spelled the same way.
 
-Ordered by the sequence a setup is prepared in, which is the order `USAGE` lists them in.
+Ordered by the sequence a setup is prepared and run in, which is the order `USAGE` lists them in.
 """
 const SUBCOMMANDS = [
     "prepare_bathymetry" => prepare_bathymetry,
@@ -21,6 +22,7 @@ const SUBCOMMANDS = [
     "add_rivers" => add_rivers,
     "download_atmosphere" => download_atmosphere,
     "prepare_atmosphere" => prepare_atmosphere,
+    "run_simulation" => run_simulation,
 ]
 
 """
@@ -45,12 +47,12 @@ function subcommand_driver(name)
 end
 
 const USAGE = """
-Prepare the input data for a FjordSim setup.
+Prepare the input data for a FjordSim setup, and run it.
 
 Usage:
   julia --project -m FjordSim SUBCOMMAND --config SETUP
 
-Subcommands, in the order a setup is prepared:
+Subcommands, in the order a setup is prepared and run:
   prepare_bathymetry    Regrid the bathymetry source onto the setup's grid. Downloads the Geonorge
                         Sjøkart FileGDB on first use (~2.3 GB).
   download_forcing      Download and subset the forcing dataset over the setup's region and years.
@@ -66,6 +68,12 @@ Subcommands, in the order a setup is prepared:
   prepare_atmosphere    Regrid the download onto a regular longitude/latitude grid. Needs
                         download_atmosphere but not prepare_bathymetry, and is cheap to re-run
                         after changing `resolution` or `padding`.
+  run_simulation        Build and run the coupled simulation, writing NetCDF snapshots into the
+                        setup's results directory. Needs every step above that the setup
+                        configures: prepare_bathymetry, prepare_forcing, add_rivers if it names
+                        rivers, and prepare_atmosphere if it names an atmosphere. Where it runs
+                        is the simulation config's `architecture` field. A setup with no
+                        simulation config does nothing.
 
 Options:
   --config SETUP   Which setup to prepare. Required. One of: $(join(setup_names(), ", ")).

@@ -6,6 +6,8 @@ export prepare_atmosphere,
     atmosphere_source_grid,
     atmosphere_variable_names,
     atmosphere_target_axes,
+    prescribed_atmosphere,
+    prescribed_radiation,
     AtmosphereRecord,
     ProjectedAtmosphereGrid,
     NORA3Config,
@@ -164,6 +166,27 @@ download_atmosphere(config::FjordConfig) =
     download_atmosphere(LatitudeLongitudeGrid(CPU(), config.grid_config), config.atmosphere_config)
 
 download_atmosphere(target_grid, ::Nothing) = nothing
+
+"""
+    prescribed_atmosphere(config, architecture)
+    prescribed_radiation(config, architecture)
+
+Read the prepared atmosphere file back at simulation time, as the NumericalEarth
+`PrescribedAtmosphere` and `PrescribedRadiation` that `coupled_hydrostatic_simulation` consumes.
+
+These are the only atmosphere hooks the simulation side needs, and they are what keeps
+`FjordSim.Simulations` from naming a dataset: which reader, which file and which backend are all
+the source's business. A setup naming no atmosphere config gets `nothing` for both, which is what
+`OceanSeaIceModel` takes to mean an uncoupled run.
+
+Deliberately no float-type argument: both NumericalEarth constructors default to `Float32`, and
+passing `Oceananigans.defaults.FloatType` would silently promote the atmosphere to `Float64`.
+
+Required for every `AbstractAtmosphereConfig` belonging to a setup that is simulated. See the
+`NORA3Config` methods in `src/Atmospheres/nora3_source.jl`.
+"""
+prescribed_atmosphere(::Nothing, architecture) = nothing
+prescribed_radiation(::Nothing, architecture) = nothing
 
 # --- Target grid ---
 

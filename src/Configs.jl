@@ -5,6 +5,7 @@ export AbstractGridConfig,
     AbstractForcingConfig,
     AbstractRiverConfig,
     AbstractAtmosphereConfig,
+    AbstractSimulationConfig,
     FjordConfig,
     bathymetry_path,
     forcing_path,
@@ -12,6 +13,7 @@ export AbstractGridConfig,
     river_forcing_path,
     atmosphere_path,
     atmosphere_directory,
+    results_path,
     plot_path
 
 """
@@ -135,11 +137,41 @@ interpolates between them — so it only has to cover the ocean domain with a ma
 - `atmosphere_variable_names(config)`: source variable name => prepared variable name.
   Required.
 - `download_atmosphere(target_grid, config)`: fetch the source data. Only if it downloads.
+- `prescribed_atmosphere(config, architecture)`, `prescribed_radiation(config, architecture)`:
+  read the prepared file back at simulation time, as the NumericalEarth objects
+  `coupled_hydrostatic_simulation` consumes. Only if the setup is simulated.
 
 `FjordSim.Atmospheres.NORA3Config` is the built-in implementation, for the MET Norway NORA3
 reanalysis; `src/Atmospheres/nora3_source.jl` is the template to copy for a new dataset.
 """
 abstract type AbstractAtmosphereConfig end
+
+"""
+    AbstractSimulationConfig
+
+Supertype for simulation configurations. A concrete subtype describes how a setup whose data is
+already prepared is turned into a running simulation: the model components that do not depend on
+the grid, and the knobs for the ones that do.
+
+Unlike the other supertypes this one declares **fields only, no hooks**. `build_simulation` is
+generic over the whole `FjordConfig` rather than over a simulation source, because everything
+dataset-specific — which forcing file, which atmosphere reader — already comes from the other
+configs.
+
+# Fields a subtype provides
+- `results_root`, `output_file`: resolved by `results_path`, the simulation's output file.
+- `architecture`: `:auto`, `:cpu` or `:gpu`, resolved by `simulation_architecture`.
+- `buoyancy`, `closure`, `tracer_advection`, `momentum_advection`, `tracers`,
+  `initial_conditions`, `coriolis`, `sea_ice`, `biogeochemistry`: passed to
+  `coupled_hydrostatic_simulation` as they are.
+- `free_surface_cfl`, `bottom_drag_coefficient`: the grid-dependent components are built from
+  these, since neither can exist before the grid does.
+- `stop_time`, `output_interval`, `progress_interval`, `overwrite_existing`, `time_step_cfl`,
+  `max_time_step`, `max_time_step_change`: run control, read by `build_simulation`.
+
+`FjordSim.Simulations.SimulationConfig` is the built-in implementation.
+"""
+abstract type AbstractSimulationConfig end
 
 """
     bathymetry_path(config)
@@ -187,6 +219,15 @@ unchanged.
 atmosphere_directory(config::AbstractAtmosphereConfig) = joinpath(config.data_root, config.output_directory)
 
 """
+    results_path(config)
+
+Resolve `config.output_file` against `config.results_root`: the file the simulation writes its
+snapshots to. Results are rooted separately from the input data, which is why this reads
+`results_root` rather than `data_root`. An absolute `output_file` is returned unchanged.
+"""
+results_path(config::AbstractSimulationConfig) = joinpath(config.results_root, config.output_file)
+
+"""
     FjordConfig
 
 Complete setup configuration for one fjord, as returned by the setup functions in
@@ -203,6 +244,8 @@ functions taking it are untouched. Each instantiation still has concrete field t
 - `forcing_config`: any `AbstractForcingConfig`.
 - `atmosphere_config`: any `AbstractAtmosphereConfig`, or `nothing` for a setup that prepares no
   atmosphere. Defaults to `nothing`, so a setup opts in by naming one.
+- `simulation_config`: any `AbstractSimulationConfig`, or `nothing` for a setup that is only
+  prepared and not run. Defaults to `nothing`, so a setup opts in by naming one.
 
 # Example
 
@@ -219,11 +262,13 @@ Base.@kwdef mutable struct FjordConfig{
     B<:AbstractBathymetryConfig,
     F<:AbstractForcingConfig,
     A,
+    S,
 }
     grid_config::G
     bathymetry_config::B
     forcing_config::F
     atmosphere_config::A = nothing
+    simulation_config::S = nothing
 end
 
 end  # module Configs

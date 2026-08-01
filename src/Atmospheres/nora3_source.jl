@@ -203,6 +203,22 @@ function validate_regular_axis(values, name)
     return nothing
 end
 
+"""
+    prescribed_atmosphere(config::NORA3Config, architecture)
+    prescribed_radiation(config::NORA3Config, architecture)
+
+Read the setup's own prepared NORA3 file back at simulation time.
+
+`MultiYearNORA3(config)` resolves `atmosphere_path(config)` rather than the shared
+`~/FjordSim_data/NORA3/NORA3.nc` the bare constructors default to, and errors naming
+`prepare_atmosphere` if that file is missing — so neither method needs its own check.
+"""
+prescribed_atmosphere(config::NORA3Config, architecture) =
+    NORA3PrescribedAtmosphere(architecture; dataset = MultiYearNORA3(config))
+
+prescribed_radiation(config::NORA3Config, architecture) =
+    NORA3PrescribedRadiation(architecture; dataset = MultiYearNORA3(config))
+
 # --- Download ---
 
 """

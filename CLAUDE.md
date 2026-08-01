@@ -6,7 +6,7 @@
 # Run all tests
 julia --project test/runtests.jl
 
-# Run the Oslofjord example simulation (requires GPU + data files)
+# Run the Oslofjord example simulation (requires GPU + data files); same as run_simulation below
 julia --project examples/oslofjord.jl
 
 # Prepare bathymetry for a configured fjord (downloads the Geonorge GDB on first use)
@@ -26,6 +26,9 @@ julia --project -m FjordSim download_atmosphere --config oslofjorden
 
 # Regrid the downloaded atmosphere onto a regular lon/lat grid (needs the download first)
 julia --project -m FjordSim prepare_atmosphere --config oslofjorden
+
+# Build and run the coupled simulation (needs every prepare step the setup configures, plus a GPU)
+julia --project -m FjordSim run_simulation --config oslofjorden
 
 # The subcommands and the setups they accept
 julia --project -m FjordSim --help
@@ -52,6 +55,10 @@ using Debugger        # step through a step
 @enter prepare_forcing(config)
 ```
 
+`run_simulation` is the exception with a second entry point: `build_simulation(config)` returns
+the assembled `Simulation` without starting it, which is what to reach for in the REPL or the
+debugger.
+
 ## Architecture
 
 FjordSim is a Julia package that wraps [Oceananigans.jl](https://github.com/CliMA/Oceananigans.jl) and [NumericalEarth.jl](https://github.com/NumericalEarth/NumericalEarth.jl) to set up regional ocean simulations of Norwegian fjords.
@@ -60,18 +67,25 @@ A simulation is assembled from a grid, a bathymetry file, forcing, and atmospher
 modules, in `include` order from `src/FjordSim.jl`:
 
 1. **Configs** (`src/Configs.jl`) — the abstract supertypes `AbstractGridConfig`,
-   `AbstractBathymetryConfig`, `AbstractForcingConfig`, `AbstractRiverConfig` and
-   `AbstractAtmosphereConfig`, plus `FjordConfig`, which holds a grid, bathymetry, forcing and
-   atmosphere config (parametrically, so every instantiation stays concretely typed).
-   `atmosphere_config` defaults to `nothing`, so a setup opts in by naming one. A river config
-   hangs off the forcing config's `rivers` field instead, where `nothing` means the setup has no
-   rivers. A new grid, bathymetry source, forcing dataset, river dataset or atmosphere dataset is
+   `AbstractBathymetryConfig`, `AbstractForcingConfig`, `AbstractRiverConfig`,
+   `AbstractAtmosphereConfig` and `AbstractSimulationConfig`, plus `FjordConfig`, which holds a
+   grid, bathymetry, forcing, atmosphere and simulation config (parametrically, so every
+   instantiation stays concretely typed). `atmosphere_config` and `simulation_config` default to
+   `nothing`, so a setup opts in by naming one. A river config hangs off the forcing config's
+   `rivers` field instead, where `nothing` means the setup has no rivers. A new grid, bathymetry
+   source, forcing dataset, river dataset or atmosphere dataset is
    added by subtyping the matching supertype and overloading methods on it — `FjordConfig` and its
    callers are untouched. The path helpers defined on the supertypes live here too, so a new
    source inherits them without loading the built-in source's module: `bathymetry_path`,
    `forcing_path`, `forcing_directory`, `river_forcing_path`, `atmosphere_path`,
-   `atmosphere_directory`, and `plot_path` (one method per supertype). Each supertype's docstring
-   lists the fields and hook methods a subtype must provide — see "Adding a new source" below.
+   `atmosphere_directory`, `results_path`, and `plot_path` (one method per supertype). Each
+   supertype's docstring lists the fields and hook methods a subtype must provide — see "Adding a
+   new source" below.
+
+   `AbstractSimulationConfig` is the one supertype with fields but no hooks: `build_simulation` is
+   generic over the whole `FjordConfig`, because everything dataset-specific already comes from
+   the other configs. It is also the only one rooted at a `results_root` rather than a
+   `data_root`, being the only config that writes rather than reads.
 
 2. **Dataset adapters** (`src/Datasets.jl`) — `ForcingDataset` and `ResultsDataset` are NumericalEarth
    dataset wrappers for local FjordSim NetCDF files (forcing inputs and simulation outputs),
@@ -260,7 +274,48 @@ modules, in `include` order from `src/FjordSim.jl`:
    returns an `ImmersedBoundaryGrid` wrapping a `LatitudeLongitudeGrid` with `PartialCellBottom`.
    The loader still accepts legacy files with positive depths or swapped `lon`/`lat` axes.
 
-10. **Setups** (`src/Setups/Setups.jl` registry, one lowercase file per fjord beside it) — the
+10. **Simulations** (`src/Simulations.jl`) — `SimulationConfig <: AbstractSimulationConfig`, the
+    `build_simulation`/`run_simulation` drivers, and `coupled_hydrostatic_simulation`, which
+    assembles a `HydrostaticFreeSurfaceModel` inside an `OceanSeaIceModel` (NumericalEarth) and
+    returns a `Simulation`. Included after `Grids`, which it reads the grid back through, and
+    before `Setups`, which constructs a `SimulationConfig`.
+
+    `coupled_hydrostatic_simulation` lives here rather than in `src/FjordSim.jl` for that ordering
+    reason: a function defined after the `include` block cannot be imported by a module included
+    inside it. Its 15-positional signature is unchanged by the move, and `FjordSim` still exports
+    it.
+
+    `SimulationConfig`'s fields split three ways, and the split is forced rather than stylistic.
+    `buoyancy`, `closure`, `tracer_advection`, `momentum_advection`, `tracers`,
+    `initial_conditions`, `coriolis`, `sea_ice` and `biogeochemistry` depend on neither the grid
+    nor the device, so they are stored as the objects `coupled_hydrostatic_simulation` consumes —
+    one type parameter each, nine in total, which is the cost of the no-abstract-fields rule. A
+    tenth is the signal to collapse them into one `NamedTuple` field instead of adding another,
+    which the "Simulation config" testset guards with an exact parameter count.
+    `free_surface_cfl` and `bottom_drag_coefficient` are scalars because
+    `SplitExplicitFreeSurface` and `top_bottom_boundary_conditions` both need the grid.
+    `architecture` is a `Symbol` for the same reason as the forcing config's, and
+    `simulation_architecture` resolves it by reusing `interpolation_architecture`'s `Val` methods.
+
+    No field has a default, deliberately, which is the one place `SimulationConfig` departs from
+    the other configs: a defaulted closure or coriolis would be one fjord's physics quietly
+    applied to another's. The setup file is the complete statement of the run.
+
+    Three things are deliberately *not* fields, because they are already stated elsewhere and a
+    second copy could only disagree: the forcing file (`simulation_forcing_path` takes the
+    rivers-augmented copy when the forcing config names rivers, the plain prepared file
+    otherwise), the open boundary (`open_boundary_conditions` puts it on the velocity normal to
+    the forcing config's `relaxation_edge`), and the atmosphere (the `prescribed_atmosphere` and
+    `prescribed_radiation` hooks on `config.atmosphere_config`).
+
+    `build_simulation` returns the instrumented `Simulation` without running it — the REPL and
+    debugger entry point — and `run_simulation` calls it and `run!`. Both return `nothing` for a
+    setup naming no simulation config. Each prerequisite is checked before anything is read or
+    allocated and reported as the command that produces it; the atmosphere is the exception,
+    because `MultiYearNORA3(config)` already owns that error, which is what keeps the module free
+    of any named dataset.
+
+11. **Setups** (`src/Setups/Setups.jl` registry, one lowercase file per fjord beside it) — the
     built-in fjords, each a zero-arg function returning a fresh `FjordConfig`: `oslofjorden()`,
     `drammensfjorden()`. `SETUPS` maps a name to its function, `setup_names()` lists them sorted,
     and `fjord_config(name_or_path)` resolves either a registered name or a path to an out-of-tree
@@ -273,15 +328,13 @@ modules, in `include` order from `src/FjordSim.jl`:
     `native_region!` edits the bathymetry config, so a shared instance would leak state between
     steps.
 
-11. **CLI** (`src/CLI.jl`) — `SUBCOMMANDS` maps each subcommand to the driver it calls, one `USAGE`
+12. **CLI** (`src/CLI.jl`) — `SUBCOMMANDS` maps each subcommand to the driver it calls, one `USAGE`
     string, a pure `parse_arguments` returning `(; subcommand, config, help)` and throwing
     `ArgumentError`, and `main(args)` returning a process exit code. Included last, since it names
     every driver and every setup. `parse_arguments` deliberately does not `exit`: printing and exit
     codes live in `main`, which keeps the help path testable.
 
-12. **Top-level** (`src/FjordSim.jl`) — re-exports the public API, defines
-    `coupled_hydrostatic_simulation`, which assembles a `HydrostaticFreeSurfaceModel` inside an
-    `OceanSeaIceModel` (NumericalEarth) and returns a `Simulation`, and defines `main` plus a bare
+13. **Top-level** (`src/FjordSim.jl`) — re-exports the public API and defines `main` plus a bare
     `@main` for `julia -m FjordSim`. Also patches `compute_bounding_indices` from NumericalEarth to
     prevent off-by-one errors with custom longitude/latitude grids.
 
@@ -344,6 +397,14 @@ Atmosphere — `AbstractAtmosphereConfig`, consumed by `prepare_atmosphere`:
 | `atmosphere_source_grid(config, filepath)` → source grid, e.g. `ProjectedAtmosphereGrid` | yes |
 | `atmosphere_variable_names(config)` → `Dict` downloaded name => prepared name | yes |
 | `download_atmosphere(target_grid, config)` | only if it downloads |
+| `prescribed_atmosphere(config, architecture)` → `PrescribedAtmosphere` | only if the setup is simulated |
+| `prescribed_radiation(config, architecture)` → `PrescribedRadiation` | only if the setup is simulated |
+
+The last two are the read side, consumed by `build_simulation` rather than `prepare_atmosphere`,
+and are what keep `Simulations` from naming a dataset. They take no float type on purpose: both
+NumericalEarth constructors default to `Float32`, and passing `Oceananigans.defaults.FloatType`
+would silently promote the atmosphere to `Float64`. A `nothing` atmosphere config yields `nothing`
+for both.
 
 The prepared variable names and units are *not* a hook — they are fixed by the read side in
 `ATMOSPHERE_VARIABLES`. A source whose download already normalizes names (as NORA3's does, since
@@ -351,10 +412,15 @@ five of its eight variables are derived rather than copied) returns the identity
 core's `grid_rotation_angle` and `rotate_to_east_north` are available to any adapter whose source
 gives wind relative to its own grid axes.
 
+Simulation — `AbstractSimulationConfig`, consumed by `build_simulation`: **no hooks**. It is data
+only, read field by field, so an alternative simulation config is a subtype supplying the field
+set its docstring lists. It inherits `results_path`.
+
 Required fields are listed in each supertype's docstring in `src/Configs.jl`. Path resolution
 (`bathymetry_path`, `forcing_path`, `forcing_directory`, `river_forcing_path`, `atmosphere_path`,
-`atmosphere_directory`, `plot_path`) and the plots come for free. A missing required hook surfaces
-as a `MethodError` naming it, which the "Config extensibility" testset asserts.
+`atmosphere_directory`, `results_path`, `plot_path`) and the plots come for free. A missing
+required hook surfaces as a `MethodError` naming it, which the "Config extensibility" testset
+asserts.
 
 ## Setups
 
@@ -372,21 +438,27 @@ absolute path relocates just that file — which is how a single FileGDB copy is
 A nested config carries its own `data_root` too, so it can be relocated independently, but
 `oslofjorden()` gives its `OF800RiversConfig` the same `data_root` as the rest of the setup —
 the river data downloads there rather than being shared from elsewhere. `drammensfjorden()`
-names no `rivers`, so it defaults to `nothing` and the rivers step is a no-op — and it names no
-`atmosphere_config` either, which defaults to `nothing` and makes both atmosphere steps no-ops the
-same way.
+names no `rivers`, so it defaults to `nothing` and the rivers step is a no-op — and it names
+neither an `atmosphere_config` nor a `simulation_config` either, which default to `nothing` and
+make both atmosphere steps and `run_simulation` no-ops the same way.
 
-Each preparation step is a `FjordConfig` method on the generic function of the same name —
+The simulation config is rooted separately, at `~/FjordSim_results/<fjord>/` rather than under
+`data_root`, since it writes rather than reads. Unlike every other config, `SimulationConfig` has
+**no defaults at all**: `oslofjorden()` names all 21 fields, because each is a scientific choice
+about that fjord and a default would let the next setup silently inherit it. Adding a field to
+`SimulationConfig` therefore breaks every setup until each names it, which is the intent.
+
+Each step is a `FjordConfig` method on the generic function of the same name —
 `prepare_bathymetry`, `download_forcing`, `prepare_forcing`, `add_rivers`, `download_atmosphere`,
-`prepare_atmosphere` — living beside the pipeline it drives. Each builds the grid, checks the step
-before it has run, calls the generic pipeline, plots, and logs where the output went. A step the
-setup opts out of returns `nothing` rather than raising, matching the `::Nothing` methods of the
-lower arities; "you asked for a step this setup does not configure" is reported by `CLI.main`,
-because that is user input rather than a pipeline condition.
+`prepare_atmosphere`, `run_simulation` — living beside the pipeline it drives. Each builds the
+grid, checks the step before it has run, calls the generic pipeline, plots, and logs where the
+output went. A step the setup opts out of returns `nothing` rather than raising, matching the
+`::Nothing` methods of the lower arities; "you asked for a step this setup does not configure" is
+reported by `CLI.main`, because that is user input rather than a pipeline condition.
 
-`examples/oslofjord.jl` is the end-to-end simulation script and does *not* go through
-`FjordConfig`; it builds the grid straight from a bathymetry NetCDF and wires the components
-together by hand.
+`examples/oslofjord.jl` is the end-to-end simulation script and is now just
+`run_simulation(oslofjorden())` — everything it used to wire by hand is the setup's
+`SimulationConfig`.
 
 ## GPU & Kernel Compatibility
 
@@ -443,8 +515,15 @@ forcings.
 - `Pkg.resolve()` currently fails in this environment on an unrelated pinned `CUDACore` version.
   Adding a `[deps]` entry for a package already in `Manifest.toml` works without resolving; do not
   try to fix the resolve failure as a side effect.
+- `Base.@kwdef` on a *parametric* struct does not convert its arguments, unlike on a
+  non-parametric one: the generated constructor keeps the declared field types in its signature,
+  so `SimulationConfig(stop_time = 3600, ...)` is a `MethodError` where `stop_time = 1hour` is
+  fine. Every `Oceananigans.Units` constant is already a `Float64`, so writing durations with
+  them — `365days`, `1hour`, `3minutes` — sidesteps this. Every other config is non-parametric
+  and so has never hit it.
 
 ## Key conventions
 
 - Bathymetry convention: `h < 0` = below sea level (bottom height), `h >= 0` = land.
-- Data files default to `~/FjordSim_data/` and results to `~/FjordSim_results/`.
+- Data files default to `~/FjordSim_data/<fjord>/` and results to `~/FjordSim_results/<fjord>/`,
+  the latter from the simulation config's `results_root`.

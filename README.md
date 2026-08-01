@@ -147,10 +147,15 @@ pipeline is one generic function plus a handful of dispatch points:
 | Grid | — | `LatitudeLongitudeGrid(architecture, config)` |
 | Bathymetry | `prepare_bathymetry(target_grid, config)` | `bathymetry_dataset(target_grid, config)`; optionally `regrid_options(config)` |
 | Forcing | `prepare_forcing(target_grid, config)`, `download_forcing(config)` | `forcing_time_steps`, `forcing_source_grid`, `forcing_variable_names`; `download_forcing(target_grid, config)` if it downloads |
+| Simulation | `build_simulation(config)`, `run_simulation(config)` | none — `AbstractSimulationConfig` is fields only |
 
-Path resolution (`bathymetry_path`, `forcing_path`, `forcing_directory`, `plot_path`) and the
-diagnostic plots (`plot_bathymetry`, `plot_forcing`) are defined on the supertypes, so a new
-source inherits them. `src/Bathymetry/geonorge.jl` and `src/Forcing/norkyst.jl` are the built-in
+`AbstractAtmosphereConfig` additionally has two read-side hooks, `prescribed_atmosphere(config,
+architecture)` and `prescribed_radiation(config, architecture)`, which is how the simulation
+reads a prepared atmosphere without naming a dataset.
+
+Path resolution (`bathymetry_path`, `forcing_path`, `forcing_directory`, `results_path`,
+`plot_path`) and the diagnostic plots (`plot_bathymetry`, `plot_forcing`) are defined on the
+supertypes, so a new source inherits them. `src/Bathymetry/geonorge.jl` and `src/Forcing/norkyst.jl` are the built-in
 adapters and the templates to copy; each supertype's docstring in `src/Configs.jl` lists the
 fields and hooks it expects.
 
@@ -180,6 +185,9 @@ julia --project -m FjordSim add_rivers --config oslofjorden
 julia --project -m FjordSim download_atmosphere --config oslofjorden
 julia --project -m FjordSim prepare_atmosphere --config oslofjorden
 
+# Simulation: builds and runs the coupled model, writing NetCDF snapshots to the results directory
+julia --project -m FjordSim run_simulation --config oslofjorden
+
 # All of the above, with the setups they accept
 julia --project -m FjordSim --help
 ```
@@ -196,25 +204,51 @@ prepare_forcing(config)
 ```
 
 A step the setup does not configure — `add_rivers` on a setup with no rivers, the atmosphere steps
-on a setup with no atmosphere — does nothing rather than failing.
+on a setup with no atmosphere, `run_simulation` on a setup with no simulation config — does
+nothing rather than failing.
 
 The forcing config's `architecture` field decides where the regridding interpolation runs:
 `:auto` (the default) uses the GPU when one is usable and the CPU otherwise, so the same config
 works on a compute node and a laptop; `:cpu` and `:gpu` pin it, and `:gpu` errors rather than
 silently falling back to a ~12x slower CPU run.
 
-## Run an example Oslofjord simulation
+## Run a simulation
 
-1. Download the [grid, forcing, atmospheric forcing](https://www.dropbox.com/scl/fo/gc3yc155b5eohi7998wgh/AGN2Yt3HyQ0LlZGImpcca6o?rlkey=x6okc3uxe2avud6sbxgd00l14&st=093llyqp&dl=0).
-2. In `FjordSim.jl/examples/oslofjord.jl` it is possible to specify the location of the input data files.
-By default, the files should be in `$HOME/FjordSim_data/oslofjord/` and `$HOME/FjordSim_data/JRA55/` or `$HOME/FjordSim_data/NORA3/`.
-Also, it is possible to specify the results folder destination.
-By default, the result will go to `$HOME/FjordSim_results/oslofjord/`.
-3. Run `julia --project examples/oslofjord.jl`.
-This will generate a netcdf results file.
+Once every step the setup configures has run, `run_simulation` builds the coupled model from the
+setup's own prepared files and runs it:
 
-The example does not go through `FjordConfig`: it builds the grid straight from a bathymetry
-NetCDF and wires the components together by hand.
+```bash
+julia --project -m FjordSim run_simulation --config oslofjorden
+```
+
+or, equivalently, `julia --project examples/oslofjord.jl`. Snapshots go to the simulation config's
+`results_root`, `$HOME/FjordSim_results/oslofjorden/` for the built-in Oslofjord setup — separate
+from the input data root.
+
+Everything the run needs comes from the setup: the grid from the processed bathymetry, the forcing
+from the rivers-augmented file when the setup names rivers and the plain prepared file otherwise,
+and the atmosphere from the file `prepare_atmosphere` wrote. A missing prerequisite is reported as
+the command that produces it. The simulation config's `architecture` field selects the device, the
+same `:auto`/`:cpu`/`:gpu` as the forcing config's.
+
+To inspect or step through the assembly instead of running it, build the simulation without
+starting it:
+
+```julia
+using FjordSim
+simulation = build_simulation(oslofjorden())
+run!(simulation)
+```
+
+What the simulation is made of — the buoyancy, the closure, the advection schemes, the tracers,
+the initial conditions, the coriolis, the sea ice, the run length, the output interval and the
+time-step wizard settings — is the `SimulationConfig` in `src/Setups/oslofjorden.jl`.
+`SimulationConfig` has no defaults, so that block is the whole story: every knob is stated there,
+and omitting one is an `UndefKeywordError` naming it rather than a silently inherited value.
+
+The grid, forcing and atmospheric forcing for the Oslofjord are also available
+[here](https://www.dropbox.com/scl/fo/gc3yc155b5eohi7998wgh/AGN2Yt3HyQ0LlZGImpcca6o?rlkey=x6okc3uxe2avud6sbxgd00l14&st=093llyqp&dl=0)
+if you would rather not run the preparation steps yourself.
 
 Further preparation scripts for the Oslofjord are available in the following repository:
 [https://github.com/NIVANorge/oslofjord-sim](https://github.com/NIVANorge/oslofjord-sim)

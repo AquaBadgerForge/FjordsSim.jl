@@ -45,6 +45,11 @@ struct MinimalAtmosphere <: AbstractAtmosphereConfig
     padding::Float64
 end
 
+struct MinimalSimulation <: AbstractSimulationConfig
+    results_root::String
+    output_file::String
+end
+
 # A river config the "Add rivers round-trip" testset drives `add_rivers` with, standing in for a
 # real dataset: fixed outlets and a value that counts up in time, so a misplaced write is
 # visible.
@@ -82,6 +87,7 @@ FjordSim.Forcing.forcing_variable_names(config::ConstantForcing) = Dict("tempera
         :AbstractBathymetryConfig,
         :AbstractForcingConfig,
         :AbstractRiverConfig,
+        :AbstractSimulationConfig,
         :EvenGrid,
         :DybdedataConfig,
         :NorKystConfig,
@@ -138,6 +144,14 @@ FjordSim.Forcing.forcing_variable_names(config::ConstantForcing) = Dict("tempera
         :setup_names,
         :oslofjorden,
         :drammensfjorden,
+        # simulation
+        :SimulationConfig,
+        :build_simulation,
+        :run_simulation,
+        :simulation_architecture,
+        :results_path,
+        :prescribed_atmosphere,
+        :prescribed_radiation,
     ]
 
     for sym in exported_symbols
@@ -156,6 +170,11 @@ FjordSim.Forcing.forcing_variable_names(config::ConstantForcing) = Dict("tempera
         (:Datasets, :last_date),
         (:Setups, :fjord_config),
         (:Setups, :setup_names),
+        (:Simulations, :SimulationConfig),
+        (:Simulations, :run_simulation),
+        # Moved out of FjordSim.jl into Simulations; still re-exported, so the entry above in
+        # `exported_symbols` and this one together pin both halves of that move.
+        (:Simulations, :coupled_hydrostatic_simulation),
         (:CLI, :parse_arguments),
     ]
 
@@ -166,7 +185,9 @@ FjordSim.Forcing.forcing_variable_names(config::ConstantForcing) = Dict("tempera
 
     @test isdefined(FjordSim, :Bathymetry)
     @test isdefined(FjordSim, :Setups)
+    @test isdefined(FjordSim, :Simulations)
     @test isdefined(FjordSim, :CLI)
+    @test parentmodule(coupled_hydrostatic_simulation) === FjordSim.Simulations
 end
 
 @testset "Backward Compatibility — Function Signatures" begin
@@ -508,10 +529,15 @@ end
     @test oslo.forcing_config.rivers.data_root == oslo.forcing_config.data_root
     @test atmosphere_path(oslo.atmosphere_config) ==
           joinpath(oslo.atmosphere_config.data_root, "atmosphere.nc")
+    # Results are rooted separately from the input data, so `results_root` is its own path.
+    @test oslo.simulation_config isa SimulationConfig
+    @test results_path(oslo.simulation_config) ==
+          joinpath(homedir(), "FjordSim_results", "oslofjorden", "snapshots_ocean.nc")
 
     drammen = drammensfjorden()
     @test isnothing(drammen.forcing_config.rivers)     # so add_rivers is a no-op for it
     @test isnothing(drammen.atmosphere_config)         # ...and so are both atmosphere steps
+    @test isnothing(drammen.simulation_config)         # ...and so is run_simulation
 end
 
 @testset "CLI" begin
@@ -546,6 +572,7 @@ end
         "add_rivers",
         "download_atmosphere",
         "prepare_atmosphere",
+        "run_simulation",
     ]
     for name in subcommands
         @test occursin(name, FjordSim.CLI.USAGE)  # the usage text cannot drift from the table
@@ -582,6 +609,10 @@ end
         @test isnothing(add_rivers(config))
         @test isnothing(prepare_atmosphere(config))
         @test isnothing(download_atmosphere(config))
+        # Both return on the `nothing` simulation config, before any prerequisite is checked, so
+        # neither touches the empty temporary root.
+        @test isnothing(build_simulation(config))
+        @test isnothing(run_simulation(config))
         @test FjordSim.main(["add_rivers", "--config", joinpath(tmp, "unused.jl")]) == 2
     end
 end
@@ -626,6 +657,97 @@ end
     end
 end
 
+@testset "Simulation config" begin
+    open_boundary_conditions = FjordSim.Simulations.open_boundary_conditions
+    simulation_forcing_path = FjordSim.Simulations.simulation_forcing_path
+
+    # No field has a default, so every one of them is named by the setup and omitting any is an
+    # UndefKeywordError rather than a plausible-looking run. `results_root` is the last one left,
+    # so dropping it from an otherwise complete argument set still fails.
+    fields = Dict(name => getfield(oslofjorden().simulation_config, name)
+                  for name in fieldnames(SimulationConfig))
+    @test_throws UndefKeywordError SimulationConfig(; delete!(copy(fields), :results_root)...)
+    @test_throws UndefKeywordError SimulationConfig(; delete!(copy(fields), :coriolis)...)
+    @test_throws UndefKeywordError SimulationConfig(; delete!(copy(fields), :tracer_advection)...)
+    @test_throws UndefKeywordError SimulationConfig(; delete!(copy(fields), :stop_time)...)
+    @test_throws UndefKeywordError SimulationConfig()
+
+    config = oslofjorden().simulation_config
+    @test config isa AbstractSimulationConfig
+    @test isconcretetype(typeof(config))
+    @test all(isconcretetype, fieldtypes(typeof(config)))
+    # One parameter per prebuilt Oceananigans component. A tenth is the signal to collapse them
+    # into a single `NamedTuple` field instead of adding another.
+    @test length(typeof(config).parameters) == 9
+
+    # The device is a Symbol, not a live CPU()/GPU(), so a setup file loads without a GPU.
+    @test fieldtype(typeof(config), :architecture) === Symbol
+    @test results_path(config) ==
+          joinpath(homedir(), "FjordSim_results", "oslofjorden", "snapshots_ocean.nc")
+    config.output_file = "/elsewhere/run.nc"      # an absolute path relocates just that file
+    @test results_path(config) == "/elsewhere/run.nc"
+
+    # The values Oslofjord runs with, stated in the setup rather than inherited. Durations are
+    # seconds, and must be Float64 — @kwdef on a parametric struct does not convert.
+    @test config.tracers == (:T, :S)
+    @test config.initial_conditions == (T = 5.0, S = 33.0)
+    @test isnothing(config.biogeochemistry)
+    @test config.architecture == :auto
+    @test config.stop_time == 365 * 24 * 3600.0
+    @test config.output_interval == 3600.0
+    @test config.max_time_step == 180.0
+
+    # Architecture resolution shares `interpolation_architecture`'s Val methods, so :cpu pins the
+    # CPU and an unknown selector is rejected rather than silently defaulted.
+    config.architecture = :cpu
+    @test simulation_architecture(config) isa CPU
+    config.architecture = :tpu
+    @test_throws ArgumentError simulation_architecture(config)
+
+    # The open boundary is derived from the forcing config's `relaxation_edge`, on the velocity
+    # normal to that edge, so the two cannot drift apart.
+    @test keys(open_boundary_conditions(Val(:south))) == (:v,)
+    @test keys(open_boundary_conditions(Val(:south)).v) == (:south,)
+    @test keys(open_boundary_conditions(Val(:north))) == (:v,)
+    @test keys(open_boundary_conditions(Val(:west))) == (:u,)
+    @test keys(open_boundary_conditions(Val(:east)).u) == (:east,)
+    @test_throws ArgumentError open_boundary_conditions(Val(:middle))
+
+    # A setup that configures rivers simulates the rivers-augmented copy, never the pre-rivers
+    # file; one with no rivers reads what prepare_forcing wrote.
+    oslo = oslofjorden()
+    @test simulation_forcing_path(oslo) == river_forcing_path(oslo.forcing_config.rivers)
+    drammen = drammensfjorden()
+    @test simulation_forcing_path(drammen) == forcing_path(drammen.forcing_config)
+
+    # Every prerequisite is reported as the command that produces it, and both checks run before
+    # anything is read or allocated, so the temporary root stays empty apart from the stub.
+    mktempdir() do tmp
+        config = oslofjorden()
+        config.bathymetry_config.data_root = tmp
+        config.forcing_config.data_root = tmp
+        config.forcing_config.rivers.data_root = tmp
+
+        @test_throws "prepare_bathymetry" build_simulation(config)
+
+        touch(bathymetry_path(config.bathymetry_config))
+        @test_throws "add_rivers" build_simulation(config)
+
+        # ...and a setup with no rivers names prepare_forcing instead. Assembled rather than
+        # mutated, because `rivers` is a type parameter of NorKystConfig and cannot be unset.
+        without_rivers = drammensfjorden()
+        no_rivers = FjordConfig(
+            grid_config = without_rivers.grid_config,
+            bathymetry_config = config.bathymetry_config,
+            forcing_config = without_rivers.forcing_config,
+            simulation_config = config.simulation_config,
+        )
+        no_rivers.forcing_config.data_root = tmp
+        @test isnothing(no_rivers.forcing_config.rivers)
+        @test_throws "prepare_forcing" build_simulation(no_rivers)
+    end
+end
+
 @testset "Config extensibility" begin
     data_root = joinpath(tempdir(), "fjordsim_extensibility_test")
 
@@ -642,6 +764,7 @@ end
             0.05,
             0.1,
         ),
+        simulation_config = MinimalSimulation(data_root, "column_snapshots.nc"),
     )
     rivers = MinimalRivers(data_root, "column_rivers.nc", 3600.0, 10)
 
@@ -649,12 +772,14 @@ end
     @test config.bathymetry_config isa AbstractBathymetryConfig
     @test config.forcing_config isa AbstractForcingConfig
     @test config.atmosphere_config isa AbstractAtmosphereConfig
+    @test config.simulation_config isa AbstractSimulationConfig
     @test rivers isa AbstractRiverConfig
 
     # Field types are still concrete, so the struct stays type-stable per instantiation.
     @test isconcretetype(typeof(config))
     @test fieldtype(typeof(config), :grid_config) === SingleColumnGrid
     @test fieldtype(typeof(config), :atmosphere_config) === MinimalAtmosphere
+    @test fieldtype(typeof(config), :simulation_config) === MinimalSimulation
 
     # ...and the built-in types remain valid, i.e. FjordConfig is genuinely generic.
     @test FjordConfig(
@@ -688,6 +813,8 @@ end
     @test atmosphere_path(config.atmosphere_config) == joinpath(data_root, "column_atmosphere.nc")
     @test atmosphere_directory(config.atmosphere_config) == joinpath(data_root, "column_source")
     @test plot_path(config.atmosphere_config) == joinpath(data_root, "column_atmosphere.png")
+    # The simulation config resolves against `results_root`, being the one config that writes.
+    @test results_path(config.simulation_config) == joinpath(data_root, "column_snapshots.nc")
 
     # `river_search_radius` is the river pipeline's one optional hook.
     @test river_search_radius(rivers) == 10
@@ -716,6 +843,10 @@ end
     @test_throws MethodError atmosphere_source_grid(config.atmosphere_config, "unused.nc")
     @test_throws MethodError atmosphere_variable_names(config.atmosphere_config)
     @test_throws MethodError prepare_atmosphere(grid, config.atmosphere_config)
+    # The two read-side atmosphere hooks are missing the same way, so a source that prepares a
+    # file but cannot be simulated says which methods it still owes.
+    @test_throws MethodError prescribed_atmosphere(config.atmosphere_config, CPU())
+    @test_throws MethodError prescribed_radiation(config.atmosphere_config, CPU())
 
     # A forcing config carrying no rivers skips the step rather than needing a river dataset.
     @test isnothing(add_rivers(grid, config.forcing_config))
@@ -724,6 +855,8 @@ end
     # `atmosphere_config` defaults to `nothing`.
     @test isnothing(prepare_atmosphere(grid, nothing))
     @test isnothing(download_atmosphere(grid, nothing))
+    @test isnothing(prescribed_atmosphere(nothing, CPU()))
+    @test isnothing(prescribed_radiation(nothing, CPU()))
     bare = FjordConfig(
         grid_config = SingleColumnGrid(120.0),
         bathymetry_config = MinimalBathymetry(data_root, "column.nc", "column.png"),
@@ -731,6 +864,10 @@ end
     )
     @test isnothing(bare.atmosphere_config)
     @test isnothing(download_atmosphere(bare))
+    # ...and the same for a setup that is only prepared and never run.
+    @test isnothing(bare.simulation_config)
+    @test isnothing(build_simulation(bare))
+    @test isnothing(run_simulation(bare))
 
     # `atmosphere_target_axes` is generic over the grid config: it reads the domain through
     # `x_domain`/`y_domain`, so the stub grid works, and both axes must come out uniformly spaced

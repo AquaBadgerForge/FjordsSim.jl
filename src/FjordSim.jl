@@ -11,6 +11,7 @@ export
     AbstractForcingConfig,
     AbstractRiverConfig,
     AbstractAtmosphereConfig,
+    AbstractSimulationConfig,
     # generic entry points
     prepare_bathymetry,
     prepare_forcing,
@@ -19,8 +20,11 @@ export
     download_rivers,
     prepare_atmosphere,
     download_atmosphere,
+    build_simulation,
+    run_simulation,
     forcing_from_file,
     interpolation_architecture,
+    simulation_architecture,
     plot_bathymetry,
     plot_forcing,
     plot_atmosphere,
@@ -31,6 +35,7 @@ export
     river_forcing_path,
     atmosphere_path,
     atmosphere_directory,
+    results_path,
     plot_path,
     # extension hooks a new config subtype overloads
     bathymetry_dataset,
@@ -46,6 +51,8 @@ export
     atmosphere_source_grid,
     atmosphere_variable_names,
     atmosphere_target_axes,
+    prescribed_atmosphere,
+    prescribed_radiation,
     ProjectedSourceGrid,
     ProjectedAtmosphereGrid,
     RiverLocation,
@@ -61,6 +68,7 @@ export
     NorKystConfig,
     OF800RiversConfig,
     NORA3Config,
+    SimulationConfig,
     geodatabase_path,
     # boundary conditions
     top_bottom_boundary_conditions,
@@ -116,6 +124,9 @@ include("Atmospheres/Atmospheres.jl")
 include("Forcing/Forcing.jl")
 include("BoundaryConditions.jl")
 include("Grids.jl")
+# Simulations reads the grid back from the processed bathymetry, so it comes after Grids, and
+# Setups builds a SimulationConfig, so it comes before Setups.
+include("Simulations.jl")
 # Setups builds every config type, so it comes after all of them — Grids' EvenGrid included.
 include("Setups/Setups.jl")
 # CLI names every driver and every setup, so it comes last.
@@ -130,53 +141,9 @@ using .Atmospheres
 using .Forcing
 using .BoundaryConditions
 using .Grids
+using .Simulations
 using .Setups
 using .CLI
-
-function coupled_hydrostatic_simulation(
-    grid,
-    buoyancy,
-    closure,
-    tracer_advection,
-    momentum_advection,
-    tracers,
-    initial_conditions,
-    free_surface,
-    coriolis,
-    forcing,
-    boundary_conditions,
-    atmosphere,
-    downwelling_radiation,
-    sea_ice,
-    biogeochemistry;
-    results_dir = joinpath(homedir(), "FjordSim_results"),
-    stop_time = 365days,
-)
-    isdir(results_dir) || mkpath(results_dir)
-
-    println("Start compiling HydrostaticFreeSurfaceModel")
-    ocean_model = HydrostaticFreeSurfaceModel(
-        grid;
-        buoyancy,
-        closure,
-        tracer_advection,
-        momentum_advection,
-        tracers,
-        free_surface,
-        coriolis,
-        forcing,
-        boundary_conditions,
-        biogeochemistry,
-    )
-    println("Done compiling HydrostaticFreeSurfaceModel")
-    set!(ocean_model; initial_conditions...)
-    Δt = 1second
-    ocean_sim = Simulation(ocean_model; Δt, stop_time)
-    coupled_model = OceanSeaIceModel(sea_ice, ocean_sim; atmosphere, radiation = downwelling_radiation)
-    println("Initialized coupled model")
-    coupled_simulation = Simulation(coupled_model; Δt, stop_time)
-    return coupled_simulation
-end  # function coupled_hydrostatic_simulation
 
 """
     main(args)

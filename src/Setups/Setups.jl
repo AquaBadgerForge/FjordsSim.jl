@@ -2,11 +2,24 @@ module Setups
 
 export fjord_config, setup_names, oslofjorden, drammensfjorden
 
+import Oceananigans        # for `Oceananigans.defaults.FloatType`
+using Oceananigans:
+    CATKEVerticalDiffusivity,
+    HydrostaticSphericalCoriolis,
+    SeawaterBuoyancy,
+    WENO,
+    WENOVectorInvariant
+using Oceananigans.TurbulenceClosures: HorizontalScalarBiharmonicDiffusivity
+using Oceananigans.Units: days, hour, minutes
+using SeawaterPolynomials.TEOS10: TEOS10EquationOfState
+using NumericalEarth: FreezingLimitedOceanTemperature
+
 using ..Configs: FjordConfig
 using ..Grids: EvenGrid
 using ..Bathymetry: DybdedataConfig
 using ..Atmospheres: NORA3Config
 using ..Forcing: NorKystConfig, OF800RiversConfig
+using ..Simulations: SimulationConfig
 
 include("oslofjorden.jl")
 include("drammensfjorden.jl")
