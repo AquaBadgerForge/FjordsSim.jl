@@ -615,6 +615,48 @@ end
         @test isnothing(run_simulation(config))
         @test FjordSim.main(["add_rivers", "--config", joinpath(tmp, "unused.jl")]) == 2
     end
+
+    # The tee returns the closure's value — that is how `main` gets its exit code back out — and
+    # captures both streams into one file in the order they were written.
+    mktempdir() do tmp
+        log_file = joinpath(tmp, "tee.log")
+        @test FjordSim.CLI.tee_output(log_file) do
+            println("out-line")
+            println(stderr, "err-line")
+            42
+        end == 42
+
+        logged = read(log_file, String)
+        @test occursin("out-line", logged)
+        @test occursin("err-line", logged)
+    end
+
+    # A step that fails is exit code 1, and its error and backtrace are in the log rather than only
+    # in the terminal's scrollback — which is the whole point of the tee, since a stacktrace through
+    # `SimulationConfig` is long enough to scroll the error message itself away. An out-of-tree
+    # config rooted in `tmp` rather than the registered name, so the assertion does not depend on
+    # whether ~/FjordSim_data/drammensfjorden happens to exist.
+    mktempdir() do tmp
+        config_file = joinpath(tmp, "config.jl")
+        write(
+            config_file,
+            """
+            using FjordSim
+            config = drammensfjorden()
+            config.bathymetry_config.data_root = raw"$tmp"
+            config.forcing_config.data_root = raw"$tmp"
+            config
+            """,
+        )
+
+        cd(tmp) do
+            @test FjordSim.main(["prepare_forcing", "--config", config_file]) == 1
+
+            logged = read(FjordSim.CLI.LOG_FILE, String)
+            @test occursin("Processed bathymetry", logged)
+            @test occursin("Stacktrace", logged)
+        end
+    end
 end
 
 @testset "OF800 rivers config" begin

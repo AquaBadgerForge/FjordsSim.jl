@@ -332,7 +332,30 @@ modules, in `include` order from `src/FjordSim.jl`:
     string, a pure `parse_arguments` returning `(; subcommand, config, help)` and throwing
     `ArgumentError`, and `main(args)` returning a process exit code. Included last, since it names
     every driver and every setup. `parse_arguments` deliberately does not `exit`: printing and exit
-    codes live in `main`, which keeps the help path testable.
+    codes live in `main`, which keeps the help path testable. Exit codes are 0 success, 1 the step
+    failed, 2 bad arguments.
+
+    `main` runs the driver inside `tee_output(f, LOG_FILE)`, which mirrors `stdout` and `stderr` to
+    `fjordsim.log` in the working directory while still printing live to the terminal — a stacktrace
+    through `SimulationConfig` spells out every type parameter and is long enough to push the error
+    message itself out of the scrollback. `redirect_stdio` only accepts fd-backed streams, so the tee
+    is a `Pipe` (needing an explicit `Base.link_pipe!`; an uninitialized `Pipe` throws from `eof`)
+    plus a task copying each chunk to both destinations. Both streams share one pipe, so the log
+    interleaves them in write order.
+
+    Two things about it are load-bearing. The failure is **caught inside** the redirect and reported
+    with `showerror`: an exception left to propagate would be printed by `Base._start` after
+    `tee_output`'s `finally` had torn the redirect down, so the error would be the one thing missing
+    from the log. And only the driver runs inside the tee — parsing, `--help` and config resolution
+    stay outside it, so a usage error leaves no log file behind, which is also why the existing
+    `main` tests (all of which fail before the driver is reached) write nothing.
+
+    The cost is that `stdout` is a `Pipe` during a run, so `displaysize` reports the 24x80 default
+    and wide `show` output (Oceananigans' grid and model summaries) may wrap at 80 columns. Colour
+    survives, since `Base.have_color` is fixed at startup and the raw bytes reach the real terminal.
+    On a single-threaded Julia the reader task only runs when the main task yields, but writing to
+    the pipe is libuv I/O and does yield, and the `finally` waits for the reader to drain, so output
+    can arrive in bursts but is never lost.
 
 13. **Top-level** (`src/FjordSim.jl`) — re-exports the public API and defines `main` plus a bare
     `@main` for `julia -m FjordSim`. Also patches `compute_bounding_indices` from NumericalEarth to

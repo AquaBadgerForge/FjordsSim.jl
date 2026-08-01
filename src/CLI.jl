@@ -89,6 +89,49 @@ command-line surface. The same steps are available from the REPL:
 """
 
 """
+Where a run's transcript goes: a fixed name in the working directory, truncated each run.
+
+Not an option, because `--config` is the whole command-line surface and a log nobody has to
+remember to ask for is the point — a stacktrace through `SimulationConfig` is long enough to push
+the error message itself out of the terminal's scrollback.
+"""
+const LOG_FILE = "fjordsim.log"
+
+"""
+    tee_output(f, log_file)
+
+Run `f` with `stdout` and `stderr` redirected into `log_file`, still printing everything live to the
+real `stdout`, and return whatever `f` returns.
+
+`redirect_stdio` only accepts fd-backed streams, so the tee is a `Pipe` plus a task copying each
+chunk to both destinations. Both streams share one pipe, so the log interleaves them in the order
+they were written.
+"""
+function tee_output(f, log_file)
+    original_stdout = stdout
+
+    return open(log_file, "w") do log_stream
+        pipe = Pipe()
+        Base.link_pipe!(pipe)
+
+        reader = Threads.@spawn while !eof(pipe)
+            chunk = readavailable(pipe)
+            write(original_stdout, chunk)
+            write(log_stream, chunk)
+            flush(log_stream)
+        end
+
+        try
+            return redirect_stdio(f; stdout = pipe, stderr = pipe)
+        finally
+            close(pipe.in)
+            wait(reader)
+            close(pipe)
+        end
+    end
+end
+
+"""
     parse_arguments(args)
 
 Parse one positional subcommand plus `--config SETUP` (or `--config=SETUP`) and `-h`/`--help`.
@@ -133,11 +176,18 @@ end
 """
     main(args)
 
-Run one subcommand and return a process exit code: 0 on success, 2 for bad arguments.
+Run one subcommand and return a process exit code: 0 on success, 1 if the step failed, 2 for bad
+arguments.
 
 A step a setup opts out of — `add_rivers` on a setup with no rivers, the atmosphere steps on a
 setup with no atmosphere — returns `nothing` from the driver and is reported here rather than
 raising, because that is a property of the setup and not a failure.
+
+The driver runs inside `tee_output`, and a failure is caught rather than propagated. Both halves of
+that matter: an exception left to `Base._start` would be printed after the redirect had already been
+torn down, so the error — the one thing worth having in the log — would be the only thing missing
+from it. Parsing, `--help` and config resolution stay outside the tee, so a usage error leaves no
+log file behind.
 """
 function main(args)
     arguments = try
@@ -162,11 +212,21 @@ function main(args)
         return 2
     end
 
-    @info "Setup: $(arguments.config), step: $(arguments.subcommand)"
-    isnothing(driver(config)) &&
-        @info "$(arguments.subcommand) is a no-op for $(arguments.config): the setup does not configure it"
+    @info "Logging to $(abspath(LOG_FILE))"
 
-    return 0
+    return tee_output(LOG_FILE) do
+        @info "Setup: $(arguments.config), step: $(arguments.subcommand)"
+        try
+            isnothing(driver(config)) &&
+                @info "$(arguments.subcommand) is a no-op for $(arguments.config): the setup does not configure it"
+            return 0
+        catch exception
+            println(stderr, "fjordsim: $(arguments.subcommand) failed on $(arguments.config):")
+            showerror(stderr, exception, catch_backtrace())
+            println(stderr)
+            return 1
+        end
+    end
 end
 
 end  # module CLI
