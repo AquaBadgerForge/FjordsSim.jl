@@ -4,6 +4,7 @@ export DybdedataConfig,
     prepare_bathymetry,
     bathymetry_dataset,
     regrid_options,
+    smoothing_options,
     geodatabase_path
 
 using NCDatasets
@@ -13,7 +14,7 @@ using Oceananigans.Architectures: on_architecture
 using Oceananigans.Fields: interior
 using Oceananigans.Grids: x_domain, y_domain, znodes
 using Printf: @printf
-using Statistics: mean
+using Statistics: mean, median
 
 using NumericalEarth.DataWrangling: Metadatum, metadata_path
 
@@ -24,6 +25,12 @@ using ..Plotting: plot_bathymetry
 # post-regrid gap-filling pass.
 const BATHYMETRY_GAP_FILL_PASSES = 10
 const ISOLATED_SEA_CELL_LAND_SIDES = 3
+# A spike needs neighbors to be compared against; two is the minimum that gives a meaningful
+# median and keeps single-cell inlets, which have one wet neighbor, out of it.
+const SPIKE_MIN_WET_NEIGHBOURS = 2
+# `limit_bottom_slope` converges in tens of passes at the slope factors a fjord needs; the cap
+# only exists so a pathological input cannot spin forever.
+const SLOPE_LIMIT_MAX_PASSES = 400
 # NumericalEarth bathymetry regridding constructs a native grid with halo = (10, 10, 1).
 # Keep a generated raw dataset comfortably larger than that minimum.
 const MIN_NATIVE_BATHYMETRY_SIZE = 24
@@ -52,6 +59,16 @@ Defaults to no options, so implementing it is optional.
 """
 regrid_options(config::AbstractBathymetryConfig) = (;)
 
+"""
+    smoothing_options(config)
+
+Named tuple of keyword arguments forwarded to `smooth_bathymetry_gaps!` by `prepare_bathymetry`,
+letting a source expose the post-regrid smoothing knobs as config fields. Defaults to no options,
+which leaves only the topological cleanup every source gets — so implementing it is optional and
+an existing source keeps its behavior.
+"""
+smoothing_options(config::AbstractBathymetryConfig) = (;)
+
 # --- Preparation pipeline ---
 
 """
@@ -77,7 +94,7 @@ function prepare_bathymetry(target_grid, config::AbstractBathymetryConfig; regri
 
     output_file = bathymetry_path(config)
     @info "Smoothing small-scale bathymetry gaps"
-    smooth_bathymetry_gaps!(bottom_height)
+    smooth_bathymetry_gaps!(bottom_height; smoothing_options(config)...)
     @info "Writing processed bathymetry file to $output_file"
     write_bathymetry_file(output_file, target_grid, bottom_height)
     @info "Finished preparing bathymetry"
@@ -176,14 +193,27 @@ function write_bathymetry_file(filepath::String, target_grid, bottom_height)
 end
 
 """
-    smooth_bathymetry_gaps!(bottom_height)
+    smooth_bathymetry_gaps!(bottom_height; spike_ratio = 0, max_slope_factor = 0, minimum_depth = 0)
 
-Remove small-scale diagonal checkerboard artifacts and single-cell sea/land noise left
-by regridding, following the fixed cleanup pass used for the Oslofjord ROMS-based
-bathymetry: one diagonal-pair fill, then `BATHYMETRY_GAP_FILL_PASSES` rounds of isolated
-sea/land cell cleanup. Mutates `bottom_height` in place.
+Clean up the regridded bathymetry in place, in three stages.
+
+First the topological pass every source gets: one diagonal-pair fill, then
+`BATHYMETRY_GAP_FILL_PASSES` rounds of isolated sea/land cell cleanup, following the fixed cleanup
+used for the Oslofjord ROMS-based bathymetry. This removes the checkerboard noise that would
+otherwise skew the neighbor medians the next stage takes.
+
+Then two optional stages, each skipped when its parameter is zero so a source that configures
+neither keeps exactly the behavior above: `fill_shallow_spikes` with `spike_ratio`, and
+`limit_bottom_slope` with `max_slope_factor` and `minimum_depth`. Despiking runs first, because a
+spike is precisely the kind of one-cell feature that slope limiting would otherwise smear into its
+neighbors instead of removing.
 """
-function smooth_bathymetry_gaps!(bottom_height)
+function smooth_bathymetry_gaps!(
+    bottom_height;
+    spike_ratio = 0,
+    max_slope_factor = 0,
+    minimum_depth = 0,
+)
     cpu_bottom_height = on_architecture(CPU(), bottom_height)
     h = Array(interior(cpu_bottom_height, :, :, 1))
 
@@ -192,8 +222,110 @@ function smooth_bathymetry_gaps!(bottom_height)
         h = fill_isolated_land_cells(remove_isolated_sea_cells(h))
     end
 
+    spike_ratio > 0 && (h = fill_shallow_spikes(h; ratio = spike_ratio))
+    max_slope_factor > 0 && (h = limit_bottom_slope(h; max_slope_factor, minimum_depth))
+
     set!(bottom_height, h)
     return bottom_height
+end
+
+"""
+    fill_shallow_spikes(h; ratio, min_neighbours = SPIKE_MIN_WET_NEIGHBOURS)
+
+Replace every sea cell shallower than `ratio` times the median depth of its sea neighbors with
+that median, leaving land (`h >= 0`) untouched.
+
+This targets the isolated shallow spikes regridding leaves along a coastline — and the ones a
+`minimum_depth` floor creates, by lifting a sub-metre sliver to a constant depth that is still far
+shallower than the water around it. Such a cell carries the same transport as its neighbors in a
+fraction of the water column, so the velocity there grows until the run goes unstable. A genuinely
+shallow *region* is not affected, because its neighbors are shallow too and the median moves with
+it: this only fires where a cell disagrees with its surroundings.
+
+A cell with fewer than `min_neighbours` sea neighbors is skipped, since a median over one value
+would turn every single-cell inlet into its neighbor.
+"""
+function fill_shallow_spikes(h; ratio, min_neighbours = SPIKE_MIN_WET_NEIGHBOURS)
+    filled = copy(h)
+    Nx, Ny = size(h)
+
+    for i = 1:Nx, j = 1:Ny
+        h[i, j] < 0 || continue
+
+        depths = eltype(h)[]
+        for (di, dj) in ((1, 0), (-1, 0), (0, 1), (0, -1))
+            ii, jj = i + di, j + dj
+            (1 <= ii <= Nx && 1 <= jj <= Ny) || continue
+            h[ii, jj] < 0 && push!(depths, -h[ii, jj])
+        end
+        length(depths) >= min_neighbours || continue
+
+        neighbour_depth = median(depths)
+        -h[i, j] < ratio * neighbour_depth && (filled[i, j] = -neighbour_depth)
+    end
+
+    return filled
+end
+
+"""
+    limit_bottom_slope(h; max_slope_factor, minimum_depth = 0, max_passes = SLOPE_LIMIT_MAX_PASSES)
+
+Limit the bathymetry's steepness so that no two adjacent sea cells differ by more than
+`max_slope_factor` in the Beckmann–Haidvogel slope parameter
+
+```
+r = |d₁ - d₂| / (d₁ + d₂)
+```
+
+where `d` is positive depth. Land is never touched, and no cell is made shallower than
+`minimum_depth`.
+
+`PartialCellBottom` bounds how *thin* a cell may be but says nothing about how much the depth may
+change between adjacent columns, which is the quantity that destabilizes a regional run: a shallow
+cell beside a deep one carries the same transport in a fraction of the water column. Bounding `r`
+is the standard remedy.
+
+Each offending pair is moved symmetrically — the deeper cell up and the shallower one down by the
+same `Δ = (|d₁ - d₂| - max_slope_factor (d₁ + d₂)) / 2` — so the pair's depth sum is unchanged and
+the domain's water volume is conserved rather than being quietly shifted. Passes repeat until no
+pair exceeds the limit, since fixing one pair can push a neighbouring pair over it.
+"""
+function limit_bottom_slope(
+    h;
+    max_slope_factor,
+    minimum_depth = 0,
+    max_passes = SLOPE_LIMIT_MAX_PASSES,
+)
+    depth = map(value -> value < 0 ? -value : convert(eltype(h), NaN), h)
+    Nx, Ny = size(h)
+
+    for _ = 1:max_passes
+        steepest = zero(eltype(h))
+
+        for i = 1:Nx, j = 1:Ny
+            isnan(depth[i, j]) && continue
+
+            for (di, dj) in ((1, 0), (0, 1))
+                ii, jj = i + di, j + dj
+                (ii <= Nx && jj <= Ny) || continue
+                isnan(depth[ii, jj]) && continue
+
+                here, there = depth[i, j], depth[ii, jj]
+                slope = abs(here - there) / (here + there)
+                steepest = max(steepest, slope)
+                slope > max_slope_factor || continue
+
+                shift = (abs(here - there) - max_slope_factor * (here + there)) / 2
+                deeper, shallower = here > there ? ((i, j), (ii, jj)) : ((ii, jj), (i, j))
+                depth[deeper...] = max(depth[deeper...] - shift, minimum_depth)
+                depth[shallower...] = max(depth[shallower...] + shift, minimum_depth)
+            end
+        end
+
+        steepest <= max_slope_factor && break
+    end
+
+    return map((original, d) -> isnan(d) ? original : -d, h, depth)
 end
 
 """

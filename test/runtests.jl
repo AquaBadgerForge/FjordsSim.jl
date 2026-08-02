@@ -657,6 +657,42 @@ end
             @test occursin("Stacktrace", logged)
         end
     end
+
+    # The log goes beside the output it describes. `results_root` is a simulation-config field, so a
+    # setup naming no simulation config has no results directory and falls back to the cwd — the
+    # `drammensfjorden` case the test above relies on.
+    oslo = oslofjorden()
+    @test FjordSim.CLI.log_path(oslo) ==
+          joinpath(oslo.simulation_config.results_root, FjordSim.CLI.LOG_FILE)
+    @test FjordSim.CLI.log_path(drammensfjorden()) == FjordSim.CLI.LOG_FILE
+    @test FjordSim.CLI.log_path(nothing) == FjordSim.CLI.LOG_FILE
+
+    # End to end: a failing step on a setup that does name a results root writes its log there and
+    # not into the working directory, creating the directory if it does not exist yet.
+    mktempdir() do tmp
+        results = joinpath(tmp, "results")
+        config_file = joinpath(tmp, "config.jl")
+        write(
+            config_file,
+            """
+            using FjordSim
+            config = oslofjorden()
+            config.bathymetry_config.data_root = raw"$tmp"
+            config.forcing_config.data_root = raw"$tmp"
+            config.simulation_config.results_root = raw"$results"
+            config
+            """,
+        )
+
+        cd(tmp) do
+            @test !isdir(results)
+            @test FjordSim.main(["prepare_forcing", "--config", config_file]) == 1
+            @test !isfile(FjordSim.CLI.LOG_FILE)
+
+            logged = read(joinpath(results, FjordSim.CLI.LOG_FILE), String)
+            @test occursin("Processed bathymetry", logged)
+        end
+    end
 end
 
 @testset "OF800 rivers config" begin
@@ -1056,6 +1092,72 @@ end
     # a boundary land cell is left alone even if it would otherwise qualify
     h6 = [0.0 -1.0 0.0; -1.0 -1.0 -1.0; 0.0 -1.0 0.0]
     @test fill_isolated_land_cells(h6) == h6
+
+    fill_shallow_spikes = FjordSim.Bathymetry.fill_shallow_spikes
+    limit_bottom_slope = FjordSim.Bathymetry.limit_bottom_slope
+
+    # A cell far shallower than its neighbours is lifted to their median depth. This is the
+    # artifact `minimum_depth` leaves behind: a sliver floored to a constant depth, still far
+    # shallower than the water around it.
+    spike = [-10.0 -10.0 -10.0; -10.0 -1.0 -10.0; -10.0 -10.0 -10.0]
+    despiked = fill_shallow_spikes(spike; ratio = 0.5)
+    @test despiked[2, 2] == -10.0
+    @test despiked[1, :] == spike[1, :]  # everything else untouched
+
+    # 60% of the neighbour median is above a 0.5 threshold, so it is left alone: the filter must
+    # not shave genuine topography, only cells that disagree with their surroundings.
+    mild = [-10.0 -10.0 -10.0; -10.0 -6.0 -10.0; -10.0 -10.0 -10.0]
+    @test fill_shallow_spikes(mild; ratio = 0.5) == mild
+
+    # A uniformly shallow region is not a spike — its neighbours are shallow too.
+    shelf = [-2.0 -2.0 -2.0; -2.0 -1.5 -2.0; -2.0 -2.0 -2.0]
+    @test fill_shallow_spikes(shelf; ratio = 0.5) == shelf
+
+    # Land is never touched, and a cell with fewer than `min_neighbours` sea neighbours is skipped
+    # so a single-cell inlet is not swallowed by the one neighbour it has.
+    inlet = [0.0 0.0 0.0; 0.0 -1.0 -10.0; 0.0 0.0 0.0]
+    @test fill_shallow_spikes(inlet; ratio = 0.5) == inlet
+    @test fill_shallow_spikes(inlet; ratio = 0.5, min_neighbours = 1)[2, 2] == -10.0
+
+    # Slope limiting moves each offending pair symmetrically, so the pair's depth sum — and hence
+    # the domain's water volume — is unchanged, and the resulting r sits exactly at the limit.
+    steep = reshape([-1.0, -9.0], 2, 1)
+    limited = limit_bottom_slope(steep; max_slope_factor = 0.5)
+    d1, d2 = -limited[1, 1], -limited[2, 1]
+    @test d1 + d2 ≈ 10.0
+    @test abs(d1 - d2) / (d1 + d2) ≈ 0.5
+    @test d1 > 1.0 && d2 < 9.0  # shallow deepened, deep shoaled
+
+    # Already within the limit: returned untouched.
+    gentle = reshape([-9.0, -10.0], 2, 1)
+    @test limit_bottom_slope(gentle; max_slope_factor = 0.5) == gentle
+
+    # The floor wins over the slope limit — flattening a slope must not undo `minimum_depth`.
+    @test all(<=(-2.0), limit_bottom_slope(steep; max_slope_factor = 0.5, minimum_depth = 2.0))
+
+    # Land stays land, and the whole field converges below the limit within the pass cap.
+    mixed = [-1.0 -40.0 0.0; -30.0 -2.0 -50.0; 0.0 -60.0 -1.0]
+    smoothed = limit_bottom_slope(mixed; max_slope_factor = 0.4)
+    @test smoothed[1, 3] == 0.0 && smoothed[3, 1] == 0.0
+    for i = 1:3, j = 1:3
+        smoothed[i, j] < 0 || continue
+        for (di, dj) in ((1, 0), (0, 1))
+            ii, jj = i + di, j + dj
+            (ii <= 3 && jj <= 3) || continue
+            smoothed[ii, jj] < 0 || continue
+            here, there = -smoothed[i, j], -smoothed[ii, jj]
+            @test abs(here - there) / (here + there) <= 0.4 + 1e-9
+        end
+    end
+
+    # Both stages are opt-in: the default keeps the topological cleanup and nothing else, which is
+    # what leaves every other source's bathymetry unchanged.
+    @test FjordSim.Bathymetry.smoothing_options(drammensfjorden().bathymetry_config) ==
+          (spike_ratio = 0.0, max_slope_factor = 0.0, minimum_depth = 0.0)
+    oslo_smoothing = FjordSim.Bathymetry.smoothing_options(oslofjorden().bathymetry_config)
+    @test oslo_smoothing.spike_ratio == 0.5
+    @test oslo_smoothing.max_slope_factor == 0.5
+    @test oslo_smoothing.minimum_depth == 2.0
 
     # smooth_bathymetry_gaps! round-trips a Field through the same pipeline
     architecture = CPU()

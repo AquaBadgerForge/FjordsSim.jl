@@ -2,7 +2,7 @@ module CLI
 
 export parse_arguments
 
-using ..Configs: FjordConfig
+using ..Configs: AbstractSimulationConfig, FjordConfig
 using ..Setups: fjord_config, setup_names
 using ..Bathymetry: prepare_bathymetry
 using ..Atmospheres: prepare_atmosphere, download_atmosphere
@@ -89,13 +89,28 @@ command-line surface. The same steps are available from the REPL:
 """
 
 """
-Where a run's transcript goes: a fixed name in the working directory, truncated each run.
+The name of a run's transcript, resolved against the setup's results directory by `log_path`.
 
 Not an option, because `--config` is the whole command-line surface and a log nobody has to
 remember to ask for is the point — a stacktrace through `SimulationConfig` is long enough to push
 the error message itself out of the terminal's scrollback.
 """
 const LOG_FILE = "fjordsim.log"
+
+"""
+    log_path(config)
+
+Where to write this run's transcript: `LOG_FILE` under the setup's `results_root`, so a log lands
+beside the output it describes rather than wherever the command happened to be run from.
+
+Dispatched on `config.simulation_config` like `simulation_forcing_path`, because `results_root` is
+a field of the simulation config and a setup need not name one. A setup that does not — every step
+of `drammensfjorden`, for instance — has no results directory to speak of, so it falls back to the
+working directory.
+"""
+log_path(config::FjordConfig) = log_path(config.simulation_config)
+log_path(::Nothing) = LOG_FILE
+log_path(config::AbstractSimulationConfig) = joinpath(config.results_root, LOG_FILE)
 
 """
     tee_output(f, log_file)
@@ -106,9 +121,14 @@ real `stdout`, and return whatever `f` returns.
 `redirect_stdio` only accepts fd-backed streams, so the tee is a `Pipe` plus a task copying each
 chunk to both destinations. Both streams share one pipe, so the log interleaves them in the order
 they were written.
+
+`log_file`'s directory is created if absent, since a setup's results directory need not exist
+before its first run.
 """
 function tee_output(f, log_file)
     original_stdout = stdout
+    directory = dirname(log_file)
+    isempty(directory) || mkpath(directory)
 
     return open(log_file, "w") do log_stream
         pipe = Pipe()
@@ -183,11 +203,12 @@ A step a setup opts out of — `add_rivers` on a setup with no rivers, the atmos
 setup with no atmosphere — returns `nothing` from the driver and is reported here rather than
 raising, because that is a property of the setup and not a failure.
 
-The driver runs inside `tee_output`, and a failure is caught rather than propagated. Both halves of
-that matter: an exception left to `Base._start` would be printed after the redirect had already been
-torn down, so the error — the one thing worth having in the log — would be the only thing missing
-from it. Parsing, `--help` and config resolution stay outside the tee, so a usage error leaves no
-log file behind.
+The driver runs inside `tee_output`, writing to `log_path(config)`, and a failure is caught rather
+than propagated. Both halves of that matter: an exception left to `Base._start` would be printed
+after the redirect had already been torn down, so the error — the one thing worth having in the log
+— would be the only thing missing from it. Parsing, `--help` and config resolution stay outside the
+tee, so a usage error leaves no log file behind — which also means the log path is only ever
+resolved from a config that loaded.
 """
 function main(args)
     arguments = try
@@ -212,9 +233,10 @@ function main(args)
         return 2
     end
 
-    @info "Logging to $(abspath(LOG_FILE))"
+    log_file = log_path(config)
+    @info "Logging to $(abspath(log_file))"
 
-    return tee_output(LOG_FILE) do
+    return tee_output(log_file) do
         @info "Setup: $(arguments.config), step: $(arguments.subcommand)"
         try
             isnothing(driver(config)) &&

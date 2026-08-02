@@ -61,6 +61,34 @@ across fjords.
 - `contour_stride`: Sample every n-th contour vertex.
 - `interpolation_passes`: Passed to `NumericalEarth.regrid_bathymetry`.
 - `major_basins`: Passed to `NumericalEarth.regrid_bathymetry`.
+- `minimum_depth`: Passed to `NumericalEarth.regrid_bathymetry`, as a positive depth in metres.
+  Every wet cell shallower than this is *deepened* to exactly it (`min(h, -minimum_depth)`), so
+  no water area is lost and the coastline does not move — note that `regrid_bathymetry`'s own
+  docstring claims such cells become land, which its kernel does not do.
+
+  Defaults to `0.0`, which keeps every cell the source resolves — including the sub-millimetre
+  slivers interpolation leaves along a coastline, which `PartialCellBottom` then floors at
+  `minimum_fractional_cell_height * Δz`. Such a sliver destabilizes its *neighbours*, not itself:
+  the horizontal spacings are `Δrᶠᶜᶜ = min(Δrᶜᶜᶜ(i-1,j,k), Δrᶜᶜᶜ(i,j,k))`, so the face between a
+  floored 0.2 m cell and the ordinary cell beside it is 0.2 m thick while the volume it feeds is
+  metres thick, and `cell_advection_timescale` builds its vertical term from `Δzᶜᶜᶠ` and never
+  sees the thin cell at all. The time-step wizard therefore under-constrains `Δt` there, velocity
+  grows monotonically in the neighbouring cell over ~1500 iterations, and the run dies with
+  `InexactError: Int64(NaN)` from `calculate_substeps` once the timescale reduction goes NaN — the
+  last symptom rather than the cause. On `oslofjorden` a 9.4 cm sliver did this to the 4.9 m cell
+  beside it. Set it to a depth that leaves no sliver.
+
+  A floor alone is not enough, and on its own makes a second problem: lifting a sliver to a
+  constant depth in much deeper water leaves a shallow *spike*, which destabilizes its neighbours
+  the same way. Pair it with `spike_ratio`.
+- `spike_ratio`: `fill_shallow_spikes` threshold — a sea cell shallower than this fraction of its
+  neighbours' median depth is replaced by that median. `0.0` disables despiking. This is what
+  removes the interpolation spikes, and the ones `minimum_depth` itself creates.
+- `max_slope_factor`: `limit_bottom_slope` limit on the Beckmann–Haidvogel slope parameter
+  `r = |d₁ - d₂| / (d₁ + d₂)` between adjacent sea cells. `0.0` disables slope limiting. Despiking
+  handles the one-cell artifacts; this bounds what is left, including real topography. Lower is
+  more stable and less faithful — 0.2 is the textbook limit but flattens genuine fjord sills, so
+  prefer the largest value that keeps the run stable.
 - `geonorge_cache`: Reuse the cached regional raw NetCDF when available.
 - `regrid_cache`: Use NumericalEarth's on-disk bathymetry cache.
 
@@ -83,6 +111,9 @@ Base.@kwdef mutable struct DybdedataConfig <: AbstractBathymetryConfig
     contour_stride::Int = 1
     interpolation_passes::Int = 1
     major_basins::Int = 1
+    minimum_depth::Float64 = 0.0
+    spike_ratio::Float64 = 0.0
+    max_slope_factor::Float64 = 0.0
     geonorge_cache::Bool = true
     regrid_cache::Bool = true
     raw_file::String = ""
@@ -117,6 +148,21 @@ regrid_options(config::DybdedataConfig) = (;
     cache = config.regrid_cache,
     interpolation_passes = config.interpolation_passes,
     major_basins = config.major_basins,
+    minimum_depth = config.minimum_depth,
+)
+
+"""
+    smoothing_options(config::DybdedataConfig)
+
+The `smooth_bathymetry_gaps!` options this setup configures.
+
+`minimum_depth` is passed on as well as being a `regrid_bathymetry` option, because
+`limit_bottom_slope` must not undo the floor while flattening a slope.
+"""
+smoothing_options(config::DybdedataConfig) = (;
+    spike_ratio = config.spike_ratio,
+    max_slope_factor = config.max_slope_factor,
+    minimum_depth = config.minimum_depth,
 )
 
 """

@@ -106,9 +106,26 @@ modules, in `include` order from `src/FjordSim.jl`:
    source adapter, included into the same `Bathymetry` module).
    `prepare_bathymetry(target_grid, config::AbstractBathymetryConfig)` is the generic pipeline:
    `bathymetry_dataset(target_grid, config)` (the one source-specific step) →
-   `NumericalEarth.regrid_bathymetry` with `regrid_options(config)` → `smooth_bathymetry_gaps!` →
-   `write_bathymetry_file`. The core also owns the smoothing kernels and the
-   `center_coordinates`/`expand_domain`/`vertical_faces` domain helpers.
+   `NumericalEarth.regrid_bathymetry` with `regrid_options(config)` → `smooth_bathymetry_gaps!`
+   with `smoothing_options(config)` → `write_bathymetry_file`. The core also owns the smoothing
+   kernels and the `center_coordinates`/`expand_domain`/`vertical_faces` domain helpers.
+
+   `smooth_bathymetry_gaps!` runs three stages. The topological cleanup every source gets
+   (diagonal-pair fills, isolated sea/land cells), then two stages a source opts into through
+   `smoothing_options`, each skipped when its parameter is zero: `fill_shallow_spikes` and
+   `limit_bottom_slope`. The order is forced — the topological pass first, because checkerboard
+   noise would skew the neighbour medians; despiking before slope limiting, because a spike is
+   exactly the one-cell feature slope limiting would smear into its neighbours instead of removing.
+
+   Both exist because `PartialCellBottom` bounds how *thin* a cell may be but says nothing about
+   how much depth may change between adjacent *columns*, and that is what destabilizes a regional
+   run: a shallow cell beside a deep one carries the same transport in a fraction of the water
+   column, so velocity grows there until the time-step wizard's timescale goes NaN and
+   `calculate_substeps` throws `InexactError: Int64(NaN)` — the last symptom, not the cause. A
+   `minimum_depth` floor alone makes this *worse* in one respect: lifting a sliver to a constant
+   depth in much deeper water leaves a shallow spike, which is why the two are configured together.
+   `limit_bottom_slope` moves each offending pair symmetrically, so water volume is conserved
+   exactly rather than quietly shifted.
 
    `geonorge.jl` holds `DybdedataConfig <: AbstractBathymetryConfig` and the Geonorge Sjøkart
    Dybdedata implementation of the two hooks: derive the native region from the target grid
@@ -335,13 +352,19 @@ modules, in `include` order from `src/FjordSim.jl`:
     codes live in `main`, which keeps the help path testable. Exit codes are 0 success, 1 the step
     failed, 2 bad arguments.
 
-    `main` runs the driver inside `tee_output(f, LOG_FILE)`, which mirrors `stdout` and `stderr` to
-    `fjordsim.log` in the working directory while still printing live to the terminal — a stacktrace
-    through `SimulationConfig` spells out every type parameter and is long enough to push the error
-    message itself out of the scrollback. `redirect_stdio` only accepts fd-backed streams, so the tee
-    is a `Pipe` (needing an explicit `Base.link_pipe!`; an uninitialized `Pipe` throws from `eof`)
-    plus a task copying each chunk to both destinations. Both streams share one pipe, so the log
-    interleaves them in write order.
+    `main` runs the driver inside `tee_output(f, log_path(config))`, which mirrors `stdout` and
+    `stderr` to `fjordsim.log` while still printing live to the terminal — a stacktrace through
+    `SimulationConfig` spells out every type parameter and is long enough to push the error message
+    itself out of the scrollback. `redirect_stdio` only accepts fd-backed streams, so the tee is a
+    `Pipe` (needing an explicit `Base.link_pipe!`; an uninitialized `Pipe` throws from `eof`) plus a
+    task copying each chunk to both destinations. Both streams share one pipe, so the log interleaves
+    them in write order.
+
+    `log_path` puts the transcript under the simulation config's `results_root`, beside the output it
+    describes, and creates that directory if absent. It dispatches on `config.simulation_config` just
+    like `simulation_forcing_path`, because `results_root` is a *simulation*-config field and a setup
+    need not name one: `drammensfjorden` has no results directory, so every step of it falls back to
+    `fjordsim.log` in the working directory. That fallback is why the name stays in `.gitignore`.
 
     Two things about it are load-bearing. The failure is **caught inside** the redirect and reported
     with `showerror`: an exception left to propagate would be printed by `Base._start` after
@@ -387,6 +410,7 @@ Bathymetry — `AbstractBathymetryConfig`, consumed by `prepare_bathymetry`:
 |---|---|---|
 | `bathymetry_dataset(target_grid, config)` → NumericalEarth dataset | yes | none |
 | `regrid_options(config)` → NamedTuple for `regrid_bathymetry` | no | `(;)` |
+| `smoothing_options(config)` → NamedTuple for `smooth_bathymetry_gaps!` | no | `(;)` |
 
 Forcing — `AbstractForcingConfig`, consumed by `prepare_forcing`:
 

@@ -207,15 +207,19 @@ A step the setup does not configure — `add_rivers` on a setup with no rivers, 
 on a setup with no atmosphere, `run_simulation` on a setup with no simulation config — does
 nothing rather than failing.
 
-Every step that runs writes a full transcript to `fjordsim.log` in the working directory, truncated
-each run, while still printing live to the terminal. If a step fails, that log is where to read the
-error: a stacktrace through the simulation config spells out every type parameter, so the error
-message itself scrolls out of the terminal long before the trace ends.
+Every step that runs writes a full transcript to `fjordsim.log` in the setup's results directory,
+truncated each run, while still printing live to the terminal. If a step fails, that log is where to
+read the error: a stacktrace through the simulation config spells out every type parameter, so the
+error message itself scrolls out of the terminal long before the trace ends.
 
 ```bash
 julia --project -m FjordSim run_simulation --config oslofjorden
-head -60 fjordsim.log      # the error, before the stacktrace buries it
+head -60 ~/FjordSim_results/oslofjorden/fjordsim.log   # the error, before the stacktrace buries it
 ```
+
+The log lands beside the output it describes. `results_root` is a field of the simulation config, so
+a setup that names none — `drammensfjorden` — has no results directory and writes `fjordsim.log`
+into the working directory instead. Either way, the path is printed as the run starts.
 
 The forcing config's `architecture` field decides where the regridding interpolation runs:
 `:auto` (the default) uses the GPU when one is usable and the CPU otherwise, so the same config
