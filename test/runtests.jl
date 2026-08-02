@@ -6,6 +6,8 @@ using ArchGDAL
 using NCDatasets
 using Oceananigans
 using Oceananigans.BoundaryConditions: FluxBoundaryCondition
+using Oceananigans.Fields: AbstractField
+using NumericalEarth
 
 # Alternative config types used by the "Config extensibility" testset. They exist only to
 # check that `FjordConfig` accepts any subtype of the abstract config supertypes and that new
@@ -234,6 +236,14 @@ end
         @test !isnothing(bcs.v.bottom)  # v.bottom must exist
         @test !isnothing(bcs.T.top)  # T.top must exist
         @test !isnothing(bcs.S.top)  # S.top must exist
+
+        # The tracer top conditions must carry a freshwater exchange NumericalEarth can read back
+        # out of them: `net_fluxes` pulls the volume flux and its heat content straight from the
+        # boundary condition, so a bare FluxBoundaryCondition raises a MethodError as soon as the
+        # coupled model assembles fluxes — which nothing else here would catch.
+        @test NumericalEarth.Oceans.extract_freshwater_flux(bcs.S.top.condition) isa AbstractField
+        @test NumericalEarth.Oceans.extract_freshwater_flux(bcs.T.top.condition) isa AbstractField
+        @test NumericalEarth.Oceans.freshwater_exchange(bcs.T.top.condition).content_flux isa AbstractField
     end
 end
 
@@ -264,6 +274,79 @@ end
         @test isa(nora3.default_download_directory, String)  # default_download_directory is String
         @test isa(nora3.size, Tuple)  # size is Tuple
         @test isa(nora3.all_dates, Vector)  # all_dates is Vector
+    end
+end
+
+@testset "NORA3 dataset interface" begin
+    # The interface must sit on NumericalEarth's own generics so its machinery dispatches into this
+    # backend instead of falling back to the generic `Metadata` defaults. Defined under a bare
+    # `using NumericalEarth`, each one becomes a module-local binding that shadows the upstream
+    # function, and the failure is silent: every fallback is plausible.
+    #
+    # The time axis has to be CF-encoded here, unlike in the struct-field test above: a `Metadatum`
+    # is a `Metadata` whose date is an `AnyDateTime`, so a raw Float64 axis would not produce one
+    # and `size` would fall through to the vector method and pass for the wrong reason.
+    DW = NumericalEarth.DataWrangling
+    NORA3 = FjordSim.Atmospheres.NORA3
+
+    mktempdir() do tmp
+        filename = "NORA3_interface.nc"
+        dates = [DateTime(2020, 1, 1), DateTime(2020, 1, 1, 1), DateTime(2020, 1, 1, 2)]
+        ds = NCDataset(joinpath(tmp, filename), "c")
+        defDim(ds, "lon", 3)
+        defDim(ds, "lat", 4)
+        defDim(ds, "time", length(dates))
+        defVar(ds, "time", dates, ("time",))
+        temperature = defVar(ds, "air_temperature_2m", Float32, ("lon", "lat", "time"))
+        temperature[:, :, :] = fill(280.0f0, (3, 4, length(dates)))
+        close(ds)
+
+        nora3 = MultiYearNORA3(filename, tmp)
+        vector_metadata = DW.Metadata(:temperature; dataset = nora3, dates, dir = tmp)
+        scalar_metadata = DW.Metadata(:temperature; dataset = nora3, dates = first(dates), dir = tmp)
+
+        @test DW.is_three_dimensional(vector_metadata) == false     # upstream default is `true`
+        @test DW.dataset_variable_name(vector_metadata) == "air_temperature_2m"
+        @test DW.available_variables(nora3) == NORA3.NORA3_variable_names
+        @test DW.all_dates(nora3) == dates
+        @test DW.first_date(nora3) == first(dates)
+        @test DW.last_date(nora3) == last(dates)
+        @test DW.metadata_filename(nora3) == filename
+        @test Oceananigans.location(vector_metadata) == (Center, Center, Center)
+
+        # A Metadatum carries one scalar date, so it needs its own `size`: the vector method's
+        # `length(metadata.dates)` cannot count a scalar.
+        @test scalar_metadata isa NORA3.NORA3Metadatum
+        @test !(vector_metadata isa NORA3.NORA3Metadatum)
+        @test size(vector_metadata) == (3, 4, length(dates))
+        @test size(scalar_metadata) == (3, 4, 1)
+    end
+end
+
+@testset "save_fts" begin
+    # `save_fts` takes the on-disk locations from the in-memory series it is handed; it used to
+    # name three undefined variables, so every call was an UndefVarError.
+    mktempdir() do tmp
+        grid = RectilinearGrid(CPU(); size = (2, 2, 2), x = (0, 1), y = (0, 1), z = (0, 1))
+        times = [0.0, 3600.0]
+        jld2_filepath = joinpath(tmp, "series.jld2")
+
+        for location_types in ((Center, Center, Center), (Face, Center, Nothing))
+            fts = FieldTimeSeries{location_types...}(grid, times)
+            rm(jld2_filepath; force = true)
+            FjordSim.Utils.save_fts(;
+                jld2_filepath,
+                fts_name = "T",
+                fts,
+                grid,
+                times,
+                boundary_conditions = fts.boundary_conditions,
+            )
+            @test isfile(jld2_filepath)
+            reloaded = FieldTimeSeries(jld2_filepath, "T")
+            @test Oceananigans.location(reloaded) == location_types
+            @test reloaded.times == times
+        end
     end
 end
 
@@ -1472,7 +1555,7 @@ end
         @test u[1, 1, 1] == false && u[5, 1, 1] == false  # closed east/west walls
 
         # ...but the open boundary named by relaxation_edge must survive, because that is where
-        # the forcing relaxes and the setup puts an OpenBoundaryCondition. peripheral_node alone
+        # the forcing relaxes and the setup puts a NormalFlowBoundaryCondition. peripheral_node alone
         # marks it land, since the tracer cell outside the domain is an inactive halo cell.
         v_south = water_mask(grid, Center, Face, :south)
         @test size(v_south) == (4, 3, 2)
@@ -1973,5 +2056,101 @@ end
         @test dataset.all_dates == dates
         @test_nowarn NORA3PrescribedAtmosphere(CPU(), Float32; dataset)
         @test_nowarn NORA3PrescribedRadiation(CPU(), Float32; dataset)
+    end
+end
+
+@testset "Build simulation" begin
+    # The "Simulation config" testset only reaches build_simulation's two prerequisite errors, so
+    # everything past them — the HydrostaticFreeSurfaceModel, the coupled OceanSeaIceModel and the
+    # tracer top boundary conditions NumericalEarth reads its freshwater exchange out of — is
+    # otherwise never executed. Synthetic inputs keep it on the CPU with no ~/FjordSim_data.
+    mktempdir() do tmp
+        # Small, but the halo is oslofjorden's: the setup's WENO and biharmonic closure set the
+        # floor, and an ImmersedBoundaryGrid needs one point more than that in every direction.
+        architecture = CPU()
+        Nx, Ny, Nz = 16, 16, 8
+        grid_config = EvenGrid(
+            size = (Nx, Ny, Nz),
+            halo = (7, 7, 7),
+            longitude = (10.0, 11.0),
+            latitude = (59.0, 60.0),
+            z_faces = collect(range(-80.0, 0.0, length = Nz + 1)),
+        )
+
+        bathymetry_config = DybdedataConfig(
+            data_root = tmp,
+            output_file = "bathymetry.nc",
+            plot_file = "bathymetry.png",
+        )
+        underlying_grid = LatitudeLongitudeGrid(architecture, grid_config)
+        bottom_height = Field{Center, Center, Nothing}(underlying_grid)
+        set!(bottom_height, fill(-80.0, (Nx, Ny)))
+        write_bathymetry_file(bathymetry_path(bathymetry_config), underlying_grid, bottom_height)
+
+        forcing_config = NorKystConfig(
+            data_root = tmp,
+            output_directory = "norkyst",
+            parameters = ["temperature", "salinity", "u_eastward", "v_northward"],
+            years = [2020],
+        )
+        ds = NCDataset(forcing_path(forcing_config), "c")
+        defDim(ds, "Nx", Nx)
+        defDim(ds, "Ny", Ny)
+        defDim(ds, "Nz", Nz)
+        defDim(ds, "Nx_faces", Nx + 1)
+        defDim(ds, "Ny_faces", Ny + 1)
+        defDim(ds, "time", 2)
+        defVar(ds, "time", [DateTime(2020, 1, 1, 12), DateTime(2020, 1, 2, 12)], ("time",))
+        for name in ("T", "S", "u", "v")
+            dimensions = FjordSim.Forcing.forcing_dimension_names(name)
+            shape = ntuple(i -> ds.dim[dimensions[i]], 4)
+            for variable_name in (name, name * "_lambda")
+                variable = defVar(ds, variable_name, Float32, dimensions; attrib = ["_FillValue" => NaN32])
+                variable[:, :, :, :] = fill(1.0f0, shape)
+            end
+        end
+        close(ds)
+
+        # Oslofjord's physics, on the CPU and stopped almost immediately. `atmosphere_config` stays
+        # unnamed, so both prescribed_atmosphere hooks yield nothing and the coupled model runs
+        # ocean-only — which is what keeps this off the network and off a GPU.
+        simulation_config = oslofjorden().simulation_config
+        simulation_config.architecture = :cpu
+        simulation_config.results_root = tmp
+        simulation_config.stop_time = 60.0
+
+        config = FjordConfig(
+            grid_config = grid_config,
+            bathymetry_config = bathymetry_config,
+            forcing_config = forcing_config,
+            simulation_config = simulation_config,
+        )
+        @test isnothing(config.atmosphere_config)
+        @test isnothing(config.forcing_config.rivers)
+
+        simulation = build_simulation(config)
+        @test simulation isa Simulation
+        @test simulation.stop_time == 60.0
+
+        ocean_model = simulation.model.ocean.model
+        @test Set(keys(ocean_model.tracers)) ⊇ Set((:T, :S))
+
+        # The coupled model must have accepted (ocean, sea_ice) in that order — the flipped call
+        # throws rather than mis-assembling, so reaching here at all pins the argument order.
+        @test simulation.model.ocean isa Simulation
+        @test !isnothing(simulation.model.sea_ice)
+
+        # And the model's own tracer top conditions still expose the freshwater exchange after
+        # passing through HydrostaticFreeSurfaceModel's boundary-condition materialization.
+        S_top = ocean_model.tracers.S.boundary_conditions.top
+        @test NumericalEarth.Oceans.extract_freshwater_flux(S_top.condition) isa AbstractField
+
+        # The open boundary landed on the velocity normal to the forcing config's relaxation edge.
+        normal_velocity = config.forcing_config.relaxation_edge in (:south, :north) ? :v : :u
+        edge_bc = getproperty(
+            getproperty(ocean_model.velocities, normal_velocity).boundary_conditions,
+            config.forcing_config.relaxation_edge,
+        )
+        @test edge_bc isa BoundaryCondition{<:Oceananigans.BoundaryConditions.NormalFlow}
     end
 end

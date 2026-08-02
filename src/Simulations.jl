@@ -117,10 +117,10 @@ velocity normal to that edge.
 Derived rather than configured: the relaxation edge is by construction the edge the regional
 domain is open on, so a setup that named it twice could only ever disagree with itself.
 """
-open_boundary_conditions(::Val{:south}) = (v = (south = OpenBoundaryCondition(nothing),),)
-open_boundary_conditions(::Val{:north}) = (v = (north = OpenBoundaryCondition(nothing),),)
-open_boundary_conditions(::Val{:west}) = (u = (west = OpenBoundaryCondition(nothing),),)
-open_boundary_conditions(::Val{:east}) = (u = (east = OpenBoundaryCondition(nothing),),)
+open_boundary_conditions(::Val{:south}) = (v = (south = NormalFlowBoundaryCondition(nothing),),)
+open_boundary_conditions(::Val{:north}) = (v = (north = NormalFlowBoundaryCondition(nothing),),)
+open_boundary_conditions(::Val{:west}) = (u = (west = NormalFlowBoundaryCondition(nothing),),)
+open_boundary_conditions(::Val{:east}) = (u = (east = NormalFlowBoundaryCondition(nothing),),)
 
 open_boundary_conditions(::Val{edge}) where {edge} = throw(
     ArgumentError("relaxation_edge must be one of (:south, :north, :west, :east), got :$edge"),
@@ -325,7 +325,7 @@ function coupled_hydrostatic_simulation(
     set!(ocean_model; initial_conditions...)
     Δt = 1second
     ocean_sim = Simulation(ocean_model; Δt, stop_time)
-    coupled_model = OceanSeaIceModel(sea_ice, ocean_sim; atmosphere, radiation = downwelling_radiation)
+    coupled_model = OceanSeaIceModel(ocean_sim, sea_ice; atmosphere, radiation = downwelling_radiation)
     println("Initialized coupled model")
     coupled_simulation = Simulation(coupled_model; Δt, stop_time)
     return coupled_simulation

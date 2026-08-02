@@ -666,8 +666,8 @@ cell just inside them is active.
 
 `peripheral_node` treats those faces as peripheral because the tracer cell outside the domain is
 a halo cell, and halo cells are inactive in `Bounded` directions. For a closed wall that is
-right, but `edge` is where the setup relaxes towards the source data and carries an
-`OpenBoundaryCondition`, so leaving that row masked would drop the forcing exactly where it is
+right, but `edge` is where the setup relaxes towards the source data and carries a
+`NormalFlowBoundaryCondition`, so leaving that row masked would drop the forcing exactly where it is
 needed. Only the component staggered across `edge` is affected.
 """
 function open_boundary_water!(mask, target_grid, LX, LY, edge)

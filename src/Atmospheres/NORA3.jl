@@ -6,24 +6,29 @@ using ...Utils: compute_faces
 using ...Configs: AbstractAtmosphereConfig, atmosphere_path
 
 using Oceananigans
-using Oceananigans.Units
 using Oceananigans.BoundaryConditions: fill_halo_regions!
-using Oceananigans.Grids: λnodes, φnodes, on_architecture
-using Oceananigans.Fields: interpolate!
-using Oceananigans.OutputReaders: Cyclical, TotallyInMemory, AbstractInMemoryBackend, FlavorOfFTS, time_indices, FieldTimeSeries
-using NumericalEarth
-using NumericalEarth: PrescribedAtmosphere
+using Oceananigans.OutputReaders: Cyclical, AbstractInMemoryBackend, FlavorOfFTS, time_indices, FieldTimeSeries
+using NumericalEarth.Atmospheres: PrescribedAtmosphere, PrescribedPrecipitationFlux
 using NumericalEarth.Radiations: PrescribedRadiation, SurfaceRadiationProperties, default_stefan_boltzmann_constant
-using NumericalEarth.DataWrangling: compute_native_date_range, Metadata, metadata_path, native_times
+using NumericalEarth.DataWrangling: compute_native_date_range, Metadata, Metadatum, native_times
 using Adapt
 using NCDatasets
-using JLD2
-using Dates
 
+import Oceananigans: location
 import Oceananigans.Fields: set!
-import Oceananigans.OutputReaders: new_backend, update_field_time_series!
-import NumericalEarth: all_dates
-import NumericalEarth.DataWrangling: metadata_filename
+import Oceananigans.OutputReaders: new_backend
+# The dataset interface below is *extended*, not redefined: these are NumericalEarth's own generic
+# functions, so its machinery dispatches into this backend rather than silently falling back to the
+# generic `Metadata` defaults. A bare `using NumericalEarth` would make each definition a new
+# module-local binding that shadows the upstream one — see `Datasets.jl` for the same import block.
+import NumericalEarth.DataWrangling:
+    all_dates,
+    available_variables,
+    dataset_variable_name,
+    first_date,
+    is_three_dimensional,
+    last_date,
+    metadata_filename
 
 const NORA3_FILE = "NORA3.nc"
 
@@ -88,7 +93,7 @@ available_variables(::MultiYearNORA3) = NORA3_variable_names
 const NORA3Metadata{D} = Metadata{<:MultiYearNORA3,D}
 const NORA3Metadatum = Metadatum{<:MultiYearNORA3}
 Base.size(metadata::NORA3Metadata) = (metadata.dataset.size..., length(metadata.dates))
-Base.size(::NORA3Metadatum) = (metadata.dataset.size..., 1)
+Base.size(metadata::NORA3Metadatum) = (metadata.dataset.size..., 1)
 
 is_three_dimensional(data::NORA3Metadata) = false
 location(::NORA3Metadata) = (Center, Center, Center)
@@ -270,25 +275,27 @@ function NORA3PrescribedAtmosphere(
     times = ua.times
     grid = ua.grid
 
-    freshwater_flux = (rain = Fra, snow = FieldTimeSeries{Center, Center, Nothing}(grid, times))
-
     velocities = (u = ua, v = va)
 
-    tracers = (T = Ta, q = qa)
-
-    pressure = pa
+    # NORA3 carries rain only, and `PrescribedPrecipitationFlux` reads a `nothing` snow component as
+    # "this dataset does not represent snowfall", so there is no placeholder field to build.
+    precipitation_flux = PrescribedPrecipitationFlux(; rain = Fra)
 
     FT = eltype(ua)
     surface_layer_height = convert(FT, surface_layer_height)
 
+    # Temperature and specific humidity are their own keywords: `tracers` is for gas species (CO₂
+    # and the like). Passing them as tracers is accepted silently and leaves the atmosphere on its
+    # constant placeholder temperature and humidity.
     atmosphere = PrescribedAtmosphere(
         grid,
         times;
         velocities,
-        freshwater_flux,
-        tracers,
+        temperature = Ta,
+        specific_humidity = qa,
+        pressure = pa,
+        precipitation_flux,
         surface_layer_height,
-        pressure,
     )
 
     return atmosphere

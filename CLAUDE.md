@@ -285,6 +285,16 @@ modules, in `include` order from `src/FjordSim.jl`:
    wind/heat/salt flux fields at the top and quadratic bottom drag, returning a named tuple
    `(u, v, T, S)`.
 
+   The two tracer top conditions are not plain `FluxBoundaryCondition`s: they go through
+   NumericalEarth's `build_tracer_top_bc`, which wraps the flux field together with a
+   `FreshwaterExchange` carrying a freshwater volume flux and its heat content. That is not a
+   physics choice here but an interface requirement — NumericalEarth's `net_fluxes` reads the
+   exchange back *out of* the boundary condition (`Oceans/Oceans.jl`), so a bare flux condition is a
+   `MethodError` the first time the coupled model assembles fluxes. The volume flux field stays
+   zero: NumericalEarth turns freshwater into a volume change through a free-surface forcing it adds
+   only on a mutable-z grid, and these setups' z faces are static, so the surface T and S fluxes are
+   exactly the flux fields the interface writes.
+
 9. **Grids** (`src/Grids.jl`) — `EvenGrid <: AbstractGridConfig` (size, halo, longitude, latitude,
    `z_faces`) with `LatitudeLongitudeGrid(architecture, config::EvenGrid)`, and a constructor
    `ImmersedBoundaryGrid(filepath, architecture, halo)` that reads the processed bathymetry NetCDF and
@@ -381,8 +391,11 @@ modules, in `include` order from `src/FjordSim.jl`:
     can arrive in bursts but is never lost.
 
 13. **Top-level** (`src/FjordSim.jl`) — re-exports the public API and defines `main` plus a bare
-    `@main` for `julia -m FjordSim`. Also patches `compute_bounding_indices` from NumericalEarth to
-    prevent off-by-one errors with custom longitude/latitude grids.
+    `@main` for `julia -m FjordSim`. It used to also patch NumericalEarth's
+    `compute_bounding_indices` to stop a regional read from running past the file's extent; that is
+    fixed upstream as of NumericalEarth 0.6 (`DataWrangling/set_region_data.jl` clamps both the
+    bounding-box offset and every index), so the patch is gone and nothing here monkey-patches a
+    dependency.
 
     Two non-obvious things about the entry point. `main` is **not exported**: Julia's startup runs
     `Main.main` after a script's body whenever that binding resolves to an entry point, so
@@ -559,9 +572,10 @@ forcings.
   implementation, *ask* — do not silently contort the design to avoid it. This applies to packages
   already present transitively (e.g. `KernelAbstractions` via Oceananigans), where a direct
   `[deps]` entry costs nothing but is still required to `using` them.
-- `Pkg.resolve()` currently fails in this environment on an unrelated pinned `CUDACore` version.
-  Adding a `[deps]` entry for a package already in `Manifest.toml` works without resolving; do not
-  try to fix the resolve failure as a side effect.
+- `Pkg.resolve()` only *checks* the manifest against `[compat]`; it will not move a version to
+  satisfy a widened bound, and reports `empty intersection between X@old and project compatibility`
+  instead. Use `Pkg.update()` after raising a compat bound. (`Pkg.up` is not a name in current Pkg.)
+  The `CUDACore` resolve failure this note used to warn about is gone — CUDA now resolves to 6.2.1.
 - `Base.@kwdef` on a *parametric* struct does not convert its arguments, unlike on a
   non-parametric one: the generated constructor keeps the declared field types in its signature,
   so `SimulationConfig(stop_time = 3600, ...)` is a `MethodError` where `stop_time = 1hour` is

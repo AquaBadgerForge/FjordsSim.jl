@@ -10,7 +10,7 @@ export compute_faces,
     cell_advection_timescale_coupled_model
 
 using Oceananigans
-using Oceananigans.Fields: interior
+using Oceananigans.Fields: interior, location
 using Oceananigans.OutputReaders: FieldTimeSeries, OnDisk
 using Oceananigans.Utils: prettytime
 using Oceananigans.Advection: cell_advection_timescale
@@ -94,6 +94,7 @@ end
 
 function save_fts(; jld2_filepath, fts_name, fts, grid, times, boundary_conditions)
     isfile(jld2_filepath) && rm(jld2_filepath)
+    LX, LY, LZ = location(fts)
     on_disk_fts = FieldTimeSeries{LX,LY,LZ}(
         grid,
         times;

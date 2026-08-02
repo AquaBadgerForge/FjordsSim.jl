@@ -13,7 +13,6 @@ using NumericalEarth.DataWrangling: AbstractStaticBathymetry
 import NumericalEarth.DataWrangling:
     dataset_variable_name,
     default_download_directory,
-    download_dataset,
     latitude_interfaces,
     longitude_interfaces,
     metadata_filename,
@@ -230,12 +229,12 @@ Base.size(dataset::GeonorgeBathymetry) = dataset.size
 dataset_variable_name(::GeonorgeBathymetryMetadatum) = "z"
 
 """
-    download_dataset(metadata::GeonorgeBathymetryMetadatum)
+    Downloads.download(metadata::GeonorgeBathymetryMetadatum)
 
 Return the generated regional raw bathymetry file.
 This dataset is materialized locally by `bathymetry_dataset`.
 """
-function download_dataset(metadata::GeonorgeBathymetryMetadatum)
+function Downloads.download(metadata::GeonorgeBathymetryMetadatum)
     filepath = metadata_path(metadata)
     isfile(filepath) || error("Raw bathymetry file $filepath does not exist. Run prepare_bathymetry first.")
     return filepath

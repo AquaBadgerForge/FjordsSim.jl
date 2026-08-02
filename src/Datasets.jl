@@ -4,6 +4,7 @@ export ForcingDataset, ResultsDataset, last_date
 
 using Dates
 
+using Downloads: Downloads
 using NCDatasets
 using Oceananigans
 using NumericalEarth.DataWrangling: Metadatum, metadata_path
@@ -16,7 +17,6 @@ import NumericalEarth.DataWrangling:
     first_date,
     last_date,
     dataset_variable_name,
-    download_dataset,
     longitude_interfaces,
     latitude_interfaces,
     z_interfaces,
@@ -178,7 +178,7 @@ function location(metadata::Union{MetadatumResults, MetadatumForcing})
     return (Center, Center, Center)
 end
 
-function download_dataset(metadata::Union{MetadatumResults, MetadatumForcing})
+function Downloads.download(metadata::Union{MetadatumResults, MetadatumForcing})
     filepath = metadata_path(metadata)
     return filepath
 end
