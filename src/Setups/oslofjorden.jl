@@ -73,7 +73,7 @@ function oslofjorden()
             buoyancy                = SeawaterBuoyancy(FT, equation_of_state = TEOS10EquationOfState(FT)),
             closure                 = (
                 CATKEVerticalDiffusivity(minimum_tke = 7e-6),
-                HorizontalScalarBiharmonicDiffusivity(ν = 15, κ = 10),
+                HorizontalScalarBiharmonicDiffusivity(ν = 1e5, κ = 1e4),
             ),
             tracer_advection        = (T = WENO(), S = WENO()),
             momentum_advection      = WENOVectorInvariant(FT),
