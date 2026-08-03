@@ -91,6 +91,26 @@ Oceananigans.LatitudeLongitudeGrid(architecture, config::SingleColumnGrid) = Lat
 # One forcing hook overloaded on the new forcing config, without touching Forcing.jl.
 FjordSim.Forcing.forcing_variable_names(config::ConstantForcing) = Dict("temperature" => "T")
 
+# `run_tag` is the instant this process started, so a test that wants an exact filename pins it
+# rather than deriving one from the config, and puts it back afterwards.
+const PINNED_RUN_TAG = "20260803T141530"
+
+function with_run_tag(f, tag = PINNED_RUN_TAG)
+    saved = FjordSim.Configs.LAUNCH_TAG[]
+    FjordSim.Configs.LAUNCH_TAG[] = tag
+    try
+        return f()
+    finally
+        FjordSim.Configs.LAUNCH_TAG[] = saved
+    end
+end
+
+# A deeply parameterized type, so a frame mentioning it is long enough for `show_compact_error` to
+# have something to abbreviate.
+struct Nested{A,B} end
+
+nested_failure(::Nested) = error("nested boom")
+
 @testset "Backward Compatibility — API Exports" begin
     # Verify all exported symbols are present in the public interface
     exported_symbols = [
@@ -627,13 +647,13 @@ end
           joinpath(oslo.atmosphere_config.data_root, "atmosphere.nc")
     # Results are rooted separately from the input data, so `results_root` is its own path.
     @test oslo.simulation_config isa SimulationConfig
-    # Tagged with `start_date`, so runs of different windows do not overwrite each other.
-    @test results_path(oslo.simulation_config) ==
+    # Tagged with the launch instant, so runs do not overwrite each other.
+    @test with_run_tag(() -> results_path(oslo.simulation_config)) ==
           joinpath(
               homedir(),
               "FjordSim_results",
               "oslofjorden",
-              "snapshots_ocean_20200101T0000.nc",
+              "snapshots_ocean_$PINNED_RUN_TAG.nc",
           )
 
     drammen = drammensfjorden()
@@ -733,11 +753,9 @@ end
         @test occursin("err-line", logged)
     end
 
-    # A step that fails is exit code 1, and its error and backtrace are in the log rather than only
-    # in the terminal's scrollback — which is the whole point of the tee, since a stacktrace through
-    # `SimulationConfig` is long enough to scroll the error message itself away. An out-of-tree
-    # config rooted in `tmp` rather than the registered name, so the assertion does not depend on
-    # whether ~/FjordSim_data/drammensfjorden happens to exist.
+    # Only `run_simulation` is logged, so a failing prepare step is exit code 1 and leaves no file
+    # behind at all. An out-of-tree config rooted in `tmp` rather than the registered name, so the
+    # assertion does not depend on whether ~/FjordSim_data/drammensfjorden happens to exist.
     mktempdir() do tmp
         config_file = joinpath(tmp, "config.jl")
         write(
@@ -753,25 +771,19 @@ end
 
         cd(tmp) do
             @test FjordSim.main(["prepare_forcing", "--config", config_file]) == 1
-
-            logged = read(FjordSim.CLI.LOG_FILE, String)
-            @test occursin("Processed bathymetry", logged)
-            @test occursin("Stacktrace", logged)
+            @test isempty(filter(name -> startswith(name, "fjordsim"), readdir(tmp)))
         end
     end
 
-    # The log goes beside the output it describes, tagged with the run's `start_date` so runs stay
-    # distinguishable. `results_root` and `start_date` are simulation-config fields, so a setup
-    # naming no simulation config has neither and falls back to `LOG_FILE` in the cwd — the
-    # `drammensfjorden` case the test above relies on.
+    # The log goes beside the output it describes, tagged with the launch instant so runs stay
+    # distinguishable, and takes the simulation config because that is where both come from.
     oslo = oslofjorden()
-    @test FjordSim.CLI.log_path(oslo) ==
-          joinpath(oslo.simulation_config.results_root, "fjordsim_20200101T0000.log")
-    @test FjordSim.CLI.log_path(drammensfjorden()) == FjordSim.CLI.LOG_FILE
-    @test FjordSim.CLI.log_path(nothing) == FjordSim.CLI.LOG_FILE
+    @test with_run_tag(() -> FjordSim.CLI.log_path(oslo.simulation_config)) ==
+          joinpath(oslo.simulation_config.results_root, "fjordsim_$PINNED_RUN_TAG.log")
 
-    # End to end: a failing step on a setup that does name a results root writes its log there and
-    # not into the working directory, creating the directory if it does not exist yet.
+    # End to end: a failing `run_simulation` writes its log into the setup's results root and not
+    # into the working directory, creating the directory if it does not exist yet. `build_simulation`
+    # stops at the bathymetry prerequisite, which is as far as a run gets without data or a GPU.
     mktempdir() do tmp
         results = joinpath(tmp, "results")
         config_file = joinpath(tmp, "config.jl")
@@ -789,13 +801,57 @@ end
 
         cd(tmp) do
             @test !isdir(results)
-            @test FjordSim.main(["prepare_forcing", "--config", config_file]) == 1
-            @test !isfile(FjordSim.CLI.LOG_FILE)
+            @test FjordSim.main(["run_simulation", "--config", config_file]) == 1
+            @test isempty(filter(name -> startswith(name, "fjordsim"), readdir(tmp)))
 
-            logged = read(joinpath(results, "fjordsim_20200101T0000.log"), String)
+            log_file = joinpath(results, "fjordsim_$(FjordSim.Configs.LAUNCH_TAG[]).log")
+            logged = read(log_file, String)
             @test occursin("Processed bathymetry", logged)
+            @test occursin("Stacktrace", logged)
         end
     end
+
+    # A setup naming no simulation config has nothing to log and no results root to log into, so
+    # `run_simulation` stays a no-op that writes nothing.
+    mktempdir() do tmp
+        config_file = joinpath(tmp, "config.jl")
+        write(
+            config_file,
+            """
+            using FjordSim
+            config = drammensfjorden()
+            config.bathymetry_config.data_root = raw"$tmp"
+            config.forcing_config.data_root = raw"$tmp"
+            config
+            """,
+        )
+
+        cd(tmp) do
+            @test FjordSim.main(["run_simulation", "--config", config_file]) == 0
+            @test isempty(filter(name -> startswith(name, "fjordsim"), readdir(tmp)))
+        end
+    end
+
+    # Stacktrace frames are reported with their type parameters abbreviated, the way the REPL does
+    # it: a bare `showerror` spells out every one of them, which is what makes a trace through the
+    # coupled model unreadable in the terminal and in the log alike.
+    # Deep enough that the frame is past `STACKTRACE_WIDTH` spelled out: `type_depth_limit` only
+    # abbreviates what does not fit.
+    inner = Nested{Nested{Int,Float64},Nested{Float32,Bool}}
+    exception, backtrace = try
+        nested_failure(Nested{Nested{inner,inner},Nested{inner,inner}}())
+    catch caught
+        caught, catch_backtrace()
+    end
+
+    compact = sprint(io -> FjordSim.CLI.show_compact_error(io, exception, backtrace))
+    verbose = sprint(io -> showerror(io, exception, backtrace))
+
+    @test occursin("nested boom", compact)
+    @test occursin("{…}", compact)
+    @test occursin("abbreviated", compact)
+    @test !occursin("{…}", verbose)
+    @test length(compact) < length(verbose)
 end
 
 @testset "OF800 rivers config" begin
@@ -867,33 +923,43 @@ end
     # The device is a Symbol, not a live CPU()/GPU(), so a setup file loads without a GPU.
     @test fieldtype(typeof(config), :architecture) === Symbol
 
-    # `run_tag` is the simulated start instant, so the same config always names the same files and
-    # post-processing can predict them; it is inserted before the extension either way, and the loop
-    # index goes on top of it so a looped run gives each repetition its own file.
-    @test run_tag(config) == "20200101T0000"
-    @test results_path(config) ==
-          joinpath(
-              homedir(),
-              "FjordSim_results",
-              "oslofjorden",
-              "snapshots_ocean_20200101T0000.nc",
-          )
-    @test results_path(config, 7) ==
-          joinpath(
-              homedir(),
-              "FjordSim_results",
-              "oslofjorden",
-              "snapshots_ocean_20200101T0000_loop07.nc",
-          )
+    # `run_tag` is the wall-clock launch instant, so every invocation names its own files, and moving
+    # `start_date` — which used to be the tag — leaves it alone. It is constant for the life of the
+    # process, since `results_path`, `log_path` and the checkpointer all have to agree.
+    @test occursin(r"^\d{8}T\d{6}$", run_tag(config))
+    @test run_tag(config) == FjordSim.Configs.LAUNCH_TAG[]
+    config.start_date = DateTime(1999, 12, 31)
+    @test run_tag(config) == FjordSim.Configs.LAUNCH_TAG[]
+    config.start_date = DateTime(2020, 1, 1)
+
+    # The tag is inserted before the extension either way, and the loop index goes on top of it so a
+    # looped run gives each repetition its own file.
+    with_run_tag() do
+        @test results_path(config) ==
+              joinpath(
+                  homedir(),
+                  "FjordSim_results",
+                  "oslofjorden",
+                  "snapshots_ocean_$PINNED_RUN_TAG.nc",
+              )
+        @test results_path(config, 7) ==
+              joinpath(
+                  homedir(),
+                  "FjordSim_results",
+                  "oslofjorden",
+                  "snapshots_ocean_$(PINNED_RUN_TAG)_loop07.nc",
+              )
+
+        config.output_file = "/elsewhere/run.nc"      # an absolute path relocates just that file
+        @test results_path(config) == "/elsewhere/run_$PINNED_RUN_TAG.nc"
+        config.output_file = "snapshots_ocean.nc"
+    end
+
     # A single run keeps the shorter name; only a looped one gains the index.
     @test FjordSim.Simulations.loop_output_path(config, 1) == results_path(config)
     config.loops = 3
     @test FjordSim.Simulations.loop_output_path(config, 1) == results_path(config, 1)
     config.loops = 1
-
-    config.output_file = "/elsewhere/run.nc"      # an absolute path relocates just that file
-    @test results_path(config) == "/elsewhere/run_20200101T0000.nc"
-    config.output_file = "snapshots_ocean.nc"
 
     # The window every loop replays, which is what the prepare steps pad their axes to. It does not
     # grow with `loops`, since each repetition replays the same interval.
@@ -904,9 +970,9 @@ end
     @test isnothing(coverage_window(nothing))     # a setup naming no simulation config
 
     # The checkpoint prefix carries the loop index because the checkpoint itself does not: the state
-    # records the clock but not which repetition produced it.
-    @test FjordSim.Simulations.checkpoint_prefix(config, 3) ==
-          "checkpoint_20200101T0000_loop03"
+    # records the clock but not which repetition produced it. It carries no run tag, so a later launch
+    # can name — and so resume — the checkpoints of the one before it.
+    @test FjordSim.Simulations.checkpoint_prefix(3) == "checkpoint_loop03"
 
     # The values Oslofjord runs with, stated in the setup rather than inherited. Durations are
     # seconds, and must be Float64 — @kwdef on a parametric struct does not convert.
@@ -1044,11 +1110,13 @@ end
     @test plot_path(config.atmosphere_config) == joinpath(data_root, "column_atmosphere.png")
     # The simulation config resolves against `results_root`, being the one config that writes, and
     # inherits the run tag, the loop-indexed variant and the coverage window for free.
-    @test run_tag(config.simulation_config) == "20210304T0500"
-    @test results_path(config.simulation_config) ==
-          joinpath(data_root, "column_snapshots_20210304T0500.nc")
-    @test results_path(config.simulation_config, 12) ==
-          joinpath(data_root, "column_snapshots_20210304T0500_loop12.nc")
+    @test run_tag(config.simulation_config) == FjordSim.Configs.LAUNCH_TAG[]
+    with_run_tag() do
+        @test results_path(config.simulation_config) ==
+              joinpath(data_root, "column_snapshots_$PINNED_RUN_TAG.nc")
+        @test results_path(config.simulation_config, 12) ==
+              joinpath(data_root, "column_snapshots_$(PINNED_RUN_TAG)_loop12.nc")
+    end
     @test coverage_window(config.simulation_config) ==
           (DateTime(2021, 3, 4, 5), DateTime(2021, 3, 4, 7))
 
@@ -2538,14 +2606,18 @@ end
 
         # The loop index is read back out of the checkpoint filename, because the checkpoint state
         # records the clock but not which repetition produced it.
-        touch(joinpath(tmp, checkpoint_prefix(config, 1) * "_iteration50.jld2"))
-        touch(joinpath(tmp, checkpoint_prefix(config, 3) * "_iteration7.jld2"))
-        touch(joinpath(tmp, checkpoint_prefix(config, 3) * "_iteration90.jld2"))
+        touch(joinpath(tmp, checkpoint_prefix(1) * "_iteration50.jld2"))
+        touch(joinpath(tmp, checkpoint_prefix(3) * "_iteration7.jld2"))
+        touch(joinpath(tmp, checkpoint_prefix(3) * "_iteration90.jld2"))
         @test resume_loop(config) == 3
 
-        # A checkpoint from a different run tag is not this run's to resume.
+        # Checkpoints carry no run tag, so they are resumed whichever launch wrote them and whatever
+        # `start_date` it ran — there is one resumable run per results directory. That is what keeps
+        # `pickup` working now that the snapshots are named per launch.
         config.start_date = DateTime(2021, 5, 6, 7)
-        @test (@test_logs (:warn,) resume_loop(config)) == 1
+        with_run_tag() do
+            @test resume_loop(config) == 3
+        end
     end
 end
 

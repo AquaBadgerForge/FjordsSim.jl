@@ -2,7 +2,7 @@ module CLI
 
 export parse_arguments
 
-using ..Configs: AbstractSimulationConfig, FjordConfig, run_tag
+using ..Configs: AbstractSimulationConfig, run_tag
 using ..Setups: fjord_config, setup_names
 using ..Bathymetry: prepare_bathymetry
 using ..Atmospheres: prepare_atmosphere, download_atmosphere
@@ -89,30 +89,55 @@ command-line surface. The same steps are available from the REPL:
 """
 
 """
-The fallback name of a run's transcript, for a setup with no simulation config to tag it from.
-
-Not an option, because `--config` is the whole command-line surface and a log nobody has to
-remember to ask for is the point — a stacktrace through `SimulationConfig` is long enough to push
-the error message itself out of the terminal's scrollback.
-"""
-const LOG_FILE = "fjordsim.log"
-
-"""
     log_path(config)
 
-Where to write this run's transcript: `fjordsim_<run_tag>.log` under the setup's `results_root`, so
-a log lands beside the output it describes rather than wherever the command happened to be run from,
-and so runs with different `start_date`s do not overwrite each other's transcript.
+Where to write this run's transcript: `fjordsim_<run_tag>.log` under the setup's `results_root`, so a
+log lands beside the output it describes rather than wherever the command happened to be run from,
+and so each launch keeps its own transcript.
 
-Dispatched on `config.simulation_config` like `simulation_forcing_path`, because `results_root` and
-`start_date` are fields of the simulation config and a setup need not name one. A setup that does
-not — every step of `drammensfjorden`, for instance — has no results directory and no run to tag, so
-it falls back to `LOG_FILE` in the working directory.
+Takes the *simulation* config, because `results_root` and the run tag are its fields and only
+`run_simulation` is logged: that is the one step whose failure is a stacktrace through the whole
+coupled model, and the one step a setup without a simulation config does not run at all.
 """
-log_path(config::FjordConfig) = log_path(config.simulation_config)
-log_path(::Nothing) = LOG_FILE
 log_path(config::AbstractSimulationConfig) =
     joinpath(config.results_root, string("fjordsim_", run_tag(config), ".log"))
+
+"""
+The width, in columns, the error reporter tells `showerror` it has.
+
+`Base.type_depth_limit` floors this at 120, so a smaller number changes nothing. Stated explicitly
+rather than left to `displaysize` so the log does not depend on how wide the terminal was — under the
+tee `stdout` is a `Pipe`, which reports the 24x80 default anyway.
+"""
+const STACKTRACE_WIDTH = 120
+
+"""
+    show_compact_error(io, exception, backtrace)
+
+Report `exception` and its backtrace with the type parameters in each frame abbreviated to `{…}`.
+
+Julia only abbreviates them when the IO carries `:stacktrace_types_limited`, which is what
+`REPL.repl_display_error` sets and a script's bare `showerror` does not — which is why a stacktrace
+through the coupled model spells out every parameter of every `HydrostaticFreeSurfaceModel` and
+`ImmersedBoundaryGrid` in it, and stays unreadable even in a file.
+
+It shortens *frames*, not messages: a `GPUCompiler` `InvalidIRError` body is as long as it ever was.
+"""
+function show_compact_error(io, exception, backtrace)
+    abbreviated = Ref(false)
+    context = IOContext(
+        io,
+        :limit => true,
+        :displaysize => (first(displaysize(io)), STACKTRACE_WIDTH),
+        :stacktrace_types_limited => abbreviated,
+    )
+
+    showerror(context, exception, backtrace)
+    println(io)
+    abbreviated[] && println(io, "fjordsim: type parameters above were abbreviated to `{…}`.")
+
+    return nothing
+end
 
 """
     tee_output(f, log_file)
@@ -196,21 +221,46 @@ function parse_arguments(args)
 end
 
 """
+    run_step(driver, config, subcommand, setup)
+
+Run one driver and return its exit code: 0 on success, 1 if it threw.
+
+A step a setup opts out of — `add_rivers` on a setup with no rivers, the atmosphere steps on a setup
+with no atmosphere — returns `nothing` from the driver and is reported here rather than raising,
+because that is a property of the setup and not a failure.
+
+A failure is caught rather than propagated: under `tee_output` an exception left to `Base._start`
+would be printed after the redirect had already been torn down, so the error — the one thing worth
+having in the log — would be the only thing missing from it.
+"""
+function run_step(driver, config, subcommand, setup)
+    @info "Setup: $setup, step: $subcommand"
+
+    try
+        isnothing(driver(config)) &&
+            @info "$subcommand is a no-op for $setup: the setup does not configure it"
+        return 0
+    catch exception
+        println(stderr, "fjordsim: $subcommand failed on $setup:")
+        show_compact_error(stderr, exception, catch_backtrace())
+        return 1
+    end
+end
+
+"""
     main(args)
 
 Run one subcommand and return a process exit code: 0 on success, 1 if the step failed, 2 for bad
 arguments.
 
-A step a setup opts out of — `add_rivers` on a setup with no rivers, the atmosphere steps on a
-setup with no atmosphere — returns `nothing` from the driver and is reported here rather than
-raising, because that is a property of the setup and not a failure.
+`run_simulation` runs inside `tee_output`, writing to `log_path`; every other step prints to the
+terminal only. It is the one step long enough and loud enough to be worth a transcript — a stacktrace
+through the coupled model scrolls its own error message away — the one whose output is not
+reproducible by re-running it, and the only one whose setup is guaranteed to name a `results_root` to
+put the transcript in.
 
-The driver runs inside `tee_output`, writing to `log_path(config)`, and a failure is caught rather
-than propagated. Both halves of that matter: an exception left to `Base._start` would be printed
-after the redirect had already been torn down, so the error — the one thing worth having in the log
-— would be the only thing missing from it. Parsing, `--help` and config resolution stay outside the
-tee, so a usage error leaves no log file behind — which also means the log path is only ever
-resolved from a config that loaded.
+Parsing, `--help` and config resolution stay outside the tee, so a usage error leaves no log file
+behind — which also means the log path is only ever resolved from a config that loaded.
 """
 function main(args)
     arguments = try
@@ -235,22 +285,17 @@ function main(args)
         return 2
     end
 
-    log_file = log_path(config)
-    @info "Logging to $(abspath(log_file))"
+    simulation_config = config.simulation_config
+    if driver === run_simulation && !isnothing(simulation_config)
+        log_file = log_path(simulation_config)
+        @info "Logging to $(abspath(log_file))"
 
-    return tee_output(log_file) do
-        @info "Setup: $(arguments.config), step: $(arguments.subcommand)"
-        try
-            isnothing(driver(config)) &&
-                @info "$(arguments.subcommand) is a no-op for $(arguments.config): the setup does not configure it"
-            return 0
-        catch exception
-            println(stderr, "fjordsim: $(arguments.subcommand) failed on $(arguments.config):")
-            showerror(stderr, exception, catch_backtrace())
-            println(stderr)
-            return 1
+        return tee_output(log_file) do
+            run_step(driver, config, arguments.subcommand, arguments.config)
         end
     end
+
+    return run_step(driver, config, arguments.subcommand, arguments.config)
 end
 
 end  # module CLI

@@ -207,19 +207,20 @@ A step the setup does not configure — `add_rivers` on a setup with no rivers, 
 on a setup with no atmosphere, `run_simulation` on a setup with no simulation config — does
 nothing rather than failing.
 
-Every step that runs writes a full transcript to `fjordsim.log` in the setup's results directory,
-truncated each run, while still printing live to the terminal. If a step fails, that log is where to
-read the error: a stacktrace through the simulation config spells out every type parameter, so the
-error message itself scrolls out of the terminal long before the trace ends.
+`run_simulation` writes a full transcript to `fjordsim_<launch time>.log` in the setup's results
+directory, while still printing live to the terminal; the other steps print to the terminal only. If
+the run fails, that log is where to read the error: a stacktrace through the coupled model scrolls the
+error message itself out of the terminal long before the trace ends. Type parameters in the trace are
+abbreviated to `{…}`, as they are in the REPL, so a frame stays one readable line.
 
 ```bash
 julia --project -m FjordSim run_simulation --config oslofjorden
-head -60 ~/FjordSim_results/oslofjorden/fjordsim.log   # the error, before the stacktrace buries it
+# the path is printed as the run starts; the error is at the top of it
+head -60 ~/FjordSim_results/oslofjorden/fjordsim_20260803T141530.log
 ```
 
-The log lands beside the output it describes. `results_root` is a field of the simulation config, so
-a setup that names none — `drammensfjorden` — has no results directory and writes `fjordsim.log`
-into the working directory instead. Either way, the path is printed as the run starts.
+The log lands beside the output it describes, and carries the same launch-time tag as the snapshots,
+so runs do not overwrite each other's transcripts.
 
 The forcing config's `architecture` field decides where the regridding interpolation runs:
 `:auto` (the default) uses the GPU when one is usable and the CPU otherwise, so the same config

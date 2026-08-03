@@ -78,7 +78,7 @@ atmosphere reader all come from `forcing_config` and `atmosphere_config`.
 - `time_step_cfl`, `max_time_step`, `max_time_step_change`: the time-step wizard's settings.
 
 A relative `output_file` resolves against `results_root`; an absolute one relocates just that
-file. Either way `results_path` inserts `run_tag` — the `start_date` — before the extension, and a
+file. Either way `results_path` inserts `run_tag` — the launch instant — before the extension, and a
 looped run appends the loop index on top of that, so runs and repetitions land in separate files.
 
 `start_date` is a field rather than something derived from an input file because every prepared
@@ -434,7 +434,7 @@ loop_output_path(config::AbstractSimulationConfig, loop) =
     config.loops == 1 ? results_path(config) : results_path(config, loop)
 
 """
-    checkpoint_prefix(config, loop)
+    checkpoint_prefix(loop)
 
 Prefix for one repetition's checkpoints, under which `Checkpointer` writes
 `<prefix>_iteration<N>.jld2`.
@@ -442,18 +442,22 @@ Prefix for one repetition's checkpoints, under which `Checkpointer` writes
 The loop index is in the *name* because it is not in the checkpoint: the state records the clock but
 not which repetition produced it, so without this `pickup` could not tell a loop-3 checkpoint from a
 loop-1 one and would replay the whole spin-up. `resume_loop` reads the index back out.
+
+The run tag is deliberately *not* in the name, even though `results_path` carries it: the tag is the
+launch instant, so a later launch could not name — and so could not resume — the checkpoints of the
+one before it. The cost is that checkpoints are shared per `results_root`, which is spelled out in
+`resume_loop`.
 """
-checkpoint_prefix(config::AbstractSimulationConfig, loop) =
-    string("checkpoint_", run_tag(config), "_loop", lpad(loop, 2, '0'))
+checkpoint_prefix(loop) = string("checkpoint_loop", lpad(loop, 2, '0'))
 
 """
     checkpointed_loops(config)
 
-Every loop index that has a checkpoint under `results_root` for this run tag.
+Every loop index that has a checkpoint under `results_root`.
 """
 function checkpointed_loops(config::AbstractSimulationConfig)
     isdir(config.results_root) || return Int[]
-    pattern = Regex(string("^checkpoint_", run_tag(config), "_loop(\\d+)_iteration\\d+\\.jld2\$"))
+    pattern = r"^checkpoint_loop(\d+)_iteration\d+\.jld2$"
     found = filter(!isnothing, match.(pattern, readdir(config.results_root)))
     return [parse(Int, captured[1]) for captured in found]
 end
@@ -464,16 +468,22 @@ end
 Which repetition to start at: the highest one that has a checkpoint when `pickup` is set, and `1`
 otherwise.
 
-`build_simulation` attaches its writers for this loop rather than unconditionally for the first, so
-a resumed run writes into the file it was already writing.
+`build_simulation` attaches its writers for this loop rather than unconditionally for the first, so a
+resumed run writes into the loop it left off in.
+
+Since checkpoints carry no run tag, this is whatever state `results_root` holds, whichever launch
+wrote it and whatever `start_date` it was written under — there is one resumable run per results
+directory, and a second launch overwrites the first's checkpoints. The snapshots are per launch, so a
+resumed run's file starts at the resume point and the records before it stay in the previous launch's
+file.
 """
 function resume_loop(config::AbstractSimulationConfig)
     config.pickup || return 1
 
     loops = checkpointed_loops(config)
     if isempty(loops)
-        @warn "`pickup` is set but no checkpoint for this run was found in " *
-              "$(config.results_root); starting from the beginning"
+        @warn "`pickup` is set but no checkpoint was found in $(config.results_root); " *
+              "starting from the beginning"
         return 1
     end
 
@@ -481,7 +491,7 @@ function resume_loop(config::AbstractSimulationConfig)
 end
 
 """
-    attach_writers!(simulation, config, loop; picking_up = false)
+    attach_writers!(simulation, config, loop)
 
 Point the snapshot writer, and the checkpointer if there is one, at `loop`'s own files.
 
@@ -492,18 +502,11 @@ never fire again. The old one is closed first — it holds an open `NCDataset`, 
 silently would leak a handle and an unflushed tail per loop.
 
 The snapshot file records `start_date` as a global attribute so `FromResults(path, date)` can later
-turn a date into a record — see `RESULTS_START_DATE_ATTRIBUTE`.
-
-`picking_up` suppresses `overwrite_existing`, because a checkpoint restores this writer's actuation
-count: clobbering the file it is meant to continue would leave a schedule thousands of records ahead
-of an empty one.
+turn a date into a record — and, since the name carries the launch instant rather than the simulated
+one, it is also the only place the window a file covers is written down. See
+`RESULTS_START_DATE_ATTRIBUTE`.
 """
-function attach_writers!(
-    simulation,
-    config::AbstractSimulationConfig,
-    loop;
-    picking_up = false,
-)
+function attach_writers!(simulation, config::AbstractSimulationConfig, loop)
     ocean_sim = simulation.model.ocean
     ocean_model = ocean_sim.model
 
@@ -520,7 +523,7 @@ function attach_writers!(
         );
         filename = loop_output_path(config, loop),
         schedule = TimeInterval(config.output_interval),
-        overwrite_existing = config.overwrite_existing && !picking_up,
+        overwrite_existing = config.overwrite_existing,
         global_attributes = Dict(RESULTS_START_DATE_ATTRIBUTE => string(config.start_date)),
     )
 
@@ -548,7 +551,7 @@ function attach_checkpointer!(simulation, config::AbstractSimulationConfig, loop
         simulation.model;
         schedule = TimeInterval(config.checkpoint_interval),
         dir = config.results_root,
-        prefix = checkpoint_prefix(config, loop),
+        prefix = checkpoint_prefix(loop),
         overwrite_existing = config.overwrite_existing,
         cleanup = true,
     )
@@ -739,14 +742,9 @@ function build_simulation(config::FjordConfig)
         Callback(progress, TimeInterval(simulation_config.progress_interval))
 
     # For the loop `run_simulation` will start at, not unconditionally the first: a resumed run has
-    # to keep writing into the file it was already writing, and must not truncate it.
+    # to write into the loop it left off in, and to checkpoint under that loop's prefix.
     start_loop = resume_loop(simulation_config)
-    attach_writers!(
-        simulation,
-        simulation_config,
-        start_loop;
-        picking_up = simulation_config.pickup,
-    )
+    attach_writers!(simulation, simulation_config, start_loop)
 
     @info "Run $(run_tag(simulation_config)): snapshots to " *
           "$(loop_output_path(simulation_config, start_loop))"

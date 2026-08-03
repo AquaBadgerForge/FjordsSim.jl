@@ -18,7 +18,17 @@ export AbstractGridConfig,
     run_tag,
     coverage_window
 
-using Dates: DateTime, Second, format
+using Dates: DateTime, Second, format, now
+
+"""
+The wall-clock instant this process started, as the fragment `run_tag` names a run's files with.
+
+Filled in by `__init__` rather than by a `const` initialized with `now()`, which would freeze the
+moment the package was precompiled into every later run.
+"""
+const LAUNCH_TAG = Ref("")
+
+__init__() = LAUNCH_TAG[] = format(now(), "yyyymmddTHHMMSS")
 
 """
     AbstractGridConfig
@@ -175,8 +185,8 @@ configs.
   `coupled_hydrostatic_simulation`.
 - `free_surface_cfl`, `bottom_drag_coefficient`: the grid-dependent components are built from
   these, since neither can exist before the grid does.
-- `start_date`: the calendar instant model time zero stands for. Read by `run_tag` and
-  `coverage_window` as well as by `build_simulation`.
+- `start_date`: the calendar instant model time zero stands for. Read by `coverage_window` as well
+  as by `build_simulation`.
 - `stop_time`, `loops`, `output_interval`, `progress_interval`, `overwrite_existing`,
   `checkpoint_interval`, `pickup`, `time_step_cfl`, `max_time_step`, `max_time_step_change`: run
   control, read by `build_simulation` and `run_simulation`.
@@ -233,16 +243,19 @@ atmosphere_directory(config::AbstractAtmosphereConfig) = joinpath(config.data_ro
 """
     run_tag(config)
 
-The run's identity as a filename fragment: its `start_date`, as `yyyymmddTHHMM`.
+The run's identity as a filename fragment: the wall-clock instant this process started, as
+`yyyymmddTHHMMSS`.
 
-Derived from the simulated start instant rather than the wall clock, so a config always names the
-same files. That makes the path predictable for post-processing, and — load-bearing — it is what
-lets a `pickup` append to the file it was already writing rather than to a fresh one.
+The launch instant rather than the simulated `start_date`, so it distinguishes *invocations* and a
+re-run cannot overwrite an earlier one's output. Which simulated window a file covers is recorded in
+the snapshot's `start_date` global attribute rather than in its name. Seconds are in the format so a
+crash and an immediate relaunch do not collide.
 
-It therefore distinguishes *configurations*, not invocations: two runs of the same config share a
-name, which is what `overwrite_existing` is for.
+Constant for the life of the process, so `results_path`, `FjordSim.CLI.log_path` and the checkpointer
+all agree however often they ask. `config` is taken only so a simulation-config subtype can name its
+runs differently.
 """
-run_tag(config::AbstractSimulationConfig) = format(config.start_date, "yyyymmddTHHMM")
+run_tag(::AbstractSimulationConfig) = LAUNCH_TAG[]
 
 """
     results_path(config)
@@ -252,9 +265,9 @@ Resolve `config.output_file` against `config.results_root`: the file the simulat
 snapshots to. Results are rooted separately from the input data, which is why this reads
 `results_root` rather than `data_root`. An absolute `output_file` keeps its own directory.
 
-`run_tag(config)` is inserted before the extension so runs from different `start_date`s do not
-overwrite each other, and the two-argument form appends the loop index on top of it, which is how a
-looped run gives each repetition its own file.
+`run_tag(config)` is inserted before the extension so separate runs do not overwrite each other, and
+the two-argument form appends the loop index on top of it, which is how a looped run gives each
+repetition its own file.
 """
 results_path(config::AbstractSimulationConfig) = tagged_path(config, run_tag(config))
 

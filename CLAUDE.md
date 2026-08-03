@@ -98,17 +98,26 @@ modules, in `include` order from `src/FjordSim.jl`:
    supertype's docstring lists the fields and hook methods a subtype must provide — see "Adding a
    new source" below.
 
-   Three helpers on `AbstractSimulationConfig` read `start_date`, which is therefore as much part of
-   the supertype's field set as `results_root` is. `run_tag` is the run's identity as a filename
-   fragment (`yyyymmddTHHMM`); `results_path(config)` inserts it before `output_file`'s extension and
-   `results_path(config, loop)` appends a zero-padded loop index on top; `coverage_window` is the
-   `(first, last)` calendar interval the run needs its prepared inputs to span, which
+   Two helpers on `AbstractSimulationConfig` name its files and its window. `run_tag` is the run's
+   identity as a filename fragment; `results_path(config)` inserts it before `output_file`'s extension
+   and `results_path(config, loop)` appends a zero-padded loop index on top. `coverage_window` reads
+   `start_date` — which is therefore as much part of the supertype's field set as `results_root` is —
+   and is the `(first, last)` calendar interval the run needs its prepared inputs to span, which
    `prepare_forcing` and `prepare_atmosphere` take as their `coverage`.
 
-   The tag is derived from the *simulated* start instant, not the wall clock, so a config always
-   names the same files: post-processing can predict them, and — load-bearing — a `pickup` appends to
-   the file it was already writing rather than to a new one. It distinguishes *configurations*, not
-   invocations; two runs of the same config still collide, governed by `overwrite_existing`.
+   The tag is the **wall-clock instant the process started** (`yyyymmddTHHMMSS`), held in
+   `Configs.LAUNCH_TAG` and filled by `Configs.__init__` — not by a `const` initialized with `now()`,
+   which would freeze the precompilation instant into every later run. So it distinguishes
+   *invocations*, not configurations: re-running a config cannot overwrite the earlier run's snapshots
+   or log, and `overwrite_existing` only ever bites within one process. Seconds are in the format
+   because a crash and an immediate relaunch otherwise collide.
+
+   The consequences of that are all elsewhere and all deliberate. Which simulated window a file covers
+   is no longer in its name — it is the snapshot's `start_date` global attribute (see
+   `Simulations`), which is why a post-processing step now reads the file rather than predicting the
+   path. `run_tag` takes a config it does not read, so a simulation-config subtype can still name its
+   runs differently. And a `pickup` cannot name the previous launch's files, which is why checkpoints
+   carry no tag — see "Checkpointing".
 
    `AbstractSimulationConfig` is the one supertype with fields but no hooks: `build_simulation` is
    generic over the whole `FjordConfig`, because everything dataset-specific already comes from
@@ -545,16 +554,23 @@ modules, in `include` order from `src/FjordSim.jl`:
     CATKE's diffusivities and its `e` tracer are. Expect a few hundred MB per checkpoint on the
     Oslofjord grid, which is why `cleanup = true`.
 
-    `pickup` resumes from the newest checkpoint. Two couplings make it work. The checkpoint prefix
-    carries the loop index (`checkpoint_prefix`), because the state records the clock but not which
-    repetition produced it — without that, `pickup` could not tell a loop-3 checkpoint from a loop-1
-    one and would replay the whole spin-up, and loop 2 would overwrite loop 1's files at the same
-    iteration number. `resume_loop` reads the index back out of the filename, and
-    `build_simulation` attaches its writers for *that* loop rather than unconditionally for the first.
-    And `picking_up` suppresses `overwrite_existing`, because the checkpoint restores the writer's
-    actuation count: clobbering the file it is meant to continue would leave a schedule thousands of
-    records ahead of an empty one. This is also why the run tag must be deterministic — a wall-clock
-    tag would put the resumed run in a different file from the one it is appending to.
+    `pickup` resumes from the newest checkpoint. The checkpoint prefix carries the loop index
+    (`checkpoint_prefix`), because the state records the clock but not which repetition produced it —
+    without that, `pickup` could not tell a loop-3 checkpoint from a loop-1 one and would replay the
+    whole spin-up, and loop 2 would overwrite loop 1's files at the same iteration number.
+    `resume_loop` reads the index back out of the filename, and `build_simulation` attaches its
+    writers for *that* loop rather than unconditionally for the first.
+
+    It carries **no run tag**, unlike everything else a run writes, and that is what makes `pickup`
+    work at all now that the tag is the launch instant: a later launch could not name — and so could
+    not find — the checkpoints of the one before it. Three things follow, and each fails silently.
+    Checkpoints are shared per `results_root`, so there is **one resumable run per results directory**:
+    a second launch overwrites the first's (`Checkpointer.write_output!` opens `jldopen(path, "w")`
+    whatever `overwrite_existing` says, and `cleanup = true` prunes the rest). A `pickup` therefore
+    resumes whatever state is there, even one written under a different `start_date`. And the snapshots
+    *are* per launch, so a resumed run's file starts at the resume point and the records before it stay
+    in the previous launch's file — which is why `attach_writers!` no longer takes a `picking_up`
+    keyword to suppress `overwrite_existing`: the file it writes is always new.
 
     `pickup` supersedes `initial_conditions`: `set!` still runs at build time and is then overwritten.
 
@@ -578,34 +594,44 @@ modules, in `include` order from `src/FjordSim.jl`:
     codes live in `main`, which keeps the help path testable. Exit codes are 0 success, 1 the step
     failed, 2 bad arguments.
 
-    `main` runs the driver inside `tee_output(f, log_path(config))`, which mirrors `stdout` and
-    `stderr` to `fjordsim.log` while still printing live to the terminal — a stacktrace through
-    `SimulationConfig` spells out every type parameter and is long enough to push the error message
-    itself out of the scrollback. `redirect_stdio` only accepts fd-backed streams, so the tee is a
-    `Pipe` (needing an explicit `Base.link_pipe!`; an uninitialized `Pipe` throws from `eof`) plus a
-    task copying each chunk to both destinations. Both streams share one pipe, so the log interleaves
-    them in write order.
+    `run_step(driver, config, subcommand, setup)` runs one driver and turns its outcome into an exit
+    code; `main` calls it inside `tee_output(f, log_path(simulation_config))` for **`run_simulation`
+    only**, and directly for every other subcommand. `tee_output` mirrors `stdout` and `stderr` to the
+    log while still printing live to the terminal. `redirect_stdio` only accepts fd-backed streams, so
+    the tee is a `Pipe` (needing an explicit `Base.link_pipe!`; an uninitialized `Pipe` throws from
+    `eof`) plus a task copying each chunk to both destinations. Both streams share one pipe, so the log
+    interleaves them in write order.
 
-    `log_path` puts the transcript under the simulation config's `results_root`, beside the output it
-    describes, and creates that directory if absent. Its name carries the run tag —
-    `fjordsim_<run_tag>.log` — so runs of different windows do not overwrite each other's transcript,
-    matching how `results_path` tags the output. It dispatches on `config.simulation_config` just
-    like `simulation_forcing_path`, because `results_root` and `start_date` are *simulation*-config
-    fields and a setup need not name one: `drammensfjorden` has no results directory and no run to
-    tag, so every step of it falls back to `LOG_FILE` (`fjordsim.log`) in the working directory. That
-    fallback is why the name stays in `.gitignore`.
+    Only the simulation is logged because it is the one step whose failure is a stacktrace through the
+    whole coupled model — long enough to push the error message itself out of the scrollback — the one
+    whose output is not reproducible by re-running it, and the only one whose setup is guaranteed to
+    name a `results_root` to put a transcript in. The prepare steps print a few lines and one error.
+    That is also what retired `LOG_FILE` (`fjordsim.log` in the working directory) and `log_path`'s
+    `FjordConfig`/`Nothing` methods: the fallback existed for a setup with no simulation config, which
+    is exactly the case where `run_simulation` is a no-op and nothing is logged at all. `log_path` now
+    takes the simulation config, and `.gitignore` no longer needs the name.
 
-    Every subcommand for a setup that does name a simulation config writes to the *same* tagged log,
-    so a later step overwrites an earlier one's transcript. That is pre-existing behaviour plus a tag,
-    not a regression, but it means a `run_simulation` transcript does not survive a subsequent
-    `add_rivers`.
+    `log_path` puts the transcript under `results_root`, beside the output it describes, and creates
+    that directory if absent. Its name carries the run tag — `fjordsim_<run_tag>.log` — so, the tag
+    being the launch instant, each launch keeps its own transcript instead of truncating the one
+    before it.
 
-    Two things about it are load-bearing. The failure is **caught inside** the redirect and reported
-    with `showerror`: an exception left to propagate would be printed by `Base._start` after
-    `tee_output`'s `finally` had torn the redirect down, so the error would be the one thing missing
-    from the log. And only the driver runs inside the tee — parsing, `--help` and config resolution
-    stay outside it, so a usage error leaves no log file behind, which is also why the existing
-    `main` tests (all of which fail before the driver is reached) write nothing.
+    Errors go through `show_compact_error`, which sets `:limit`, `:displaysize` (`STACKTRACE_WIDTH`,
+    120 columns) and `:stacktrace_types_limited` on the IO before `showerror`. That last one is the
+    whole trick: Julia abbreviates the type parameters of a frame to `{…}` only when the IO carries
+    it, which is what `REPL.repl_display_error` does and what a script's bare `showerror` does not — so
+    a frame that used to spell out every parameter of a `FjordConfig` or a `HydrostaticFreeSurfaceModel`
+    now fits on one line. `Base.type_depth_limit` floors the width at 120, so a smaller
+    `STACKTRACE_WIDTH` would change nothing; stating `:displaysize` at all is what keeps the log
+    independent of terminal width. It shortens *frames*, not messages — a `GPUCompiler`
+    `InvalidIRError` body is as long as it ever was.
+
+    Two things about the tee are load-bearing. The failure is **caught inside** the redirect, by
+    `run_step`: an exception left to propagate would be printed by `Base._start` after `tee_output`'s
+    `finally` had torn the redirect down, so the error would be the one thing missing from the log. And
+    only the driver runs inside the tee — parsing, `--help` and config resolution stay outside it, so a
+    usage error leaves no log file behind, which is also why the existing `main` tests (all of which
+    fail before the driver is reached) write nothing.
 
     The cost is that `stdout` is a `Pipe` during a run, so `displaysize` reports the 24x80 default
     and wide `show` output (Oceananigans' grid and model summaries) may wrap at 80 columns. Colour
@@ -705,8 +731,8 @@ gives wind relative to its own grid axes.
 
 Simulation — `AbstractSimulationConfig`, consumed by `build_simulation`: **no hooks**. It is data
 only, read field by field, so an alternative simulation config is a subtype supplying the field
-set its docstring lists. It inherits `results_path`, `run_tag` and `coverage_window` — the last two
-read `start_date`, so a subtype omitting it inherits none of the three.
+set its docstring lists. It inherits `results_path`, `run_tag` and `coverage_window` — the last reads
+`start_date`, so a subtype omitting that field inherits only the first two.
 
 The `coverage` keyword `prepare_forcing` and `prepare_atmosphere` now take is a pipeline *argument*,
 not a hook: the `FjordConfig` drivers derive it with `coverage_window` and every source inherits the
