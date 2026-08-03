@@ -8,6 +8,7 @@ export prepare_atmosphere,
     atmosphere_target_axes,
     prescribed_atmosphere,
     prescribed_radiation,
+    atmosphere_date_range,
     AtmosphereRecord,
     ProjectedAtmosphereGrid,
     NORA3Config,
@@ -20,6 +21,7 @@ using Oceananigans.Grids: x_domain, y_domain
 using ArchGDAL
 using Dates: DateTime, Hour
 using NCDatasets
+using NumericalEarth.DataWrangling: first_date, last_date
 
 using ..Configs:
     AbstractAtmosphereConfig,
@@ -168,8 +170,8 @@ download_atmosphere(config::FjordConfig) =
 download_atmosphere(target_grid, ::Nothing) = nothing
 
 """
-    prescribed_atmosphere(config, architecture)
-    prescribed_radiation(config, architecture)
+    prescribed_atmosphere(config, architecture; reference_date = nothing)
+    prescribed_radiation(config, architecture; reference_date = nothing)
 
 Read the prepared atmosphere file back at simulation time, as the NumericalEarth
 `PrescribedAtmosphere` and `PrescribedRadiation` that `coupled_hydrostatic_simulation` consumes.
@@ -179,14 +181,33 @@ These are the only atmosphere hooks the simulation side needs, and they are what
 the source's business. A setup naming no atmosphere config gets `nothing` for both, which is what
 `OceanSeaIceModel` takes to mean an uncoupled run.
 
+`reference_date` is the instant the returned time axes are zeroed at, `nothing` meaning the
+prepared file's own first record. `build_simulation` passes the simulation config's `start_date`,
+so the atmosphere and the ocean forcing agree on what model time zero stands for rather than each
+zeroing at its own first record.
+
 Deliberately no float-type argument: both NumericalEarth constructors default to `Float32`, and
 passing `Oceananigans.defaults.FloatType` would silently promote the atmosphere to `Float64`.
 
 Required for every `AbstractAtmosphereConfig` belonging to a setup that is simulated. See the
 `NORA3Config` methods in `src/Atmospheres/nora3_source.jl`.
 """
-prescribed_atmosphere(::Nothing, architecture) = nothing
-prescribed_radiation(::Nothing, architecture) = nothing
+prescribed_atmosphere(::Nothing, architecture; reference_date = nothing) = nothing
+prescribed_radiation(::Nothing, architecture; reference_date = nothing) = nothing
+
+"""
+    atmosphere_date_range(config)
+
+First and last date of the prepared atmosphere file, as a tuple, for `build_simulation`'s check
+that the run does not outlast its atmosphere.
+
+Optional: the default is `nothing`, meaning "this source cannot report its dates", which skips
+the check rather than blocking a simulation. It exists as a hook rather than a direct read in
+`FjordSim.Simulations` for the same reason `prescribed_atmosphere` does — resolving the prepared
+file is the source's business, so the simulation module names no dataset.
+"""
+atmosphere_date_range(::Nothing) = nothing
+atmosphere_date_range(::AbstractAtmosphereConfig) = nothing
 
 # --- Target grid ---
 

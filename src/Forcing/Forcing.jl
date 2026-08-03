@@ -147,7 +147,13 @@ function native_times_to_seconds(native_times, start_time = native_times[1])
     return [Second(t - start_time).value for t in native_times]
 end
 
-function load_from_netcdf(; path::String, variable_name::String, grid_size::Tuple, time_indices_in_memory::Tuple)
+function load_from_netcdf(;
+    path::String,
+    variable_name::String,
+    grid_size::Tuple,
+    time_indices_in_memory::Tuple,
+    reference_date = nothing,
+)
     ds = NCDataset(path)
     variable = ds[variable_name]
     native_times = ds["time"]
@@ -158,7 +164,8 @@ function load_from_netcdf(; path::String, variable_name::String, grid_size::Tupl
         @views data[:, :, :, j] .= coalesce.(variable[:, :, :, i], -999.0)
         j += 1
     end
-    times = convert.(Int64, native_times_to_seconds(native_times))
+    start_time = isnothing(reference_date) ? native_times[1] : reference_date
+    times = convert.(Int64, native_times_to_seconds(native_times, start_time))
 
     close(ds)
     return data, times
@@ -189,18 +196,21 @@ function forcing_get_tuple(
     backend,
     field_names,
     locations,
+    reference_date,
 )
     field_name = field_names[Symbol(variable_name)]
     LX, LY, LZ = locations[field_name]
     grid_size_tupled = size.(nodes(grid, (LX(), LY(), LZ())))
     grid_size = Tuple(x[1] for x in grid_size_tupled)
 
-    data, times = load_from_netcdf(; path = filepath, variable_name, grid_size, time_indices_in_memory)
+    data, times =
+        load_from_netcdf(; path = filepath, variable_name, grid_size, time_indices_in_memory, reference_date)
     dataλ, timesλ = load_from_netcdf(;
         path = filepath,
         variable_name = variable_name * "_lambda",
         grid_size,
         time_indices_in_memory,
+        reference_date,
     )
 
     fts = FieldTimeSeries{LX,LY,LZ}(
@@ -232,8 +242,12 @@ end
 
 """
 Return a named tuple of forcing functions for all available variables in a NetCDF file.
+
+`reference_date` is the instant the time axis is zeroed at, `nothing` meaning the file's own
+first record. A coupled run passes its simulation config's `start_date`, so the forcing and the
+atmosphere agree on what model time zero stands for.
 """
-function forcing_from_file(; grid, filepath, tracers)
+function forcing_from_file(; grid, filepath, tracers, reference_date = nothing)
     ds = NCDataset(filepath)
     grid.underlying_grid.Nx == ds.dim["Nx"] &&
         grid.underlying_grid.Ny == ds.dim["Ny"] &&
@@ -256,6 +270,7 @@ function forcing_from_file(; grid, filepath, tracers)
             backend,
             field_names,
             locations,
+            reference_date,
         ),
         merge,
         forcing_variables_names,
@@ -265,13 +280,13 @@ function forcing_from_file(; grid, filepath, tracers)
 end
 
 """
-    forcing_from_file(config::AbstractForcingConfig; grid, tracers)
+    forcing_from_file(config::AbstractForcingConfig; grid, tracers, reference_date = nothing)
 
 Return the forcing named tuple for the prepared forcing file this setup names, resolved by
 `forcing_path`. `config` is positional so the method dispatches on it.
 """
-forcing_from_file(config::AbstractForcingConfig; grid, tracers) =
-    forcing_from_file(; grid, filepath = forcing_path(config), tracers)
+forcing_from_file(config::AbstractForcingConfig; grid, tracers, reference_date = nothing) =
+    forcing_from_file(; grid, filepath = forcing_path(config), tracers, reference_date)
 
 # --- Forcing preparation ---
 

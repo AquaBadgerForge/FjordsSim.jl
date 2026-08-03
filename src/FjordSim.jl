@@ -53,6 +53,7 @@ export
     atmosphere_target_axes,
     prescribed_atmosphere,
     prescribed_radiation,
+    atmosphere_date_range,
     ProjectedSourceGrid,
     ProjectedAtmosphereGrid,
     RiverLocation,

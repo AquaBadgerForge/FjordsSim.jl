@@ -249,14 +249,16 @@ end
 
 @testset "Backward Compatibility — Struct Fields" begin
     mktempdir() do tmp
-        # Create minimal NORA3 file
+        # Create minimal NORA3 file. The dimensions are `lon`/`lat` because that is the prepared
+        # file's contract — `NORA3FieldTimeSeries` reads the axes by those names, so a file
+        # dimensioned otherwise could never be read back.
         nora3_filename = "NORA3_test.nc"
         nora3_path = joinpath(tmp, nora3_filename)
         ds = NCDataset(nora3_path, "c")
-        defDim(ds, "x", 2)
-        defDim(ds, "y", 2)
+        defDim(ds, "lon", 2)
+        defDim(ds, "lat", 2)
         defDim(ds, "time", 2)
-        air_temperature_2m = defVar(ds, "air_temperature_2m", Float64, ("x", "y", "time"))
+        air_temperature_2m = defVar(ds, "air_temperature_2m", Float64, ("lon", "lat", "time"))
         time_var = defVar(ds, "time", Float64, ("time",))
         air_temperature_2m[:, :, :] .= 273.15  # Use broadcasting assignment
         time_var[:] = [0.0, 3600.0]
@@ -1061,12 +1063,13 @@ end
         lon[:] = [10.0, 11.0]
         close(ds)
 
-        # Minimal NORA3 file for MultiYearNORA3 dataset construction.
+        # Minimal NORA3 file for MultiYearNORA3 dataset construction, on the prepared file's own
+        # `lon`/`lat`/`time` dimensions.
         ds = NCDataset(nora3_path, "c")
-        defDim(ds, "x", 2)
-        defDim(ds, "y", 2)
+        defDim(ds, "lon", 2)
+        defDim(ds, "lat", 2)
         defDim(ds, "time", 2)
-        air_temperature_2m = defVar(ds, "air_temperature_2m", Float64, ("x", "y", "time"))
+        air_temperature_2m = defVar(ds, "air_temperature_2m", Float64, ("lon", "lat", "time"))
         time = defVar(ds, "time", Float64, ("time",))
         air_temperature_2m[:, :, :] .= 273.15
         time[:] = [0.0, 3600.0]
@@ -2056,6 +2059,139 @@ end
         @test dataset.all_dates == dates
         @test_nowarn NORA3PrescribedAtmosphere(CPU(), Float32; dataset)
         @test_nowarn NORA3PrescribedRadiation(CPU(), Float32; dataset)
+
+        nora3 = FjordSim.Atmospheres.NORA3
+        series(; kw...) = nora3.NORA3FieldTimeSeries(
+            :temperature,
+            CPU(),
+            Float32;
+            dataset,
+            start_date = first(dates),
+            end_date = last(dates),
+            kw...,
+        )
+        record(step) = NCDataset(result.output_file) do ds
+            Float32.(coalesce.(ds["air_temperature_2m"][:, :, step], NaN32))
+        end
+
+        full = series()
+        # The time axis must carry the grid's float type. `native_times` gives `Float64` seconds,
+        # and against a `Float32` grid that makes the interpolation weight — and so the
+        # interpolated value — `Float64`, which boxes inside GPU kernels.
+        @test eltype(full.times) === eltype(full.grid)
+        @test full.times[1] == 0
+        @test full.times[2] - full.times[1] == 3600
+        @test interior(full, :, :, 1, 1) ≈ record(1)
+
+        # A sub-range must read the records it is timestamped for. `time_indices` counts slots of
+        # the series, which coincide with records of the file only when the series spans it, so
+        # reading the file by slot shifted the whole atmosphere by the selection's offset.
+        offset = 4
+        shifted = nora3.NORA3FieldTimeSeries(
+            :temperature,
+            CPU(),
+            Float32;
+            dataset,
+            start_date = dates[offset],
+            end_date = last(dates),
+        )
+        @test interior(shifted, :, :, 1, 1) ≈ record(offset)
+        @test interior(shifted, :, :, 1, 1) ≉ record(1)
+        @test length(shifted.times) == length(dates) - offset + 1
+        @test shifted.times[1] == 0
+
+        # `reference_date` moves where t = 0 sits without touching which records are read, which
+        # is what lets the atmosphere and the forcing share an origin.
+        anchored = series(reference_date = first(dates) - Hour(3))
+        @test anchored.times[1] == 3 * 3600
+        @test interior(anchored, :, :, 1, 1) ≈ record(1)
+
+        # A date the file does not carry is refused. Dropping it would leave the series one slot
+        # short of the axis it was built for, so every later slot would read the wrong record.
+        @test_throws ErrorException nora3.nora3_time_indices(
+            dataset,
+            [first(dates), first(dates) - Hour(1)],
+            :temperature,
+        )
+    end
+end
+
+@testset "Atmosphere reader window" begin
+    # A prepared file with fewer steps than the backend's default window. Written by hand rather
+    # than through `prepare_atmosphere`, because the point is the reader, not the regrid.
+    atmospheres = FjordSim.Atmospheres
+    nora3 = atmospheres.NORA3
+
+    mktempdir() do tmp
+        config = NORA3Config(data_root = tmp, output_directory = "nora3", years = [2020])
+        dates = [DateTime(2020, 1, 1) + Hour(step - 1) for step = 1:3]
+        longitude = collect(10.0:0.02:10.1)
+        latitude = collect(59.0:0.02:59.1)
+
+        NCDataset(atmosphere_path(config), "c") do ds
+            defDim(ds, "lon", length(longitude))
+            defDim(ds, "lat", length(latitude))
+            defDim(ds, "time", length(dates))
+            defVar(ds, "lon", Float64, ("lon",))[:] = longitude
+            defVar(ds, "lat", Float64, ("lat",))[:] = latitude
+            defVar(ds, "time", dates, ("time",))
+            for variable in atmospheres.ATMOSPHERE_VARIABLES
+                written = defVar(ds, variable.name, Float32, ("lon", "lat", "time"))
+                for step in eachindex(dates)
+                    written[:, :, step] = fill(Float32(step), length(longitude), length(latitude))
+                end
+            end
+        end
+
+        dataset = MultiYearNORA3(config)
+        @test dataset.size == (length(longitude), length(latitude))
+        @test atmosphere_date_range(config) == (first(dates), last(dates))
+
+        # The default backend asks for ten slots. Left unclamped that wraps `time_indices` past 1
+        # more than once, which the wrap split cannot express: the first chunk comes out empty and
+        # `copyto!` accepts the short read, leaving the tail of the window stale.
+        fts = nora3.NORA3FieldTimeSeries(
+            :temperature,
+            CPU(),
+            Float32;
+            dataset,
+            start_date = first(dates),
+            end_date = last(dates),
+        )
+        @test length(fts.times) == length(dates)
+        for step in eachindex(dates)
+            @test all(isapprox(Float32(step)), interior(fts, :, :, 1, step))
+        end
+    end
+end
+
+@testset "Simulation time coverage" begin
+    validate_time_coverage = FjordSim.Simulations.validate_time_coverage
+    forcing_date_range = FjordSim.Simulations.forcing_date_range
+    range = (DateTime(2020, 1, 1, 12), DateTime(2020, 12, 31, 12))
+
+    # Both readers use `Cyclical()` time indexing, which wraps rather than failing outside its
+    # data, so a run that outlasts its forcing would quietly replay the beginning.
+    @test isnothing(validate_time_coverage("forcing", range, DateTime(2020, 1, 1, 12), 86400.0, "x"))
+    @test isnothing(validate_time_coverage("forcing", range, DateTime(2020, 6, 1), 86400.0, "x"))
+    # A source that cannot report its dates is skipped rather than blocking the run.
+    @test isnothing(validate_time_coverage("atmosphere", nothing, DateTime(2019, 1, 1), 1e9, "x"))
+
+    @test_throws ErrorException validate_time_coverage(
+        "forcing", range, DateTime(2020, 1, 1), 86400.0, "x",   # starts before the data
+    )
+    @test_throws ErrorException validate_time_coverage(
+        "forcing", range, DateTime(2020, 12, 31), 86400.0, "x", # runs past the data
+    )
+
+    mktempdir() do tmp
+        filepath = joinpath(tmp, "forcing.nc")
+        dates = [DateTime(2020, 1, 1, 12) + Hour(24 * (step - 1)) for step = 1:5]
+        NCDataset(filepath, "c") do ds
+            defDim(ds, "time", length(dates))
+            defVar(ds, "time", dates, ("time",))
+        end
+        @test forcing_date_range(filepath) == (first(dates), last(dates))
     end
 end
 

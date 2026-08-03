@@ -84,6 +84,10 @@ function oslofjorden()
             biogeochemistry         = nothing,
             free_surface_cfl        = 0.7,
             bottom_drag_coefficient = 0.003,
+            # The NorKyst forcing's first record. The NORA3 atmosphere starts at 00:00 and the
+            # forcing at 12:00, so anchoring both here is what keeps them in phase; 365 days from
+            # it lands exactly on the forcing's last record.
+            start_date              = DateTime(2020, 1, 1, 12),
             stop_time               = 365days,
             output_interval         = 1hour,
             progress_interval       = 1hour,

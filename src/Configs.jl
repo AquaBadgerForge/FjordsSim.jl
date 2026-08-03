@@ -137,9 +137,12 @@ interpolates between them — so it only has to cover the ocean domain with a ma
 - `atmosphere_variable_names(config)`: source variable name => prepared variable name.
   Required.
 - `download_atmosphere(target_grid, config)`: fetch the source data. Only if it downloads.
-- `prescribed_atmosphere(config, architecture)`, `prescribed_radiation(config, architecture)`:
-  read the prepared file back at simulation time, as the NumericalEarth objects
-  `coupled_hydrostatic_simulation` consumes. Only if the setup is simulated.
+- `prescribed_atmosphere(config, architecture; reference_date)`,
+  `prescribed_radiation(config, architecture; reference_date)`: read the prepared file back at
+  simulation time, as the NumericalEarth objects `coupled_hydrostatic_simulation` consumes.
+  Only if the setup is simulated.
+- `atmosphere_date_range(config)`: first and last date of the prepared file, for
+  `build_simulation`'s coverage check. Optional; the default is `nothing`, which skips the check.
 
 `FjordSim.Atmospheres.NORA3Config` is the built-in implementation, for the MET Norway NORA3
 reanalysis; `src/Atmospheres/nora3_source.jl` is the template to copy for a new dataset.

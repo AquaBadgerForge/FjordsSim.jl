@@ -335,6 +335,22 @@ modules, in `include` order from `src/FjordSim.jl`:
     the forcing config's `relaxation_edge`), and the atmosphere (the `prescribed_atmosphere` and
     `prescribed_radiation` hooks on `config.atmosphere_config`).
 
+    `start_date` is the exception to that list, and it is a field precisely *because* it cannot be
+    derived. Every prepared file carries its own first record, and each reader used to zero its own
+    time axis there — the Oslofjord forcing starts at 12:00 and its NORA3 atmosphere at 00:00, so
+    the two ran twelve hours out of phase with nothing reporting it. One stated instant is the only
+    thing they can all agree on, so `build_simulation` passes it to `forcing_from_file` and to both
+    atmosphere read hooks as their `reference_date`. Picking a `start_date` earlier than a file's
+    first record is therefore an error rather than a shift.
+
+    `validate_time_coverage` enforces that: each prepared file must span
+    `[start_date, start_date + stop_time]`. Both readers use `Cyclical()` time indexing, which does
+    not fail outside the data it was given — it wraps — so a run that outlasts its forcing would
+    otherwise quietly replay the beginning, and one starting early would read the end. The check is
+    what makes the wrap unreachable rather than merely unlikely, which is why neither reader's
+    `time_indexing` had to change. The atmosphere half goes through the optional
+    `atmosphere_date_range` hook, so the module still names no dataset.
+
     `build_simulation` returns the instrumented `Simulation` without running it — the REPL and
     debugger entry point — and `run_simulation` calls it and `run!`. Both return `nothing` for a
     setup naming no simulation config. Each prerequisite is checked before anything is read or
@@ -457,14 +473,21 @@ Atmosphere — `AbstractAtmosphereConfig`, consumed by `prepare_atmosphere`:
 | `atmosphere_source_grid(config, filepath)` → source grid, e.g. `ProjectedAtmosphereGrid` | yes |
 | `atmosphere_variable_names(config)` → `Dict` downloaded name => prepared name | yes |
 | `download_atmosphere(target_grid, config)` | only if it downloads |
-| `prescribed_atmosphere(config, architecture)` → `PrescribedAtmosphere` | only if the setup is simulated |
-| `prescribed_radiation(config, architecture)` → `PrescribedRadiation` | only if the setup is simulated |
+| `prescribed_atmosphere(config, architecture; reference_date)` → `PrescribedAtmosphere` | only if the setup is simulated |
+| `prescribed_radiation(config, architecture; reference_date)` → `PrescribedRadiation` | only if the setup is simulated |
+| `atmosphere_date_range(config)` → `(first, last)` `DateTime`s | no; defaults to `nothing`, skipping the coverage check |
 
-The last two are the read side, consumed by `build_simulation` rather than `prepare_atmosphere`,
-and are what keep `Simulations` from naming a dataset. They take no float type on purpose: both
-NumericalEarth constructors default to `Float32`, and passing `Oceananigans.defaults.FloatType`
-would silently promote the atmosphere to `Float64`. A `nothing` atmosphere config yields `nothing`
-for both.
+The last three are the read side, consumed by `build_simulation` rather than `prepare_atmosphere`,
+and are what keep `Simulations` from naming a dataset. The first two take no float type on
+purpose: both NumericalEarth constructors default to `Float32`, and passing
+`Oceananigans.defaults.FloatType` would silently promote the atmosphere to `Float64`. A `nothing`
+atmosphere config yields `nothing` for all three.
+
+`reference_date` is the instant the returned time axes are zeroed at, and is *not*
+`NORA3PrescribedAtmosphere`'s `start_date`: that one selects which records to load, this one
+selects where t = 0 sits. `build_simulation` passes the simulation config's `start_date` to both
+this hook and `forcing_from_file`, which is the only thing keeping the two in phase — see the
+`Simulations` section.
 
 The prepared variable names and units are *not* a hook — they are fixed by the read side in
 `ATMOSPHERE_VARIABLES`. A source whose download already normalizes names (as NORA3's does, since
@@ -504,7 +527,7 @@ make both atmosphere steps and `run_simulation` no-ops the same way.
 
 The simulation config is rooted separately, at `~/FjordSim_results/<fjord>/` rather than under
 `data_root`, since it writes rather than reads. Unlike every other config, `SimulationConfig` has
-**no defaults at all**: `oslofjorden()` names all 21 fields, because each is a scientific choice
+**no defaults at all**: `oslofjorden()` names all 22 fields, because each is a scientific choice
 about that fjord and a default would let the next setup silently inherit it. Adding a field to
 `SimulationConfig` therefore breaks every setup until each names it, which is the intent.
 

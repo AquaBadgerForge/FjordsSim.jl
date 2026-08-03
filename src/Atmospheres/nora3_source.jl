@@ -204,8 +204,8 @@ function validate_regular_axis(values, name)
 end
 
 """
-    prescribed_atmosphere(config::NORA3Config, architecture)
-    prescribed_radiation(config::NORA3Config, architecture)
+    prescribed_atmosphere(config::NORA3Config, architecture; reference_date = nothing)
+    prescribed_radiation(config::NORA3Config, architecture; reference_date = nothing)
 
 Read the setup's own prepared NORA3 file back at simulation time.
 
@@ -213,11 +213,22 @@ Read the setup's own prepared NORA3 file back at simulation time.
 `~/FjordSim_data/NORA3/NORA3.nc` the bare constructors default to, and errors naming
 `prepare_atmosphere` if that file is missing — so neither method needs its own check.
 """
-prescribed_atmosphere(config::NORA3Config, architecture) =
-    NORA3PrescribedAtmosphere(architecture; dataset = MultiYearNORA3(config))
+prescribed_atmosphere(config::NORA3Config, architecture; reference_date = nothing) =
+    NORA3PrescribedAtmosphere(architecture; dataset = MultiYearNORA3(config), reference_date)
 
-prescribed_radiation(config::NORA3Config, architecture) =
-    NORA3PrescribedRadiation(architecture; dataset = MultiYearNORA3(config))
+prescribed_radiation(config::NORA3Config, architecture; reference_date = nothing) =
+    NORA3PrescribedRadiation(architecture; dataset = MultiYearNORA3(config), reference_date)
+
+"""
+    atmosphere_date_range(config::NORA3Config)
+
+First and last date of the setup's prepared NORA3 file, read through `MultiYearNORA3`, which
+caches the whole time axis when it opens the file.
+"""
+function atmosphere_date_range(config::NORA3Config)
+    dataset = MultiYearNORA3(config)
+    return (first_date(dataset), last_date(dataset))
+end
 
 # --- Download ---
 

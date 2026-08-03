@@ -11,6 +11,8 @@ using Oceananigans.BoundaryConditions
 using Oceananigans.Units
 using Oceananigans.Utils: prettytime
 using NumericalEarth
+using Dates: DateTime, Second
+using NCDatasets
 
 using ..Configs:
     AbstractSimulationConfig,
@@ -22,7 +24,7 @@ using ..Configs:
     river_forcing_path,
     results_path
 using ..Utils: recursive_merge, progress, cell_advection_timescale_coupled_model
-using ..Atmospheres: prescribed_atmosphere, prescribed_radiation
+using ..Atmospheres: prescribed_atmosphere, prescribed_radiation, atmosphere_date_range
 using ..Forcing: forcing_from_file, interpolation_architecture
 using ..BoundaryConditions: top_bottom_boundary_conditions
 using ..Grids: ImmersedBoundaryGrid
@@ -57,6 +59,7 @@ atmosphere reader all come from `forcing_config` and `atmosphere_config`.
   `coupled_hydrostatic_simulation` unchanged.
 - `free_surface_cfl`: `SplitExplicitFreeSurface` needs the grid, so only the CFL is stored.
 - `bottom_drag_coefficient`: passed to `top_bottom_boundary_conditions`, which needs the grid.
+- `start_date`: the calendar instant model time zero stands for.
 - `stop_time`: seconds of simulated time to run for.
 - `output_interval`, `overwrite_existing`: the snapshot writer's schedule and clobber policy.
 - `progress_interval`: how often the `progress` callback reports.
@@ -64,6 +67,13 @@ atmosphere reader all come from `forcing_config` and `atmosphere_config`.
 
 A relative `output_file` resolves against `results_root`; an absolute one relocates just that
 file.
+
+`start_date` is a field rather than something derived from an input file because every prepared
+file has its *own* first record, and each reader used to zero its own axis there: the Oslofjord
+forcing starts at 12:00 and its atmosphere at 00:00, which silently ran the two twelve hours out
+of phase. One stated instant is the only thing they can all agree on, and
+`validate_time_coverage` checks each file actually spans `[start_date, start_date + stop_time]`
+rather than letting `Cyclical()` wrap the shortfall.
 
 Every duration is in seconds, and must be written as a `Float64` — with `Oceananigans.Units`
 (`365days`, `1hour`, `3minutes`), whose constants already are one. `Base.@kwdef` on a
@@ -86,6 +96,7 @@ Base.@kwdef mutable struct SimulationConfig{B,C,TA,MA,TR,I,CO,SI,BG} <: Abstract
     biogeochemistry::BG
     free_surface_cfl::Float64
     bottom_drag_coefficient::Float64
+    start_date::DateTime
     stop_time::Float64
     output_interval::Float64
     progress_interval::Float64
@@ -149,6 +160,44 @@ forcing_prerequisite(::Nothing) = "prepare_forcing"
 forcing_prerequisite(::AbstractRiverConfig) = "add_rivers"
 
 """
+    validate_time_coverage(label, range, start_date, stop_time, remedy)
+
+Check a prepared file's date `range` contains the run's whole interval.
+
+Both readers use `Cyclical()` time indexing, which does not fail outside the data it was given —
+it wraps, so a run that outlasts its forcing quietly replays the beginning and a run that starts
+before it quietly reads the end. This is what makes that unreachable instead of merely unlikely.
+A `nothing` range is a source that cannot report its dates, and is skipped.
+"""
+validate_time_coverage(label, ::Nothing, start_date, stop_time, remedy) = nothing
+
+function validate_time_coverage(label, range, start_date, stop_time, remedy)
+    first_available, last_available = range
+    end_date = start_date + Second(round(Int, stop_time))
+
+    start_date >= first_available || error(
+        "The run starts at $start_date but the $label only begins at $first_available. Move the " *
+        "simulation config's `start_date` to $first_available or later, or $remedy.",
+    )
+    end_date <= last_available || error(
+        "The run ends at $end_date but the $label stops at $last_available. Shorten `stop_time` " *
+        "to $(Second(last_available - start_date).value) seconds or less, or $remedy.",
+    )
+
+    return nothing
+end
+
+"""
+    forcing_date_range(filepath)
+
+First and last date on a prepared forcing file's time axis.
+"""
+forcing_date_range(filepath) = NCDataset(filepath) do ds
+    dates = ds["time"][:]
+    (first(dates), last(dates))
+end
+
+"""
     build_simulation(config::FjordConfig)
 
 Assemble the coupled simulation a setup describes, with its output writer, progress callback and
@@ -184,13 +233,33 @@ function build_simulation(config::FjordConfig)
         "$(forcing_prerequisite(config.forcing_config.rivers))` for this setup first.",
     )
 
+    start_date = simulation_config.start_date
+    stop_time = simulation_config.stop_time
+    validate_time_coverage(
+        "forcing $forcing_file",
+        forcing_date_range(forcing_file),
+        start_date,
+        stop_time,
+        "prepare more years of forcing",
+    )
+    validate_time_coverage(
+        "atmosphere",
+        atmosphere_date_range(config.atmosphere_config),
+        start_date,
+        stop_time,
+        "prepare more years of atmosphere",
+    )
+
     architecture = simulation_architecture(simulation_config)
     grid = ImmersedBoundaryGrid(bathymetry_file, architecture, config.grid_config.halo)
 
+    # Every time axis is zeroed at the same instant, so the components stay in phase: each
+    # prepared file has its own first record, and left to itself each reader would zero there.
     forcing = forcing_from_file(;
         grid = grid,
         filepath = forcing_file,
         tracers = simulation_config.tracers,
+        reference_date = start_date,
     )
     boundary_conditions = map(
         x -> FieldBoundaryConditions(; x...),
@@ -215,12 +284,12 @@ function build_simulation(config::FjordConfig)
         simulation_config.coriolis,
         forcing,
         boundary_conditions,
-        prescribed_atmosphere(config.atmosphere_config, architecture),
-        prescribed_radiation(config.atmosphere_config, architecture),
+        prescribed_atmosphere(config.atmosphere_config, architecture; reference_date = start_date),
+        prescribed_radiation(config.atmosphere_config, architecture; reference_date = start_date),
         simulation_config.sea_ice,
         simulation_config.biogeochemistry;
         results_dir = simulation_config.results_root,
-        stop_time = simulation_config.stop_time,
+        stop_time,
     )
 
     simulation.callbacks[:progress] =
