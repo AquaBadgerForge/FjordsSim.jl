@@ -657,7 +657,9 @@ end
           )
 
     drammen = drammensfjorden()
-    @test isnothing(drammen.forcing_config.rivers)     # so add_rivers is a no-op for it
+    @test drammen.forcing_config.rivers isa OF800RiversConfig
+    # Same convention as oslofjorden: the river data downloads under this setup's own root.
+    @test drammen.forcing_config.rivers.data_root == drammen.forcing_config.data_root
     @test drammen.atmosphere_config isa NORA3Config
     @test drammen.simulation_config isa SimulationConfig
     # A short demo window rather than oslofjorden's full year.
@@ -726,17 +728,23 @@ end
     # `add_rivers(grid, config, ::Nothing)` and `prepare_atmosphere(grid, ::Nothing)`. Rooted in a
     # temporary directory so nothing can touch the real ~/FjordSim_data.
     mktempdir() do tmp
-        # `drammensfjorden()` itself now names an atmosphere and a simulation config, so a config
-        # naming neither is assembled from its grid/bathymetry/forcing instead — `atmosphere_config`
-        # and `simulation_config` default to `nothing` when omitted.
+        # `drammensfjorden()` itself now names rivers, an atmosphere and a simulation config, so a
+        # config naming none of them is assembled from its grid and bathymetry plus a rivers-free
+        # forcing config — `atmosphere_config` and `simulation_config` default to `nothing` when
+        # omitted, and `rivers` is a type parameter of NorKystConfig, so it has to be left unnamed at
+        # construction rather than unset afterwards.
         base = drammensfjorden()
         config = FjordConfig(
             grid_config = base.grid_config,
             bathymetry_config = base.bathymetry_config,
-            forcing_config = base.forcing_config,
+            forcing_config = NorKystConfig(
+                data_root = tmp,
+                output_directory = "norkyst",
+                parameters = ["temperature", "salinity", "u_eastward", "v_northward"],
+                years = [2020],
+            ),
         )
         config.bathymetry_config.data_root = tmp
-        config.forcing_config.data_root = tmp
 
         @test isnothing(add_rivers(config))
         @test isnothing(prepare_atmosphere(config))
@@ -1021,11 +1029,12 @@ end
     @test_throws ArgumentError open_boundary_conditions(Val(:middle))
 
     # A setup that configures rivers simulates the rivers-augmented copy, never the pre-rivers
-    # file; one with no rivers reads what prepare_forcing wrote.
+    # file. Both registered setups do; the no-rivers branch is covered by `no_rivers` below.
     oslo = oslofjorden()
     @test simulation_forcing_path(oslo) == river_forcing_path(oslo.forcing_config.rivers)
     drammen = drammensfjorden()
-    @test simulation_forcing_path(drammen) == forcing_path(drammen.forcing_config)
+    @test simulation_forcing_path(drammen) == river_forcing_path(drammen.forcing_config.rivers)
+    @test simulation_forcing_path(drammen) != forcing_path(drammen.forcing_config)
 
     # Every prerequisite is reported as the command that produces it, and both checks run before
     # anything is read or allocated, so the temporary root stays empty apart from the stub.
@@ -1040,17 +1049,22 @@ end
         touch(bathymetry_path(config.bathymetry_config))
         @test_throws "add_rivers" build_simulation(config)
 
-        # ...and a setup with no rivers names prepare_forcing instead. Assembled rather than
-        # mutated, because `rivers` is a type parameter of NorKystConfig and cannot be unset.
-        without_rivers = drammensfjorden()
+        # ...and a config with no rivers names prepare_forcing instead. Built here rather than
+        # borrowed from a setup: `rivers` is a type parameter of NorKystConfig, so a config with none
+        # has to be constructed without naming it, and every registered setup now names one.
         no_rivers = FjordConfig(
-            grid_config = without_rivers.grid_config,
+            grid_config = config.grid_config,
             bathymetry_config = config.bathymetry_config,
-            forcing_config = without_rivers.forcing_config,
+            forcing_config = NorKystConfig(
+                data_root = tmp,
+                output_directory = "norkyst",
+                parameters = ["temperature", "salinity", "u_eastward", "v_northward"],
+                years = [2020],
+            ),
             simulation_config = config.simulation_config,
         )
-        no_rivers.forcing_config.data_root = tmp
         @test isnothing(no_rivers.forcing_config.rivers)
+        @test simulation_forcing_path(no_rivers) == forcing_path(no_rivers.forcing_config)
         @test_throws "prepare_forcing" build_simulation(no_rivers)
     end
 end

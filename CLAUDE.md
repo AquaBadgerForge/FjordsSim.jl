@@ -758,11 +758,13 @@ the setup function with `homedir()`; the config fields naming files (`output_fil
 `geodatabase_file`, `output_directory`) are names relative to `data_root`, and setting one to an
 absolute path relocates just that file — which is how a single FileGDB copy is shared across fjords.
 A nested config carries its own `data_root` too, so it can be relocated independently, but
-`oslofjorden()` gives its `OF800RiversConfig` the same `data_root` as the rest of the setup —
-the river data downloads there rather than being shared from elsewhere. `drammensfjorden()`
-names no `rivers`, so it defaults to `nothing` and the rivers step is a no-op — and it names
-neither an `atmosphere_config` nor a `simulation_config` either, which default to `nothing` and
-make both atmosphere steps and `run_simulation` no-ops the same way.
+both `oslofjorden()` and `drammensfjorden()` give their `OF800RiversConfig` the same `data_root` as
+the rest of the setup — the river data downloads there rather than being shared from elsewhere, so
+each setup carries its own copy of the ~176 MB series file. A setup wanting no rivers leaves the
+field unnamed so it defaults to `nothing`, making the rivers step a no-op; because `rivers` is a type
+parameter of `NorKystConfig`, that is a construction-time choice and cannot be undone on an existing
+instance. `atmosphere_config` and `simulation_config` default to `nothing` the same way, making both
+atmosphere steps and `run_simulation` no-ops — though both built-in setups name all three.
 
 The simulation config is rooted separately, at `~/FjordSim_results/<fjord>/` rather than under
 `data_root`, since it writes rather than reads. Unlike every other config, `SimulationConfig` has

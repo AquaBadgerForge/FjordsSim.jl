@@ -1,17 +1,24 @@
 """
     drammensfjorden()
 
-The Drammensfjord setup: Geonorge Sjøkart Dybdedata bathymetry, NorKyst-800m forcing and NORA3
-atmosphere on a 150 x 200 x 11 grid covering 10.20-10.45°E, 59.58-59.75°N.
+The Drammensfjord setup: Geonorge Sjøkart Dybdedata bathymetry, NorKyst-800m forcing with OF800
+rivers, and NORA3 atmosphere on a 150 x 200 x 11 grid covering 10.20-10.45°E, 59.58-59.75°N.
 
-It names neither rivers, so `add_rivers` is a no-op for it, but it does name an
-`atmosphere_config` and a `simulation_config` — the same buoyancy, closure, advection, tracers,
-coriolis, sea ice and time-step wizard settings as `oslofjorden()`, so it exercises the same
-physics. The two setups differ in scope, not in kind: this one runs a 30-day window
-(`start_date`/`stop_time`) rather than a full year, which is what makes it a fast first run to
-try the whole pipeline on, and its `initial_conditions` are `FromForcing()` rather than a literal
-`NamedTuple`, reading the NorKyst state at `start_date` once forcing has been prepared. Results go
-to `~/FjordSim_results/drammensfjorden/`, separate from the input data root.
+The river config gets the same `data_root` as the rest of the setup, as `oslofjorden()`'s does, so
+the river data downloads alongside it rather than being shared from elsewhere. Only Drammenselva,
+outlet 19 of the dataset's 25, is inside this grid — the rest are Oslofjord outlets far to the east
+and south, and Lierelva at 59.7502°N is 0.000625° north of the last latitude node. `river_cells`
+drops each of the 24 with an `@info`, which is not an error: `add_rivers` fails only when *no*
+outlet lands. It is still a required step, since `simulation_forcing_path` picks the
+rivers-augmented copy once a setup names rivers.
+
+It also names an `atmosphere_config` and a `simulation_config` — the same buoyancy, closure,
+advection, tracers, coriolis, sea ice and time-step wizard settings as `oslofjorden()`, so it
+exercises the same physics. The two setups differ in scope, not in kind: this one runs a 30-day
+window (`start_date`/`stop_time`) rather than a full year, which is what makes it a fast first run
+to try the whole pipeline on, and its `initial_conditions` are `FromForcing()` rather than a literal
+`NamedTuple`, reading the state at `start_date` from that rivers-augmented copy once `add_rivers`
+has run. Results go to `~/FjordSim_results/drammensfjorden/`, separate from the input data root.
 """
 function drammensfjorden()
     data_root = joinpath(homedir(), "FjordSim_data", "drammensfjorden")
@@ -49,6 +56,7 @@ function drammensfjorden()
             architecture         = :auto,
             parameters           = ["temperature", "salinity", "u_eastward", "v_northward"],
             years                = [2020],
+            rivers               = OF800RiversConfig(data_root = data_root),
         ),
         atmosphere_config = NORA3Config(
             data_root        = data_root,
