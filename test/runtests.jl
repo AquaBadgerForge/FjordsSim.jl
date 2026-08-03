@@ -658,8 +658,10 @@ end
 
     drammen = drammensfjorden()
     @test isnothing(drammen.forcing_config.rivers)     # so add_rivers is a no-op for it
-    @test isnothing(drammen.atmosphere_config)         # ...and so are both atmosphere steps
-    @test isnothing(drammen.simulation_config)         # ...and so is run_simulation
+    @test drammen.atmosphere_config isa NORA3Config
+    @test drammen.simulation_config isa SimulationConfig
+    # A short demo window rather than oslofjorden's full year.
+    @test drammen.simulation_config.stop_time == 30 * 86400.0
 end
 
 @testset "CLI" begin
@@ -724,7 +726,15 @@ end
     # `add_rivers(grid, config, ::Nothing)` and `prepare_atmosphere(grid, ::Nothing)`. Rooted in a
     # temporary directory so nothing can touch the real ~/FjordSim_data.
     mktempdir() do tmp
-        config = drammensfjorden()
+        # `drammensfjorden()` itself now names an atmosphere and a simulation config, so a config
+        # naming neither is assembled from its grid/bathymetry/forcing instead — `atmosphere_config`
+        # and `simulation_config` default to `nothing` when omitted.
+        base = drammensfjorden()
+        config = FjordConfig(
+            grid_config = base.grid_config,
+            bathymetry_config = base.bathymetry_config,
+            forcing_config = base.forcing_config,
+        )
         config.bathymetry_config.data_root = tmp
         config.forcing_config.data_root = tmp
 
@@ -812,14 +822,21 @@ end
     end
 
     # A setup naming no simulation config has nothing to log and no results root to log into, so
-    # `run_simulation` stays a no-op that writes nothing.
+    # `run_simulation` stays a no-op that writes nothing. `drammensfjorden()` itself now names one,
+    # so this config is assembled from its grid/bathymetry/forcing instead, leaving
+    # `simulation_config` at its default of `nothing`.
     mktempdir() do tmp
         config_file = joinpath(tmp, "config.jl")
         write(
             config_file,
             """
             using FjordSim
-            config = drammensfjorden()
+            base = drammensfjorden()
+            config = FjordConfig(
+                grid_config = base.grid_config,
+                bathymetry_config = base.bathymetry_config,
+                forcing_config = base.forcing_config,
+            )
             config.bathymetry_config.data_root = raw"$tmp"
             config.forcing_config.data_root = raw"$tmp"
             config

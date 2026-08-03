@@ -1,23 +1,60 @@
 # FjordSim.jl
 
-A framework for ocean simulations built on top of [Oceananigans](https://github.com/CliMA/Oceananigans.jl) and [NumericalEarth](https://github.com/NumericalEarth/NumericalEarth.jl).
+A framework for regional ocean simulations built on top of
+[Oceananigans](https://github.com/CliMA/Oceananigans.jl) and
+[NumericalEarth](https://github.com/NumericalEarth/NumericalEarth.jl).
 
-FjordSim's main contribution is a streamlined way to set up regional simulations.
-A simulation is assembled from the following components:
+## The idea
 
-1. **Grid**
-   Domain bounds, horizontal size, and vertical faces.
+Regional ocean models are usually set up one of two ways: through config files — text or YAML,
+the way [ROMS](https://www.myroms.org/) does it — or through a programmable script, the way
+Oceananigans and NumericalEarth themselves work. A config file lets you see every choice a run
+makes in one place, but only the choices its authors anticipated: adding genuinely new behavior
+means leaving the config format and writing code. A script can do anything, but the setup is now
+spread across however much of the script builds it, and nothing stops two runs of "the same
+model" from silently diverging.
 
-2. **Bathymetry file**
-   Contains the domain coordinates (longitude, latitude, depth) along with the bathymetric data.
-   It can be generated from the public [Geonorge](https://www.geonorge.no/) Sjøkart Dybdedata dataset, see below.
+FjordSim does both at once. A setup is a `FjordConfig` — a single Julia value a user can read
+top to bottom — but its fields are not limited to numbers and strings. A field can hold a live,
+programmable object: a turbulence closure, an advection scheme, a whole dataset adapter with its
+own download and regrid logic. Changing the *logic* of a run — swapping in a different closure,
+adding a new atmosphere source — is done by writing a new object and putting it in the config,
+not by writing a parallel script; and because it is still a config, the complete list of what a
+run does is still visible in one file rather than scattered across a codebase. This is a
+direction more than a finished state: today the programmable fields are grid, bathymetry,
+forcing, river, atmosphere and simulation configs, but more of the pipeline is meant to become
+config-visible this way over time, and configs are expected to nest more deeply as they do (a
+forcing config already holds a river config, for instance).
 
-3. **Forcing file**
-   Includes information about sinks and sources (e.g., rivers), boundary conditions, and custom forcings.
-   It can also be used to load initial conditions.
+## Main data components
 
-4. **Atmospheric data**
-   Supports JRA55 from [NumericalEarth](https://github.com/NumericalEarth/NumericalEarth.jl) and [NORA3](https://thredds.met.no/thredds/projects/nora3.html).
+A simulation is assembled from three data components, each regridded onto — or around — the
+same simulation grid:
+
+1. **Bathymetry** — the domain's depth and land/sea mask. `prepare_bathymetry` regrids a
+   bathymetry source onto the simulation grid (built from the grid config's bounds and
+   resolution) and writes the result as a NetCDF file, which is what actually defines the model's
+   `ImmersedBoundaryGrid`. The built-in source is the public
+   [Geonorge](https://www.geonorge.no/) Sjøkart Dybdedata dataset.
+
+2. **Forcing** — boundary and initial conditions from a larger-scale ocean model.
+   `prepare_forcing` regrids a regional reanalysis (built in: NorKyst-800m) onto the simulation
+   grid, producing relaxation values and lambdas along one open edge, plus optional river
+   relaxation (`add_rivers`) written on top. The same prepared file can also seed a run's initial
+   conditions, so the ocean starts from a realistic state instead of a uniform water column.
+
+3. **Atmospheric data** — the surface forcing a run needs but the regional ocean model does not
+   carry. `prepare_atmosphere` regrids a reanalysis product (built in: MET Norway's
+   [NORA3](https://thredds.met.no/thredds/projects/nora3.html)) onto its own regular
+   longitude/latitude grid — independent of the ocean grid, since NumericalEarth interpolates
+   between them — producing the eight variables a `PrescribedAtmosphere`/`PrescribedRadiation`
+   pair needs.
+
+Bathymetry and forcing are downloaded and regridded onto the *same* grid, so `prepare_forcing`
+needs the processed bathymetry to build the model's land mask. The atmosphere is independent of
+both. A setup can configure any subset of these — omitting an atmosphere or a simulation config
+just makes the corresponding steps no-ops — but the grid, bathymetry and forcing are always
+required.
 
 ## Installation
 
@@ -34,25 +71,78 @@ There are several options:
 
 - Add from the Julia registry: `add FjordSim`.
 
-## Setups (work in progress)
+## Quick start: Drammensfjorden
 
-Each fjord is a function in `src/Setups/` (`oslofjorden.jl`, `drammensfjorden.jl`) returning a
-`FjordConfig`, which groups a grid, a bathymetry, a forcing and an atmosphere configuration:
+`drammensfjorden()` in `src/Setups/drammensfjorden.jl` is the shortest complete example — the
+same physics as the built-in Oslofjord setup, but no rivers and a 30-day run instead of a full
+year, so it is a fast way to try every pipeline step once:
 
 ```julia
 function drammensfjorden()
     data_root = joinpath(homedir(), "FjordSim_data", "drammensfjorden")
+    FT = Oceananigans.defaults.FloatType
 
     return FjordConfig(
         grid_config       = EvenGrid(size = (150, 200, 11), longitude = (10.20, 10.45), ...),
         bathymetry_config = DybdedataConfig(data_root = data_root, output_file = "bathymetry.nc", ...),
-        forcing_config    = NorKystConfig(data_root = data_root, years = [2020]),
+        forcing_config    = NorKystConfig(data_root = data_root, years = [2020], ...),
+        atmosphere_config = NORA3Config(data_root = data_root, years = [2020], ...),
+        simulation_config = SimulationConfig(
+            buoyancy           = SeawaterBuoyancy(FT, equation_of_state = TEOS10EquationOfState(FT)),
+            closure            = (CATKEVerticalDiffusivity(minimum_tke = 7e-6), ...),
+            initial_conditions = FromForcing(),   # the NorKyst state at start_date
+            start_date         = DateTime(2020, 1, 1),
+            stop_time          = 30days,          # a short window, not a full year
+            ...
+        ),
     )
 end
 ```
 
-`setup_names()` lists the registered setups and `fjord_config(name)` returns one by name; that is
-what `--config` resolves.
+Preprocessing the data and running it is the same six commands as any setup with rivers left out
+— this one names none:
+
+```bash
+julia --project -m FjordSim prepare_bathymetry --config drammensfjorden
+julia --project -m FjordSim download_forcing --config drammensfjorden
+julia --project -m FjordSim prepare_forcing --config drammensfjorden
+julia --project -m FjordSim download_atmosphere --config drammensfjorden
+julia --project -m FjordSim prepare_atmosphere --config drammensfjorden
+julia --project -m FjordSim run_simulation --config drammensfjorden
+```
+
+or, equivalently, from the REPL:
+
+```julia
+using FjordSim
+config = drammensfjorden()
+prepare_bathymetry(config)
+download_forcing(config)
+prepare_forcing(config)
+download_atmosphere(config)
+prepare_atmosphere(config)
+run_simulation(config)
+```
+
+Snapshots land in `~/FjordSim_results/drammensfjorden/`. To inspect or step through the assembled
+model instead of running it outright, use `build_simulation` in place of `run_simulation`:
+
+```julia
+using FjordSim
+simulation = build_simulation(drammensfjorden())
+run!(simulation)
+```
+
+The full reference for every subcommand — including the features this quick setup does not use,
+like rivers, looping and checkpointing — is under "Prepare input data" and "Run a simulation"
+below, using the built-in Oslofjord setup.
+
+## Setups
+
+Each fjord is a zero-argument function in `src/Setups/` (`oslofjorden.jl`, `drammensfjorden.jl`)
+returning a `FjordConfig`, which groups a grid, a bathymetry, a forcing, and optionally an
+atmosphere and a simulation configuration. `setup_names()` lists the registered setups and
+`fjord_config(name)` returns one by name; that is what `--config` resolves.
 
 By default, input data goes to `$HOME/FjordSim_data/<fjord>/` and results to
 `$HOME/FjordSim_results/<fjord>/`. The config fields naming individual files are relative to the
@@ -137,32 +227,35 @@ Registering a fjord only buys the shorter `--config <name>`, its appearance in `
 coverage by the tests that loop over `setup_names()`. For a one-off fjord, the standalone file is
 the better choice.
 
-To add a new kind of grid, bathymetry source, or forcing dataset, define a struct subtyping
-`AbstractGridConfig`, `AbstractBathymetryConfig`, or `AbstractForcingConfig` and overload that
-supertype's hooks — `FjordConfig`, the generic pipelines and the command line stay unchanged. Each
-pipeline is one generic function plus a handful of dispatch points:
+### Adding a new source
 
-| Pipeline | Generic entry point | Hooks a new source implements |
-|---|---|---|
-| Grid | — | `LatitudeLongitudeGrid(architecture, config)` |
-| Bathymetry | `prepare_bathymetry(target_grid, config)` | `bathymetry_dataset(target_grid, config)`; optionally `regrid_options(config)` |
-| Forcing | `prepare_forcing(target_grid, config)`, `download_forcing(config)` | `forcing_time_steps`, `forcing_source_grid`, `forcing_variable_names`; `download_forcing(target_grid, config)` if it downloads |
-| Simulation | `build_simulation(config)`, `run_simulation(config)` | none — `AbstractSimulationConfig` is fields only |
+To add a new kind of grid, bathymetry source, forcing dataset, river dataset or atmosphere
+dataset, define a struct subtyping the matching supertype and overload its hooks —
+`FjordConfig`, the generic pipelines and the command line stay unchanged. Each pipeline is one
+generic function plus a handful of dispatch points; each supertype's docstring in
+`src/Configs.jl` lists the full field and hook contract, and the adapter files below are the
+templates to copy.
 
-`AbstractAtmosphereConfig` additionally has two read-side hooks, `prescribed_atmosphere(config,
-architecture)` and `prescribed_radiation(config, architecture)`, which is how the simulation
-reads a prepared atmosphere without naming a dataset.
+| Config | Generic entry point | Hooks a new source implements | Template |
+|---|---|---|---|
+| Grid (`AbstractGridConfig`) | — | `LatitudeLongitudeGrid(architecture, config)` | `src/Grids.jl` |
+| Bathymetry (`AbstractBathymetryConfig`) | `prepare_bathymetry(target_grid, config)` | `bathymetry_dataset(target_grid, config)`; optionally `regrid_options`, `smoothing_options` | `src/Bathymetry/geonorge.jl` |
+| Forcing (`AbstractForcingConfig`) | `prepare_forcing(target_grid, config)`, `download_forcing(config)` | `forcing_time_steps`, `forcing_source_grid`, `forcing_variable_names`; `download_forcing(target_grid, config)` if it downloads | `src/Forcing/norkyst.jl` |
+| Rivers (`AbstractRiverConfig`) | `add_rivers(target_grid, config)` | `river_locations`, `river_series`; `download_rivers` if it downloads | `src/Forcing/of800_rivers.jl` |
+| Atmosphere (`AbstractAtmosphereConfig`) | `prepare_atmosphere(target_grid, config)`, `download_atmosphere(config)` | `atmosphere_time_steps`, `atmosphere_source_grid`, `atmosphere_variable_names`; `download_atmosphere(target_grid, config)` if it downloads; `prescribed_atmosphere`, `prescribed_radiation` if the setup is simulated | `src/Atmospheres/nora3_source.jl` |
+| Simulation (`AbstractSimulationConfig`) | `build_simulation(config)`, `run_simulation(config)` | none — fields only | `src/Setups/oslofjorden.jl` |
 
-Path resolution (`bathymetry_path`, `forcing_path`, `forcing_directory`, `results_path`,
-`plot_path`) and the diagnostic plots (`plot_bathymetry`, `plot_forcing`) are defined on the
-supertypes, so a new source inherits them. `src/Bathymetry/geonorge.jl` and `src/Forcing/norkyst.jl` are the built-in
-adapters and the templates to copy; each supertype's docstring in `src/Configs.jl` lists the
-fields and hooks it expects.
+A river config is not a `FjordConfig` field on its own — it goes in the forcing config's `rivers`
+field, `nothing` for a setup with no rivers. Path resolution (`bathymetry_path`, `forcing_path`,
+`forcing_directory`, `river_forcing_path`, `atmosphere_path`, `atmosphere_directory`,
+`results_path`, `plot_path`) and the diagnostic plots (`plot_bathymetry`, `plot_forcing`,
+`plot_atmosphere`) are defined on the supertypes, so a new source inherits them for free.
 
 ## Prepare input data
 
 Every step takes the setup to prepare via `--config`, which is required and is the only option
-— everything else is stated in the setup:
+— everything else is stated in the setup. The Oslofjord setup is used below since it is the one
+that configures every step, including rivers:
 
 ```bash
 # Bathymetry: downloads the Geonorge Sjøkart FileGDB on first use (~2.3 GB), regrids it onto the
@@ -260,6 +353,16 @@ the initial conditions, the coriolis, the sea ice, the run length, the output in
 time-step wizard settings — is the `SimulationConfig` in `src/Setups/oslofjorden.jl`.
 `SimulationConfig` has no defaults, so that block is the whole story: every knob is stated there,
 and omitting one is an `UndefKeywordError` naming it rather than a silently inherited value.
+`initial_conditions` can be a literal `NamedTuple`, `FromForcing()` (the prepared forcing's own
+state at `start_date`), or `FromResults(path)` (a previous run's snapshot); `drammensfjorden()`
+above uses `FromForcing()`.
+
+A run can repeat its window several times with the ocean state carried over (`loops`, a spin-up
+for basins that do not equilibrate in one forcing year), and can write periodic checkpoints
+(`checkpoint_interval`) that a later run resumes from with `pickup = true`. The quick-start setup
+above sets `loops = 1` and `checkpoint_interval = 0.0` (no checkpointing); `oslofjorden()` shows
+checkpointing turned on (`checkpoint_interval = 30days`), and both fields are documented on
+`SimulationConfig` in `src/Simulations.jl`.
 
 The grid, forcing and atmospheric forcing for the Oslofjord are also available
 [here](https://www.dropbox.com/scl/fo/gc3yc155b5eohi7998wgh/AGN2Yt3HyQ0LlZGImpcca6o?rlkey=x6okc3uxe2avud6sbxgd00l14&st=093llyqp&dl=0)

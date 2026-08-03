@@ -84,11 +84,11 @@ function oslofjorden()
             tracer_advection        = (T = WENO(), S = WENO()),
             momentum_advection      = WENOVectorInvariant(FT),
             tracers                 = (:T, :S),
-            # The NorKyst state at `start_date` rather than a uniform water column: every tracer
-            # named above plus u and v, whichever of them the forcing file carries. A literal
-            # NamedTuple (`(T = 5.0, S = 33.0)`) still works, and
+            # FromForcing(): the NorKyst state at `start_date` rather than a uniform water 
+            # column: every tracer named above plus u and v, whichever of them the forcing 
+            # file carries. A literal NamedTuple (`(T = 5.0, S = 33.0)`) still works, and
             # `FromResults("snapshots_ocean_<tag>.nc")` continues from a previous run instead.
-            initial_conditions      = FromForcing(),
+            initial_conditions      = (T = 5.0, S = 33.0),
             coriolis                = HydrostaticSphericalCoriolis(FT),
             sea_ice                 = FreezingLimitedOceanTemperature(),
             biogeochemistry         = nothing,

@@ -1,14 +1,21 @@
 """
     drammensfjorden()
 
-The Drammensfjord setup: Geonorge Sjøkart Dybdedata bathymetry and NorKyst-800m forcing on a
-150 x 200 x 11 grid covering 10.20-10.45°E, 59.58-59.75°N.
+The Drammensfjord setup: Geonorge Sjøkart Dybdedata bathymetry, NorKyst-800m forcing and NORA3
+atmosphere on a 150 x 200 x 11 grid covering 10.20-10.45°E, 59.58-59.75°N.
 
-It names neither rivers nor an atmosphere, so both default to `nothing` and `add_rivers`,
-`download_atmosphere` and `prepare_atmosphere` are no-ops for it.
+It names neither rivers, so `add_rivers` is a no-op for it, but it does name an
+`atmosphere_config` and a `simulation_config` — the same buoyancy, closure, advection, tracers,
+coriolis, sea ice and time-step wizard settings as `oslofjorden()`, so it exercises the same
+physics. The two setups differ in scope, not in kind: this one runs a 30-day window
+(`start_date`/`stop_time`) rather than a full year, which is what makes it a fast first run to
+try the whole pipeline on, and its `initial_conditions` are `FromForcing()` rather than a literal
+`NamedTuple`, reading the NorKyst state at `start_date` once forcing has been prepared. Results go
+to `~/FjordSim_results/drammensfjorden/`, separate from the input data root.
 """
 function drammensfjorden()
     data_root = joinpath(homedir(), "FjordSim_data", "drammensfjorden")
+    FT = Oceananigans.defaults.FloatType
 
     return FjordConfig(
         grid_config = EvenGrid(
@@ -42,6 +49,50 @@ function drammensfjorden()
             architecture         = :auto,
             parameters           = ["temperature", "salinity", "u_eastward", "v_northward"],
             years                = [2020],
+        ),
+        atmosphere_config = NORA3Config(
+            data_root        = data_root,
+            output_directory = "nora3",
+            output_file      = "atmosphere.nc",
+            plot_file        = "atmosphere.png",
+            resolution       = 0.02,
+            padding          = 0.1,
+            years            = [2020],
+        ),
+        simulation_config = SimulationConfig(
+            results_root            = joinpath(homedir(), "FjordSim_results", "drammensfjorden"),
+            output_file             = "snapshots_ocean.nc",
+            architecture            = :auto,
+            buoyancy                = SeawaterBuoyancy(FT, equation_of_state = TEOS10EquationOfState(FT)),
+            closure                 = (
+                CATKEVerticalDiffusivity(minimum_tke = 7e-6),
+                HorizontalScalarBiharmonicDiffusivity(ν = 1e5, κ = 1e4),
+            ),
+            tracer_advection        = (T = WENO(), S = WENO()),
+            momentum_advection      = WENOVectorInvariant(FT),
+            tracers                 = (:T, :S),
+            # The NorKyst state at `start_date`: every tracer named above plus u and v, whichever
+            # of them the prepared forcing file carries.
+            initial_conditions      = FromForcing(),
+            coriolis                = HydrostaticSphericalCoriolis(FT),
+            sea_ice                 = FreezingLimitedOceanTemperature(),
+            biogeochemistry         = nothing,
+            free_surface_cfl        = 0.7,
+            bottom_drag_coefficient = 0.003,
+            # A 30-day window rather than oslofjorden's full year, so this setup's `run_simulation`
+            # finishes quickly as a first end-to-end run. Both prepare steps still pad their axes
+            # to reach it.
+            start_date              = DateTime(2020, 1, 1),
+            stop_time               = 30days,
+            loops                   = 1,
+            output_interval         = 1hour,
+            progress_interval       = 1hour,
+            overwrite_existing      = true,
+            checkpoint_interval     = 0.0,
+            pickup                  = false,
+            time_step_cfl           = 0.1,
+            max_time_step           = 3minutes,
+            max_time_step_change    = 1.01,
         ),
     )
 end
