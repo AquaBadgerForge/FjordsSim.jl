@@ -27,7 +27,8 @@ using ..Configs:
     bathymetry_path,
     forcing_path,
     forcing_directory,
-    river_forcing_path
+    river_forcing_path,
+    coverage_window
 using ..Plotting: plot_forcing
 
 export forcing_from_file,
@@ -539,10 +540,15 @@ regridded to a regular lon/lat grid upstream. What does work is projecting the t
 interpolating against a `RectilinearGrid` in projected meters; see `source_field_grid` and
 `interpolate_to_target!`.
 
+# Coverage
+`coverage` is the `(first, last)` calendar interval the run needs, from `coverage_window`. The time
+axis is padded to reach both ends by replicating the nearest step; `nothing` prepares exactly the
+downloaded range. See `pad_time_steps`.
+
 # Returns
 A named tuple with `output_file`, `times` and `variables` (the written variable names).
 """
-function prepare_forcing(target_grid, config::AbstractForcingConfig)
+function prepare_forcing(target_grid, config::AbstractForcingConfig; coverage = nothing)
     architecture = interpolation_architecture(config)
     variable_names = forcing_variable_names(config)
     source_names = [name for name in config.parameters if haskey(variable_names, name)]
@@ -553,7 +559,7 @@ function prepare_forcing(target_grid, config::AbstractForcingConfig)
 
     validate_relaxation_edge(config.relaxation_edge)
 
-    steps = daily_time_steps(forcing_time_steps(config))
+    steps = pad_time_steps(daily_time_steps(forcing_time_steps(config)), coverage)
     reference_file = first(steps).lower.filepath
     source = forcing_source_grid(config, reference_file)
     @info "Preparing forcing from $(length(unique(step -> step.lower.filepath, steps))) file(s), " *
@@ -580,6 +586,9 @@ matches the model exactly, which means `prepare_bathymetry` must have run first.
 CPU regardless of `config.forcing_config.architecture` — that field selects where the
 interpolation kernel runs, and building the masks needs scalar access to the bathymetry.
 
+The coverage window comes from the setup's simulation config, so the prepared file spans the run
+the setup describes; a setup naming no simulation config gets `nothing` and the downloaded range.
+
 # Returns
 The `prepare_forcing(target_grid, config)` named tuple with `plot_file` added.
 """
@@ -591,7 +600,11 @@ function prepare_forcing(config::FjordConfig)
     )
 
     grid = ImmersedBoundaryGrid(bathymetry_file, CPU(), config.grid_config.halo)
-    result = prepare_forcing(grid, config.forcing_config)
+    result = prepare_forcing(
+        grid,
+        config.forcing_config;
+        coverage = coverage_window(config.simulation_config),
+    )
     plot_file = plot_forcing(grid, config.forcing_config)
 
     @info "Prepared variables: $(join(result.variables, ", "))"
@@ -647,6 +660,85 @@ function daily_time_steps(records; max_gap = FORCING_MAX_GAP)
         @warn "Interpolated $(length(interpolated)) missing day(s): $(join(interpolated, ", "))"
 
     return steps
+end
+
+"""
+    pad_time_steps(steps, coverage)
+
+Extend `steps` to span `coverage`, replicating the nearest step at each end that falls short. A
+`nothing` coverage leaves `steps` alone.
+
+Written after `daily_time_steps` so its whole-day cadence check sees only the downloaded times: a
+pad step is deliberately off that cadence whenever the run's window is.
+
+The pad carries the *same* source records and blend weight as the step it copies, so the written
+field is identical to its neighbour rather than a re-derived approximation of it. That is what makes
+the padding a statement about the time axis alone.
+
+The reason this exists is that a run's window rarely lines up with a dataset's records — NorKyst's
+first daily record here is at 12:00, so a run starting at 00:00 on the same day has no forcing for
+its first half-day. `forcing_from_file` reads with `Cyclical()` time indexing, which does not fail
+outside its data but wraps to the far end, so the shortfall would be filled with the following
+December rather than reported. Padding puts a real record at both ends instead, which is what lets
+`Simulations.validate_time_coverage` stay a hard check.
+
+That last point is also why a pad may reach **at most one record spacing** past the downloaded axis.
+Unbounded, this would defeat the very check it exists to serve: a window running a year past the
+data would be "covered" by one replicated December, `forcing_date_range` would report the invented
+span, `validate_time_coverage` would pass, and the run would interpolate twelve months between two
+identical records — quietly worse than the wrap. Overshooting by more than a spacing is a missing
+download, and is reported as one.
+"""
+pad_time_steps(steps, ::Nothing) = steps
+
+function pad_time_steps(steps, coverage)
+    first_needed, last_needed = coverage
+    padded = collect(steps)
+
+    if first(padded).date > first_needed
+        head = first(padded)
+        spacing = forcing_record_spacing(padded)
+        head.date - first_needed <= spacing || error(
+            "The run starts at $first_needed but the downloaded forcing only begins at " *
+            "$(head.date), more than one record spacing " *
+            "($(Dates.canonicalize(spacing))) later. Download the preceding period, or move the " *
+            "simulation config's `start_date` to " *
+            "$(head.date - spacing) or later.",
+        )
+        pushfirst!(padded, ForcingTimeStep(first_needed, head.lower, head.upper, head.weight))
+        @info "Padded forcing start: replicated $(head.date) at $first_needed"
+    end
+
+    if last(padded).date < last_needed
+        tail = last(padded)
+        spacing = forcing_record_spacing(padded)
+        last_needed - tail.date <= spacing || error(
+            "The run ends at $last_needed but the downloaded forcing already stops at " *
+            "$(tail.date), more than one record spacing " *
+            "($(Dates.canonicalize(spacing))) earlier. Download the following period, or shorten " *
+            "`stop_time` so the run ends by " *
+            "$(tail.date + spacing).",
+        )
+        push!(padded, ForcingTimeStep(last_needed, tail.lower, tail.upper, tail.weight))
+        @info "Padded forcing end: replicated $(tail.date) at $last_needed"
+    end
+
+    return padded
+end
+
+"""
+    forcing_record_spacing(steps)
+
+The axis's record spacing, taken from its first pair — `daily_time_steps` has already made it
+uniform, so one pair speaks for the whole axis. A single-record axis has no spacing to bound a pad
+by, and is an error rather than a guess.
+"""
+function forcing_record_spacing(steps)
+    length(steps) >= 2 || error(
+        "Cannot pad a forcing axis of $(length(steps)) record(s): its record spacing, which " *
+        "bounds how far a pad may reach, is unknown.",
+    )
+    return steps[2].date - steps[1].date
 end
 
 """

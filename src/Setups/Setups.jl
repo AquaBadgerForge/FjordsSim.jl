@@ -20,7 +20,7 @@ using ..Grids: EvenGrid
 using ..Bathymetry: DybdedataConfig
 using ..Atmospheres: NORA3Config
 using ..Forcing: NorKystConfig, OF800RiversConfig
-using ..Simulations: SimulationConfig
+using ..Simulations: SimulationConfig, FromForcing, FromResults
 
 include("oslofjorden.jl")
 include("drammensfjorden.jl")

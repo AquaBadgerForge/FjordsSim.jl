@@ -2,7 +2,7 @@ module CLI
 
 export parse_arguments
 
-using ..Configs: AbstractSimulationConfig, FjordConfig
+using ..Configs: AbstractSimulationConfig, FjordConfig, run_tag
 using ..Setups: fjord_config, setup_names
 using ..Bathymetry: prepare_bathymetry
 using ..Atmospheres: prepare_atmosphere, download_atmosphere
@@ -89,7 +89,7 @@ command-line surface. The same steps are available from the REPL:
 """
 
 """
-The name of a run's transcript, resolved against the setup's results directory by `log_path`.
+The fallback name of a run's transcript, for a setup with no simulation config to tag it from.
 
 Not an option, because `--config` is the whole command-line surface and a log nobody has to
 remember to ask for is the point — a stacktrace through `SimulationConfig` is long enough to push
@@ -100,17 +100,19 @@ const LOG_FILE = "fjordsim.log"
 """
     log_path(config)
 
-Where to write this run's transcript: `LOG_FILE` under the setup's `results_root`, so a log lands
-beside the output it describes rather than wherever the command happened to be run from.
+Where to write this run's transcript: `fjordsim_<run_tag>.log` under the setup's `results_root`, so
+a log lands beside the output it describes rather than wherever the command happened to be run from,
+and so runs with different `start_date`s do not overwrite each other's transcript.
 
-Dispatched on `config.simulation_config` like `simulation_forcing_path`, because `results_root` is
-a field of the simulation config and a setup need not name one. A setup that does not — every step
-of `drammensfjorden`, for instance — has no results directory to speak of, so it falls back to the
-working directory.
+Dispatched on `config.simulation_config` like `simulation_forcing_path`, because `results_root` and
+`start_date` are fields of the simulation config and a setup need not name one. A setup that does
+not — every step of `drammensfjorden`, for instance — has no results directory and no run to tag, so
+it falls back to `LOG_FILE` in the working directory.
 """
 log_path(config::FjordConfig) = log_path(config.simulation_config)
 log_path(::Nothing) = LOG_FILE
-log_path(config::AbstractSimulationConfig) = joinpath(config.results_root, LOG_FILE)
+log_path(config::AbstractSimulationConfig) =
+    joinpath(config.results_root, string("fjordsim_", run_tag(config), ".log"))
 
 """
     tee_output(f, log_file)

@@ -11,7 +11,13 @@ It also names a `simulation_config`, so `run_simulation` works once the preparat
 run. `SimulationConfig` has no defaults, so every knob the simulation uses — buoyancy, closure,
 advection, tracers, coriolis, sea ice, the run length and the wizard settings — is stated here
 and nowhere else. Results go to `~/FjordSim_results/oslofjorden/`, separate from the input data
-root.
+root, named after `start_date` so runs do not overwrite each other.
+
+`start_date` and `stop_time` also decide what the prepare steps write: they pad the forcing and
+atmosphere time axes to span exactly this window, so changing either means re-running
+`prepare_forcing`, `add_rivers` and `prepare_atmosphere`. The window here is the whole of 2020, which
+needs that padding at both ends — files prepared against the old 12:00-anchored window will be
+rejected by `validate_time_coverage` until those three steps have been re-run.
 """
 function oslofjorden()
     data_root = joinpath(homedir(), "FjordSim_data", "oslofjorden")
@@ -78,20 +84,33 @@ function oslofjorden()
             tracer_advection        = (T = WENO(), S = WENO()),
             momentum_advection      = WENOVectorInvariant(FT),
             tracers                 = (:T, :S),
-            initial_conditions      = (T = 5.0, S = 33.0),
+            # The NorKyst state at `start_date` rather than a uniform water column: every tracer
+            # named above plus u and v, whichever of them the forcing file carries. A literal
+            # NamedTuple (`(T = 5.0, S = 33.0)`) still works, and
+            # `FromResults("snapshots_ocean_<tag>.nc")` continues from a previous run instead.
+            initial_conditions      = FromForcing(),
             coriolis                = HydrostaticSphericalCoriolis(FT),
             sea_ice                 = FreezingLimitedOceanTemperature(),
             biogeochemistry         = nothing,
             free_surface_cfl        = 0.7,
             bottom_drag_coefficient = 0.003,
-            # The NorKyst forcing's first record. The NORA3 atmosphere starts at 00:00 and the
-            # forcing at 12:00, so anchoring both here is what keeps them in phase; 365 days from
-            # it lands exactly on the forcing's last record.
-            start_date              = DateTime(2020, 1, 1, 12),
-            stop_time               = 365days,
+            # The whole calendar year 2020, which is a leap year — so 366 days from midnight on
+            # 1 January lands exactly on midnight a year later. Neither prepared file has a record
+            # at either end natively (NorKyst's are daily at 12:00, NORA3's hourly from 00:00 to
+            # 23:00), so both prepare steps pad their axes to reach them: 12 hours at each end of
+            # the forcing and one hour at the end of the atmosphere, each within the one-record-
+            # spacing bound. That is what lets the window be a round year instead of being pinned
+            # to whichever instant the forcing happened to start at.
+            start_date              = DateTime(2020, 1, 1),
+            stop_time               = 366days,
+            # One pass. Raise it to spin the deep basins up on the same forcing year, carrying the
+            # state over; each repetition writes its own `_loopNN` file.
+            loops                   = 1,
             output_interval         = 1hour,
             progress_interval       = 1hour,
             overwrite_existing      = true,
+            checkpoint_interval     = 30days,
+            pickup                  = false,
             time_step_cfl           = 0.1,
             max_time_step           = 3minutes,
             max_time_step_change    = 1.01,

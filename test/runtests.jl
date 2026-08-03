@@ -50,6 +50,17 @@ end
 struct MinimalSimulation <: AbstractSimulationConfig
     results_root::String
     output_file::String
+    # `results_path` tags the output with `run_tag`, and `coverage_window` reports the interval the
+    # prepare steps pad to, so these two are part of the supertype's field set as much as
+    # `results_root` is — an alternative simulation config that omitted them would inherit neither.
+    start_date::DateTime
+    stop_time::Float64
+end
+
+# A stand-in for a coupled-model component that does have a clock, so `rewind_clock!`'s
+# has-a-clock branch can be exercised without building a model.
+struct ClockHolder{C}
+    clock::C
 end
 
 # A river config the "Add rivers round-trip" testset drives `add_rivers` with, standing in for a
@@ -616,8 +627,14 @@ end
           joinpath(oslo.atmosphere_config.data_root, "atmosphere.nc")
     # Results are rooted separately from the input data, so `results_root` is its own path.
     @test oslo.simulation_config isa SimulationConfig
+    # Tagged with `start_date`, so runs of different windows do not overwrite each other.
     @test results_path(oslo.simulation_config) ==
-          joinpath(homedir(), "FjordSim_results", "oslofjorden", "snapshots_ocean.nc")
+          joinpath(
+              homedir(),
+              "FjordSim_results",
+              "oslofjorden",
+              "snapshots_ocean_20200101T0000.nc",
+          )
 
     drammen = drammensfjorden()
     @test isnothing(drammen.forcing_config.rivers)     # so add_rivers is a no-op for it
@@ -743,12 +760,13 @@ end
         end
     end
 
-    # The log goes beside the output it describes. `results_root` is a simulation-config field, so a
-    # setup naming no simulation config has no results directory and falls back to the cwd — the
+    # The log goes beside the output it describes, tagged with the run's `start_date` so runs stay
+    # distinguishable. `results_root` and `start_date` are simulation-config fields, so a setup
+    # naming no simulation config has neither and falls back to `LOG_FILE` in the cwd — the
     # `drammensfjorden` case the test above relies on.
     oslo = oslofjorden()
     @test FjordSim.CLI.log_path(oslo) ==
-          joinpath(oslo.simulation_config.results_root, FjordSim.CLI.LOG_FILE)
+          joinpath(oslo.simulation_config.results_root, "fjordsim_20200101T0000.log")
     @test FjordSim.CLI.log_path(drammensfjorden()) == FjordSim.CLI.LOG_FILE
     @test FjordSim.CLI.log_path(nothing) == FjordSim.CLI.LOG_FILE
 
@@ -774,7 +792,7 @@ end
             @test FjordSim.main(["prepare_forcing", "--config", config_file]) == 1
             @test !isfile(FjordSim.CLI.LOG_FILE)
 
-            logged = read(joinpath(results, FjordSim.CLI.LOG_FILE), String)
+            logged = read(joinpath(results, "fjordsim_20200101T0000.log"), String)
             @test occursin("Processed bathymetry", logged)
         end
     end
@@ -833,6 +851,9 @@ end
     @test_throws UndefKeywordError SimulationConfig(; delete!(copy(fields), :coriolis)...)
     @test_throws UndefKeywordError SimulationConfig(; delete!(copy(fields), :tracer_advection)...)
     @test_throws UndefKeywordError SimulationConfig(; delete!(copy(fields), :stop_time)...)
+    @test_throws UndefKeywordError SimulationConfig(; delete!(copy(fields), :loops)...)
+    @test_throws UndefKeywordError SimulationConfig(; delete!(copy(fields), :checkpoint_interval)...)
+    @test_throws UndefKeywordError SimulationConfig(; delete!(copy(fields), :pickup)...)
     @test_throws UndefKeywordError SimulationConfig()
 
     config = oslofjorden().simulation_config
@@ -845,20 +866,60 @@ end
 
     # The device is a Symbol, not a live CPU()/GPU(), so a setup file loads without a GPU.
     @test fieldtype(typeof(config), :architecture) === Symbol
+
+    # `run_tag` is the simulated start instant, so the same config always names the same files and
+    # post-processing can predict them; it is inserted before the extension either way, and the loop
+    # index goes on top of it so a looped run gives each repetition its own file.
+    @test run_tag(config) == "20200101T0000"
     @test results_path(config) ==
-          joinpath(homedir(), "FjordSim_results", "oslofjorden", "snapshots_ocean.nc")
+          joinpath(
+              homedir(),
+              "FjordSim_results",
+              "oslofjorden",
+              "snapshots_ocean_20200101T0000.nc",
+          )
+    @test results_path(config, 7) ==
+          joinpath(
+              homedir(),
+              "FjordSim_results",
+              "oslofjorden",
+              "snapshots_ocean_20200101T0000_loop07.nc",
+          )
+    # A single run keeps the shorter name; only a looped one gains the index.
+    @test FjordSim.Simulations.loop_output_path(config, 1) == results_path(config)
+    config.loops = 3
+    @test FjordSim.Simulations.loop_output_path(config, 1) == results_path(config, 1)
+    config.loops = 1
+
     config.output_file = "/elsewhere/run.nc"      # an absolute path relocates just that file
-    @test results_path(config) == "/elsewhere/run.nc"
+    @test results_path(config) == "/elsewhere/run_20200101T0000.nc"
+    config.output_file = "snapshots_ocean.nc"
+
+    # The window every loop replays, which is what the prepare steps pad their axes to. It does not
+    # grow with `loops`, since each repetition replays the same interval.
+    @test coverage_window(config) == (DateTime(2020, 1, 1), DateTime(2021, 1, 1))
+    config.loops = 5
+    @test coverage_window(config) == (DateTime(2020, 1, 1), DateTime(2021, 1, 1))
+    config.loops = 1
+    @test isnothing(coverage_window(nothing))     # a setup naming no simulation config
+
+    # The checkpoint prefix carries the loop index because the checkpoint itself does not: the state
+    # records the clock but not which repetition produced it.
+    @test FjordSim.Simulations.checkpoint_prefix(config, 3) ==
+          "checkpoint_20200101T0000_loop03"
 
     # The values Oslofjord runs with, stated in the setup rather than inherited. Durations are
     # seconds, and must be Float64 — @kwdef on a parametric struct does not convert.
     @test config.tracers == (:T, :S)
-    @test config.initial_conditions == (T = 5.0, S = 33.0)
+    @test config.initial_conditions isa FromForcing
     @test isnothing(config.biogeochemistry)
     @test config.architecture == :auto
-    @test config.stop_time == 365 * 24 * 3600.0
+    @test config.stop_time == 366 * 24 * 3600.0   # 2020 is a leap year
+    @test config.loops == 1
     @test config.output_interval == 3600.0
     @test config.max_time_step == 180.0
+    @test config.checkpoint_interval == 30 * 24 * 3600.0
+    @test config.pickup == false
 
     # Architecture resolution shares `interpolation_architecture`'s Val methods, so :cpu pins the
     # CPU and an unknown selector is rejected rather than silently defaulted.
@@ -927,7 +988,12 @@ end
             0.05,
             0.1,
         ),
-        simulation_config = MinimalSimulation(data_root, "column_snapshots.nc"),
+        simulation_config = MinimalSimulation(
+            data_root,
+            "column_snapshots.nc",
+            DateTime(2021, 3, 4, 5),
+            7200.0,
+        ),
     )
     rivers = MinimalRivers(data_root, "column_rivers.nc", 3600.0, 10)
 
@@ -976,8 +1042,15 @@ end
     @test atmosphere_path(config.atmosphere_config) == joinpath(data_root, "column_atmosphere.nc")
     @test atmosphere_directory(config.atmosphere_config) == joinpath(data_root, "column_source")
     @test plot_path(config.atmosphere_config) == joinpath(data_root, "column_atmosphere.png")
-    # The simulation config resolves against `results_root`, being the one config that writes.
-    @test results_path(config.simulation_config) == joinpath(data_root, "column_snapshots.nc")
+    # The simulation config resolves against `results_root`, being the one config that writes, and
+    # inherits the run tag, the loop-indexed variant and the coverage window for free.
+    @test run_tag(config.simulation_config) == "20210304T0500"
+    @test results_path(config.simulation_config) ==
+          joinpath(data_root, "column_snapshots_20210304T0500.nc")
+    @test results_path(config.simulation_config, 12) ==
+          joinpath(data_root, "column_snapshots_20210304T0500_loop12.nc")
+    @test coverage_window(config.simulation_config) ==
+          (DateTime(2021, 3, 4, 5), DateTime(2021, 3, 4, 7))
 
     # `river_search_radius` is the river pipeline's one optional hook.
     @test river_search_radius(rivers) == 10
@@ -2195,6 +2268,287 @@ end
     end
 end
 
+@testset "Time axis padding" begin
+    pad_time_steps = FjordSim.Forcing.pad_time_steps
+    pad_atmosphere_records = FjordSim.Atmospheres.pad_atmosphere_records
+    ForcingTimeStep = FjordSim.Forcing.ForcingTimeStep
+    SourceRecord = FjordSim.Forcing.SourceRecord
+
+    step(date, index) =
+        ForcingTimeStep(date, SourceRecord(date, "a.nc", index), SourceRecord(date, "a.nc", index), 0.0f0)
+    steps = [step(DateTime(2020, 1, 1, 12), 1), step(DateTime(2020, 1, 2, 12), 2)]
+
+    # A setup naming no simulation config prepares exactly the downloaded range.
+    @test pad_time_steps(steps, nothing) === steps
+    # So does a window the axis already spans.
+    @test length(pad_time_steps(steps, (DateTime(2020, 1, 1, 12), DateTime(2020, 1, 2, 12)))) == 2
+
+    # A window reaching past either end gets one replicated record there, carrying the same source
+    # records and blend weight, so the written field is identical to its neighbour.
+    padded = pad_time_steps(steps, (DateTime(2020, 1, 1), DateTime(2020, 1, 3)))
+    @test [entry.date for entry in padded] == [
+        DateTime(2020, 1, 1),
+        DateTime(2020, 1, 1, 12),
+        DateTime(2020, 1, 2, 12),
+        DateTime(2020, 1, 3),
+    ]
+    @test first(padded).lower.index == 1 && first(padded).upper.index == 1
+    @test last(padded).lower.index == 2 && last(padded).weight == 0.0f0
+
+    # A pad may reach at most one record spacing. Unbounded it would manufacture the very coverage
+    # `validate_time_coverage` exists to verify: one replicated December would "cover" a window a
+    # year past the data, and the run would interpolate twelve months between identical records.
+    @test_throws ErrorException pad_time_steps(
+        steps, (DateTime(2019, 12, 31, 11), DateTime(2020, 1, 2, 12)),
+    )
+    @test_throws ErrorException pad_time_steps(
+        steps, (DateTime(2020, 1, 1, 12), DateTime(2020, 1, 3, 13)),
+    )
+    # Exactly one spacing is allowed at each end.
+    @test length(pad_time_steps(steps, (DateTime(2019, 12, 31, 12), DateTime(2020, 1, 3, 12)))) == 4
+    # A one-record axis has no spacing to bound a pad by, and says so instead of guessing.
+    @test_throws ErrorException pad_time_steps(
+        [first(steps)], (DateTime(2020, 1, 1), DateTime(2020, 1, 1, 12)),
+    )
+
+    records = [
+        AtmosphereRecord(DateTime(2020, 1, 1, 0), "n.nc", 1),
+        AtmosphereRecord(DateTime(2020, 1, 1, 1), "n.nc", 2),
+    ]
+    @test pad_atmosphere_records(records, nothing) === records
+
+    # A pad points at the same file and index, so `validate_source_consistency` sees no new file.
+    padded = pad_atmosphere_records(records, (DateTime(2019, 12, 31, 23), DateTime(2020, 1, 1, 2)))
+    @test [entry.date for entry in padded] == [
+        DateTime(2019, 12, 31, 23),
+        DateTime(2020, 1, 1, 0),
+        DateTime(2020, 1, 1, 1),
+        DateTime(2020, 1, 1, 2),
+    ]
+    @test [entry.index for entry in padded] == [1, 1, 2, 2]
+    @test all(entry -> entry.filepath == "n.nc", padded)
+
+    @test_throws ErrorException pad_atmosphere_records(
+        records, (DateTime(2019, 12, 31, 22), DateTime(2020, 1, 1, 1)),
+    )
+    @test_throws ErrorException pad_atmosphere_records(
+        records, (DateTime(2020, 1, 1, 0), DateTime(2020, 1, 1, 3)),
+    )
+end
+
+@testset "Loop restart clocks" begin
+    rewind_clock! = FjordSim.Simulations.rewind_clock!
+
+    # NumericalEarth's own `reset_clock!(::EarthSystemModel)` cannot be used: its per-component
+    # fallback is `reset!(getproperty(component, :clock))` and `components` includes `sea_ice`, so a
+    # `FreezingLimitedOceanTemperature` — a liquidus and nothing else — makes it throw. This is the
+    # regression test for that, and the reason `rewind_clock!` dispatches on having a clock at all.
+    @test_throws Exception Oceananigans.Simulations.reset_clock!(FreezingLimitedOceanTemperature())
+    @test isnothing(rewind_clock!(FreezingLimitedOceanTemperature()))
+    @test isnothing(rewind_clock!(nothing))
+
+    # A component that does have a clock is sent back to zero, state untouched.
+    clock = Oceananigans.TimeSteppers.Clock{Float64}(time = 1234.5, iteration = 42)
+    rewind_clock!(ClockHolder(clock))
+    @test clock.time == 0
+    @test clock.iteration == 0
+end
+
+@testset "Initial conditions" begin
+    resolve_initial_conditions = FjordSim.Simulations.resolve_initial_conditions
+    initial_conditions_date = FjordSim.Simulations.initial_conditions_date
+    forcing_state = FjordSim.Simulations.forcing_state
+    results_state = FjordSim.Simulations.results_state
+
+    # An unnamed date reads the run's own start_date; a named one is taken as given.
+    @test initial_conditions_date(FromForcing(), DateTime(2020, 1, 1, 12)) == DateTime(2020, 1, 1, 12)
+    @test initial_conditions_date(FromForcing(DateTime(2020, 6, 1)), DateTime(2020, 1, 1, 12)) ==
+          DateTime(2020, 6, 1)
+
+    # A literal NamedTuple is already what `set!` wants, so it passes through by identity — the
+    # behaviour every setup had before the other two shapes existed.
+    constants = (T = 5.0, S = 33.0)
+    @test resolve_initial_conditions(constants, nothing, "unused.nc", nothing) === constants
+
+    Nx, Ny, Nz = 6, 5, 4
+    grid_config = EvenGrid(
+        size = (Nx, Ny, Nz),
+        halo = (3, 3, 3),
+        longitude = (10.0, 11.0),
+        latitude = (59.0, 60.0),
+        z_faces = collect(range(-40.0, 0.0, length = Nz + 1)),
+    )
+
+    mktempdir() do tmp
+        bathymetry_config = DybdedataConfig(
+            data_root = tmp,
+            output_file = "bathymetry.nc",
+            plot_file = "bathymetry.png",
+        )
+        underlying_grid = LatitudeLongitudeGrid(CPU(), grid_config)
+        bottom_height = Field{Center,Center,Nothing}(underlying_grid)
+        set!(bottom_height, fill(-40.0, (Nx, Ny)))
+        write_bathymetry_file(bathymetry_path(bathymetry_config), underlying_grid, bottom_height)
+        grid = ImmersedBoundaryGrid(bathymetry_path(bathymetry_config), CPU(), grid_config.halo)
+
+        # A prepared forcing file: land is NaN, and every variable has a `_lambda` twin the state
+        # reader must ignore.
+        forcing_file = joinpath(tmp, "forcing.nc")
+        dates = [DateTime(2020, 1, 1, 12), DateTime(2020, 1, 2, 12)]
+        NCDataset(forcing_file, "c") do ds
+            defDim(ds, "Nx", Nx)
+            defDim(ds, "Ny", Ny)
+            defDim(ds, "Nz", Nz)
+            defDim(ds, "Nx_faces", Nx + 1)
+            defDim(ds, "Ny_faces", Ny + 1)
+            defDim(ds, "time", length(dates))
+            defVar(ds, "time", dates, ("time",))
+            for (name, nx, ny) in
+                (("T", Nx, Ny), ("S", Nx, Ny), ("u", Nx + 1, Ny), ("v", Nx, Ny + 1))
+                xdim = nx == Nx ? "Nx" : "Nx_faces"
+                ydim = ny == Ny ? "Ny" : "Ny_faces"
+                for variable in (name, name * "_lambda")
+                    defVar(
+                        ds,
+                        variable,
+                        Float32,
+                        (xdim, ydim, "Nz", "time");
+                        attrib = ["_FillValue" => NaN32],
+                    )
+                end
+                for index = 1:length(dates)
+                    slab = fill(Float32(index), (nx, ny, Nz))
+                    slab[1, 1, 1] = NaN32          # land, as prepare_forcing writes it
+                    ds[name][:, :, :, index] = slab
+                    ds[name*"_lambda"][:, :, :, index] = zeros(Float32, nx, ny, Nz)
+                end
+            end
+        end
+
+        state = forcing_state(forcing_file, grid, DateTime(2020, 1, 2, 12), (:T, :S))
+        @test keys(state) == (:T, :S, :u, :v)
+        @test size(state.T) == (Nx, Ny, Nz)
+        @test size(state.u) == (Nx + 1, Ny, Nz)     # u is on x faces
+        @test size(state.v) == (Nx, Ny + 1, Nz)     # v is on y faces
+        # Converted to the grid's element type, since a Union{Missing,Float32} array cannot be
+        # moved to a GPU and a mismatched element type need not convert on the device.
+        @test all(array -> eltype(array) === eltype(grid), values(state))
+        @test all(array -> all(isfinite, array), values(state))
+        @test state.T[1, 1, 1] == 0                 # land zeroed
+        @test state.T[2, 2, 2] == 2                 # the second record, not the first
+
+        # The date must be on the axis: a nearest-record fallback would silently start the run
+        # somewhere else.
+        @test_throws ErrorException forcing_state(forcing_file, grid, DateTime(2020, 1, 3, 12), (:T, :S))
+
+        # A results file: time is seconds from the writing run's model zero, so a calendar date
+        # needs the `start_date` attribute `build_simulation` records.
+        function write_results(filepath, attributes)
+            NCDataset(filepath, "c"; attrib = attributes) do ds
+                defDim(ds, "λ_caa", Nx)
+                defDim(ds, "φ_aca", Ny)
+                defDim(ds, "z_aac", Nz)
+                defDim(ds, "λ_faa", Nx + 1)
+                defDim(ds, "φ_afa", Ny + 1)
+                defDim(ds, "time", 3)
+                defVar(ds, "time", [0.0, 3600.0, 7200.0], ("time",))
+                for (name, xdim, ydim, nx, ny) in (
+                    ("T", "λ_caa", "φ_aca", Nx, Ny),
+                    ("S", "λ_caa", "φ_aca", Nx, Ny),
+                    ("u", "λ_faa", "φ_aca", Nx + 1, Ny),
+                    ("v", "λ_caa", "φ_afa", Nx, Ny + 1),
+                )
+                    defVar(ds, name, Float32, (xdim, ydim, "z_aac", "time"))
+                    for index = 1:3
+                        ds[name][:, :, :, index] = fill(Float32(10 * index), (nx, ny, Nz))
+                    end
+                end
+            end
+        end
+
+        tagged = joinpath(tmp, "snapshots_tagged.nc")
+        write_results(tagged, ["start_date" => string(DateTime(2020, 1, 1, 12))])
+
+        # No date takes the last record, which is the only thing an untagged file can offer.
+        untagged = joinpath(tmp, "snapshots_untagged.nc")
+        write_results(untagged, Pair{String,String}[])
+        @test results_state(untagged, grid, nothing, (:T, :S)).T[1, 1, 1] == 30
+        @test_throws ErrorException results_state(untagged, grid, DateTime(2020, 1, 1, 13), (:T, :S))
+
+        # With the attribute, a date resolves to its record.
+        @test results_state(tagged, grid, DateTime(2020, 1, 1, 13), (:T, :S)).T[1, 1, 1] == 20
+        @test results_state(tagged, grid, DateTime(2020, 1, 1, 12), (:T, :S)).T[1, 1, 1] == 10
+        @test_throws ErrorException results_state(tagged, grid, DateTime(2020, 6, 1), (:T, :S))
+
+        # A state file from another grid is a clear error rather than a silent misread.
+        wrong = joinpath(tmp, "wrong_grid.nc")
+        NCDataset(wrong, "c") do ds
+            defDim(ds, "λ_caa", Nx + 1)
+            defDim(ds, "φ_aca", Ny)
+            defDim(ds, "z_aac", Nz)
+            defDim(ds, "time", 1)
+            defVar(ds, "time", [0.0], ("time",))
+        end
+        @test_throws DimensionMismatch results_state(wrong, grid, nothing, (:T, :S))
+
+        # `FromResults` resolves a relative path against `results_root`, like `output_file` does.
+        simulation_config = oslofjorden().simulation_config
+        simulation_config.results_root = tmp
+        @test resolve_initial_conditions(
+            FromResults("snapshots_tagged.nc"),
+            grid,
+            forcing_file,
+            simulation_config,
+        ).T[1, 1, 1] == 30
+        @test_throws ErrorException resolve_initial_conditions(
+            FromResults("absent.nc"),
+            grid,
+            forcing_file,
+            simulation_config,
+        )
+
+        # And `FromForcing` with no date reads the run's own start_date.
+        simulation_config.start_date = DateTime(2020, 1, 1, 12)
+        @test resolve_initial_conditions(
+            FromForcing(),
+            grid,
+            forcing_file,
+            simulation_config,
+        ).T[2, 2, 2] == 1
+    end
+end
+
+@testset "Checkpoint resume" begin
+    resume_loop = FjordSim.Simulations.resume_loop
+    checkpoint_prefix = FjordSim.Simulations.checkpoint_prefix
+
+    mktempdir() do tmp
+        config = oslofjorden().simulation_config
+        config.results_root = tmp
+        config.loops = 4
+
+        # Without `pickup` the run always starts at the first repetition.
+        config.pickup = false
+        @test resume_loop(config) == 1
+
+        # With `pickup` but no checkpoints, it warns and starts from the beginning rather than
+        # failing — `run!` itself tolerates a missing checkpoint the same way.
+        config.pickup = true
+        @test (@test_logs (:warn,) resume_loop(config)) == 1
+
+        # The loop index is read back out of the checkpoint filename, because the checkpoint state
+        # records the clock but not which repetition produced it.
+        touch(joinpath(tmp, checkpoint_prefix(config, 1) * "_iteration50.jld2"))
+        touch(joinpath(tmp, checkpoint_prefix(config, 3) * "_iteration7.jld2"))
+        touch(joinpath(tmp, checkpoint_prefix(config, 3) * "_iteration90.jld2"))
+        @test resume_loop(config) == 3
+
+        # A checkpoint from a different run tag is not this run's to resume.
+        config.start_date = DateTime(2021, 5, 6, 7)
+        @test (@test_logs (:warn,) resume_loop(config)) == 1
+    end
+end
+
 @testset "Build simulation" begin
     # The "Simulation config" testset only reaches build_simulation's two prerequisite errors, so
     # everything past them — the HydrostaticFreeSurfaceModel, the coupled OceanSeaIceModel and the
@@ -2254,6 +2608,10 @@ end
         simulation_config.architecture = :cpu
         simulation_config.results_root = tmp
         simulation_config.stop_time = 60.0
+        # The synthetic forcing above has two daily records at 12:00, not the real setup's padded
+        # whole-year axis, so the window is moved onto its first record. `initial_conditions` is
+        # oslofjorden's `FromForcing()`, which reads exactly there.
+        simulation_config.start_date = DateTime(2020, 1, 1, 12)
 
         config = FjordConfig(
             grid_config = grid_config,
@@ -2288,5 +2646,69 @@ end
             config.forcing_config.relaxation_edge,
         )
         @test edge_bc isa BoundaryCondition{<:Oceananigans.BoundaryConditions.NormalFlow}
+
+        # The snapshot writer records `start_date`, which is the only thing that lets a later
+        # `FromResults(path, date)` turn a date into a record — a snapshot's own time axis is
+        # seconds from model zero and says nothing about the calendar.
+        ocean_writer = simulation.model.ocean.output_writers[:ocean]
+        @test ocean_writer.filepath == results_path(simulation_config)
+        @test ocean_writer.global_attributes["start_date"] == string(simulation_config.start_date)
+
+        # The checkpointer goes on the *coupled* simulation: `prognostic_state` of the coupled model
+        # is what a resumable state is, and `run!(…; pickup)` looks for it there. Exactly one, which
+        # is what `checkpoint_path` requires.
+        checkpointers =
+            filter(writer -> writer isa Checkpointer, collect(values(simulation.output_writers)))
+        @test length(checkpointers) == 1
+        @test !any(
+            writer -> writer isa Checkpointer,
+            values(simulation.model.ocean.output_writers),
+        )
+
+        # A zero interval attaches none at all, rather than one that never fires.
+        simulation_config.checkpoint_interval = 0.0
+        no_checkpoint = build_simulation(config)
+        @test !any(
+            writer -> writer isa Checkpointer,
+            values(no_checkpoint.output_writers),
+        )
+        simulation_config.checkpoint_interval = 30 * 24 * 3600.0
+
+        # Looping does not widen what the prepared files must span, so a two-loop run of the same
+        # window still builds; the loop index reaches the output filename.
+        simulation_config.loops = 2
+        looped = build_simulation(config)
+        @test looped.stop_time == 60.0
+        @test looped.model.ocean.output_writers[:ocean].filepath ==
+              results_path(simulation_config, 1)
+
+        # Restarting a loop over the real object graph: every clock goes back to zero, the ocean
+        # state does not, the writer is replaced with the next loop's file, and the ocean
+        # sub-simulation is marked uninitialized so its fresh writer gets a schedule and a t = 0
+        # record. Exercised without a run!, since the loop's correctness lives here rather than in
+        # the time stepping.
+        looped.model.clock.time = 42.0
+        looped.model.clock.iteration = 7
+        looped.model.ocean.model.clock.time = 42.0
+        looped.model.ocean.model.clock.iteration = 7
+        set!(looped.model.ocean.model, T = 9.0)
+        FjordSim.Simulations.restart_loop!(looped, simulation_config, 2)
+
+        @test looped.model.clock.time == 0
+        @test looped.model.clock.iteration == 0
+        @test looped.model.ocean.model.clock.time == 0
+        @test looped.model.ocean.model.clock.iteration == 0
+        @test !looped.model.ocean.initialized
+        @test looped.model.ocean.output_writers[:ocean].filepath ==
+              results_path(simulation_config, 2)
+        # The state carried over — that is the whole point of resetting only the clocks.
+        @test maximum(interior(looped.model.ocean.model.tracers.T)) ≈ 9.0
+        # stop_time is untouched, so the next repetition runs the same window.
+        @test looped.stop_time == 60.0
+
+        # A loop count below one is rejected before anything is read or allocated.
+        simulation_config.loops = 0
+        @test_throws ArgumentError build_simulation(config)
+        simulation_config.loops = 1
     end
 end

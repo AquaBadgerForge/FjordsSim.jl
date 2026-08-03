@@ -39,6 +39,22 @@ registered setup name (`FjordSim.Setups.SETUPS`) or a path to an out-of-tree `.j
 whose last expression is a `FjordConfig`. Every other knob, including which device the forcing
 interpolation runs on, is a config field.
 
+### Changing `start_date` or `stop_time`
+
+Both prepare steps pad their time axes to span the run window the simulation config names
+(`coverage_window`), so moving either end invalidates the prepared files. Re-run, in this order:
+
+```bash
+julia --project -m FjordSim prepare_forcing     --config oslofjorden   # rewrites forcing.nc
+julia --project -m FjordSim add_rivers          --config oslofjorden   # re-copies forcing_rivers.nc
+julia --project -m FjordSim prepare_atmosphere  --config oslofjorden   # rewrites atmosphere.nc
+```
+
+`add_rivers` is not optional here: it `cp`s the forcing file and patches the copy, so
+`forcing_rivers.nc` — which is what `simulation_forcing_path` gives the simulation — still carries
+the *old* axis until it is re-run. Neither download step is affected; both prepares are pure regrids.
+`loops` is not part of the window, so changing it re-runs nothing.
+
 `-m` is Julia 1.12's package entry point, which is why `Project.toml` has `[compat] julia = "1.12"`.
 The equivalent without `-m` is
 `julia --project -e 'using FjordSim; FjordSim.main(ARGS)' -- prepare_forcing --config oslofjorden`.
@@ -82,14 +98,37 @@ modules, in `include` order from `src/FjordSim.jl`:
    supertype's docstring lists the fields and hook methods a subtype must provide — see "Adding a
    new source" below.
 
+   Three helpers on `AbstractSimulationConfig` read `start_date`, which is therefore as much part of
+   the supertype's field set as `results_root` is. `run_tag` is the run's identity as a filename
+   fragment (`yyyymmddTHHMM`); `results_path(config)` inserts it before `output_file`'s extension and
+   `results_path(config, loop)` appends a zero-padded loop index on top; `coverage_window` is the
+   `(first, last)` calendar interval the run needs its prepared inputs to span, which
+   `prepare_forcing` and `prepare_atmosphere` take as their `coverage`.
+
+   The tag is derived from the *simulated* start instant, not the wall clock, so a config always
+   names the same files: post-processing can predict them, and — load-bearing — a `pickup` appends to
+   the file it was already writing rather than to a new one. It distinguishes *configurations*, not
+   invocations; two runs of the same config still collide, governed by `overwrite_existing`.
+
    `AbstractSimulationConfig` is the one supertype with fields but no hooks: `build_simulation` is
    generic over the whole `FjordConfig`, because everything dataset-specific already comes from
    the other configs. It is also the only one rooted at a `results_root` rather than a
    `data_root`, being the only config that writes rather than reads.
 
 2. **Dataset adapters** (`src/Datasets.jl`) — `ForcingDataset` and `ResultsDataset` are NumericalEarth
-   dataset wrappers for local FjordSim NetCDF files (forcing inputs and simulation outputs),
-   used for initial conditions and restart.
+   dataset wrappers for local FjordSim NetCDF files (forcing inputs and simulation outputs).
+
+   **Both are dead code, and broken.** Neither is constructed anywhere in `src/`, `test/` or
+   `examples/`; the only call site ever written was already commented out when it was deleted. They
+   also no longer work: NumericalEarth 0.6 added a `read_file_coords` step
+   (`DataWrangling/metadata_field.jl`) that reads `ds[longitude_name(metadatum)]` and
+   `ds[latitude_name(metadatum)]`, defaulting to `"longitude"`/`"latitude"`, whereas the forcing file
+   names its axes `Nx`/`Ny` and a results file names them `λ_faa`/`φ_afa`.
+
+   Initial conditions do **not** go through them — see the `Simulations` section. Both prepared files
+   are already on the model grid, so reading a state is an `NCDatasets` read and a type conversion,
+   and none of NumericalEarth's `Metadatum`/`native_grid`/regrid/inpaint path applies. This is the
+   same argument the `Forcing` section makes for not reusing NumericalEarth's dataset path there.
 
 3. **Utils** (`src/Utils.jl`) — `progress` callback, `recursive_merge` for nested boundary-condition
    named tuples, `cell_advection_timescale_coupled_model` for the time-step wizard, plus
@@ -148,13 +187,19 @@ modules, in `include` order from `src/FjordSim.jl`:
 
    `prepare_atmosphere(target_grid, config::AbstractAtmosphereConfig)` regrids the downloaded files
    onto a regular lon/lat grid: `atmosphere_variable_names(config)` picks the variables →
-   `atmosphere_time_steps(config)` gives the hourly `AtmosphereRecord`s →
+   `atmosphere_time_steps(config)` gives the hourly `AtmosphereRecord`s → `pad_atmosphere_records`
+   extends that axis to the run's `coverage` window →
    `atmosphere_source_grid(config, filepath)` gives the downloaded geometry →
    `atmosphere_target_axes` derives the prepared axes from `x_domain`/`y_domain` grown by
    `config.padding` and sampled at `config.resolution` → `projected_atmosphere_nodes` projects them
    into the source projection in one bulk GDAL call → one bilinear `interpolate_to_target!` per
    variable per step → streaming NetCDF write. `download_atmosphere(config::FjordConfig)` is the
    generic download driver, mirroring `download_forcing`.
+
+   `pad_atmosphere_records` runs *after* `validate_atmosphere_records`, whose hourly-gap warning is
+   about download integrity and would otherwise fire on a pad that is deliberately off the hourly
+   cadence. See the `Forcing` section for why both prepared files are padded rather than the readers
+   made tolerant, and for the one-record-spacing bound.
 
    The prepared file's layout is a **contract**, fixed by the read side: `Float32` variables of
    shape `(lon, lat, time)`, uniformly spaced 1D `lon`/`lat` centers (`compute_faces` infers the
@@ -210,7 +255,8 @@ modules, in `include` order from `src/FjordSim.jl`:
 
    `prepare_forcing(target_grid, config::AbstractForcingConfig)` regrids the downloaded source
    files onto the simulation grid: `forcing_variable_names(config)` picks the variables →
-   `forcing_time_steps(config)` completed by `daily_time_steps` to a gap-free daily axis →
+   `forcing_time_steps(config)` completed by `daily_time_steps` to a gap-free daily axis, then
+   extended to the run's `coverage` window by `pad_time_steps` →
    `forcing_source_grid(config, filepath)` → land mask from `peripheral_node` (so it matches the
    model, including `PartialCellBottom` and the velocity-face wall convention), with the open
    `relaxation_edge` row restored → source mask filled from the nearest valid cell (`SourceFill`)
@@ -218,6 +264,33 @@ modules, in `include` order from `src/FjordSim.jl`:
    against the source subset expressed as a `RectilinearGrid` in projected meters
    (`ProjectedSourceGrid`, `source_field_grid`) → relaxation lambdas along `relaxation_edge` →
    streaming NetCDF write. Only the three hooks are dataset-specific; the rest is shared.
+
+   **Time-axis padding.** `pad_time_steps(steps, coverage)` extends the axis to reach both ends of
+   the run window, replicating the nearest step — same source records, same blend weight, so the
+   written field is identical to its neighbour. `coverage` comes from `coverage_window` at the one
+   place that holds both configs, `prepare_forcing(config::FjordConfig)`; `nothing` (a setup naming
+   no simulation config) prepares exactly the downloaded range.
+
+   It exists because a run's window rarely lines up with a dataset's records — NorKyst's first daily
+   record in Oslofjord is at 12:00, so a run starting at 00:00 has no forcing for its first half-day
+   — and because both readers use `Cyclical()` time indexing, which does not fail outside its data
+   but wraps to the far end of the year. Padding is what lets `validate_time_coverage` stay a hard
+   check instead of the wrap silently filling the shortfall with the following December.
+
+   Two things about it are load-bearing. It runs **after** `daily_time_steps`, because a pad at the
+   `SourceRecord` level would put a 12-hour difference into that function's whole-day cadence test
+   and collapse every step to a single record, silently disabling gap-filling for the whole year. And
+   a pad may reach **at most one record spacing** past the downloaded axis
+   (`forcing_record_spacing`): unbounded, it would manufacture the very coverage the validator
+   exists to verify — one replicated December would "cover" a window a year past the data,
+   `forcing_date_range` would report the invented span, and the run would interpolate twelve months
+   between two identical records, which is strictly worse than the wrap it was written to prevent.
+   Overshooting by more than a spacing is a missing download and is reported as one.
+
+   Padding changes `Cyclical`'s *inferred* period, which is `(tᴺ - t¹) + Δt` and after a pad equals
+   neither the loop period nor anything else meaningful. That is harmless only because the clock-reset
+   loop never steps outside `[t¹, tᴺ]`, so the cycling branch is dead code — do not "fix" the period.
+   It is also the argument that rules out the monotonic-clock alternative; see `Simulations`.
 
    Where the interpolation kernel runs is the config's `architecture` field (`:auto`, `:cpu`,
    `:gpu`), resolved by `interpolation_architecture` — `:auto` picks the GPU when
@@ -312,7 +385,8 @@ modules, in `include` order from `src/FjordSim.jl`:
     inside it. Its 15-positional signature is unchanged by the move, and `FjordSim` still exports
     it.
 
-    `SimulationConfig`'s fields split three ways, and the split is forced rather than stylistic.
+    `SimulationConfig` has 25 fields. They split three ways, and the split is forced rather than
+    stylistic.
     `buoyancy`, `closure`, `tracer_advection`, `momentum_advection`, `tracers`,
     `initial_conditions`, `coriolis`, `sea_ice` and `biogeochemistry` depend on neither the grid
     nor the device, so they are stored as the objects `coupled_hydrostatic_simulation` consumes —
@@ -351,12 +425,138 @@ modules, in `include` order from `src/FjordSim.jl`:
     `time_indexing` had to change. The atmosphere half goes through the optional
     `atmosphere_date_range` hook, so the module still names no dataset.
 
+    The window checked is **one** `stop_time`, not `loops` of them: every repetition replays the same
+    interval, so what the prepared files must span does not grow with the loop count. Multiplying by
+    `loops` is the obvious wrong move.
+
     `build_simulation` returns the instrumented `Simulation` without running it — the REPL and
     debugger entry point — and `run_simulation` calls it and `run!`. Both return `nothing` for a
     setup naming no simulation config. Each prerequisite is checked before anything is read or
     allocated and reported as the command that produces it; the atmosphere is the exception,
     because `MultiYearNORA3(config)` already owns that error, which is what keeps the module free
     of any named dataset.
+
+    ### Initial conditions
+
+    `initial_conditions` holds one of three shapes, resolved by `resolve_initial_conditions` in
+    `build_simulation` — where the grid and the forcing path are known — into the `NamedTuple` that
+    `coupled_hydrostatic_simulation`'s single `set!(ocean_model; initial_conditions...)` consumes.
+    That function is therefore unchanged and learns nothing about the new shapes; the dispatch is
+    three methods, not a branch.
+
+    - a `NamedTuple` of constants, functions or fields — already what `set!` wants, so it passes
+      through by identity. This is what every setup did before the others existed.
+    - `FromForcing(date = nothing)` — a record of the prepared forcing file, `nothing` meaning the
+      run's own `start_date`.
+    - `FromResults(path, date = nothing)` — a record of a previous run's snapshot file, `nothing`
+      meaning its last. A relative `path` resolves against `results_root`, like `output_file`.
+
+    Both files are already on the model grid — `prepare_forcing` regridded onto it, and a snapshot was
+    written from fields on it — so this is a read and a type conversion, not an interpolation. Hence
+    `src/Datasets.jl` stays unused: none of NumericalEarth's `Metadatum`/`native_grid`/regrid/inpaint
+    path applies. Three details are load-bearing. Land is `NaN`/`missing` in the forcing file and is
+    zeroed, which is exact rather than approximate because `prepare_forcing` writes `NaN` at precisely
+    the cells `peripheral_node` calls dry on this same grid. Arrays are converted to `eltype(grid)`,
+    because a `Union{Missing,Float32}` array cannot become a `CuArray` at all. And the date must be on
+    the axis exactly — a nearest-record fallback would silently start the run somewhere else.
+
+    A snapshot's `time` is seconds from *its* run's model zero and carries no calendar, so
+    `FromResults(path, date)` needs the instant that zero stood for. The snapshot writer records it as
+    the `start_date` global attribute (`RESULTS_START_DATE_ATTRIBUTE`), keeping that knowledge with the
+    data rather than making it a second config field that could disagree. A file predating the
+    attribute can only be read by its last record, and says so.
+
+    What gets set is every tracer the simulation config's `tracers` names plus `u` and `v`,
+    intersected with what the source file carries. That list is **never written out** in
+    `Simulations`: `state_variables` derives it as
+    `(map(String, tracers) ∪ ("u", "v")) ∩ keys(ds)`, the same rule `forcing_from_file` uses to decide
+    which forcing terms to build, so adding a biogeochemical tracer to a setup is enough to have it
+    read back and the two cannot disagree about what the state is. A tracer the source lacks is left
+    at its default rather than being an error, which is what lets one reader serve both file kinds.
+
+    The free surface `η` and any closure-owned tracer the config does not name (CATKE's `e`) keep
+    their defaults. So both `FromForcing` and `FromResults` are a **lossy warm start** — the
+    turbulence state, the free surface and the Adams-Bashforth tendencies are absent, and the first
+    hours are a barotropic adjustment. `pickup` is the exact restart; the two are complementary, not
+    alternatives, and this is the most likely thing for a later reader to conflate.
+
+    ### Looping
+
+    `loops` runs the window repeatedly with the ocean state carried over — a spin-up, since one
+    forcing year does not equilibrate the deep basins. Each repetition writes its own file
+    (`loop_output_path`: the plain run-tagged name when `loops == 1`, `_loopNN` otherwise), so the
+    loops can be compared rather than overwriting one another.
+
+    `restart_loop!` sends every clock in the coupled model back to zero and nothing else, then
+    re-attaches the writers. `run!` then re-initializes schedules, the timestepper and the initial
+    output record, because `Oceananigans.initialize!` does all of that exactly when
+    `clock.iteration == 0`. `stop_time` is untouched, and so is `simulation.Δt`, so the wizard keeps
+    the step it converged on instead of re-ramping from one second.
+
+    Four things about it are non-obvious and all fail silently otherwise.
+
+    **`NumericalEarth`'s `reset_clock!(::EarthSystemModel)` cannot be used.** Its per-component
+    fallback is `reset!(getproperty(component, :clock))` and `components` includes `sea_ice`, so
+    `oslofjorden`'s `FreezingLimitedOceanTemperature` — a liquidus and nothing else — makes it throw
+    `has no field clock`. FjordSim's own `rewind_clock!` dispatches on `Val(hasfield(…, :clock))`
+    instead, which names no component and so keeps working if a setup later names a real sea-ice or
+    land model. Do not "simplify" it back; the "Loop restart clocks" testset asserts the upstream
+    method still throws.
+
+    **The prescribed atmosphere and radiation need an explicit `update_state!`.** Rewinding a clock
+    does not refill a `FieldTimeSeries` window, and `time_step!(::EarthSystemModel)` assembles surface
+    fluxes in `maybe_prepare_first_time_step!` *before* it steps the atmosphere — so without this the
+    first step of each loop would be forced by last December. This is why NumericalEarth's own
+    `reset_clock!` ends the same way.
+
+    **`ocean_sim.initialized` must be cleared by hand.** The ocean is a `Simulation` of its own and
+    `run!` clears `initialized` only on the coupled one, so `time_step!(ocean_sim)` would skip
+    `initialize!` and the fresh snapshot writer would never have its schedule initialized or its
+    `t = 0` record written.
+
+    **The writer is replaced, not renamed, and the old one is closed.** A `TimeInterval` accumulates
+    its actuation count, so a writer reused after a clock reset believes it is thousands of records
+    ahead and never fires again; and a `NetCDFWriter` holds an open `NCDataset`, so replacing it
+    silently leaks a handle and an unflushed tail per loop.
+
+    `clock.last_Δt` comes back as `Inf`, making each loop's first step a forward Euler step. That is
+    right rather than merely harmless: `G⁻` refers to a step taken under forcing a year away.
+
+    The alternative — one monotonic clock over `loops * stop_time`, leaning on `Cyclical`'s wrap — was
+    rejected. It works numerically, but the wrap period is inferred from each file's own axis and stops
+    matching the loop the moment a file is padded, so an explicit period would have to be threaded
+    through `forcing_from_file` *and* through the `prescribed_atmosphere`/`prescribed_radiation` hook
+    signatures, which are a documented extension contract. Clock-reset leaves both readers untouched.
+
+    ### Checkpointing
+
+    `checkpoint_interval` attaches a `Checkpointer`; `0.0` attaches none at all rather than one that
+    never fires. It goes on the **coupled** simulation, not the ocean one, for two reasons that both
+    fail otherwise: `prognostic_state` of the coupled model is what a resumable state is, and
+    `run!(…; pickup)` looks for its checkpointer in `simulation.output_writers` and requires exactly
+    one there.
+
+    Oceananigans 0.110 checkpoints *only* `prognostic_state(simulation)`, so the `Checkpointer`
+    docstring's warning that "objects containing functions cannot be serialized" does not apply here:
+    `model.forcing` and `model.boundary_conditions` are not in `HydrostaticFreeSurfaceModel`'s
+    prognostic state at all, `PrescribedAtmosphere` and `PrescribedRadiation` contribute only their
+    clock, and `ComponentInterfaces` and `FreezingLimitedOceanTemperature` contribute `nothing`. So no
+    `ForcingFromFile`, no `FieldTimeSeries` backend and no `FreshwaterExchange` is ever written — while
+    CATKE's diffusivities and its `e` tracer are. Expect a few hundred MB per checkpoint on the
+    Oslofjord grid, which is why `cleanup = true`.
+
+    `pickup` resumes from the newest checkpoint. Two couplings make it work. The checkpoint prefix
+    carries the loop index (`checkpoint_prefix`), because the state records the clock but not which
+    repetition produced it — without that, `pickup` could not tell a loop-3 checkpoint from a loop-1
+    one and would replay the whole spin-up, and loop 2 would overwrite loop 1's files at the same
+    iteration number. `resume_loop` reads the index back out of the filename, and
+    `build_simulation` attaches its writers for *that* loop rather than unconditionally for the first.
+    And `picking_up` suppresses `overwrite_existing`, because the checkpoint restores the writer's
+    actuation count: clobbering the file it is meant to continue would leave a schedule thousands of
+    records ahead of an empty one. This is also why the run tag must be deterministic — a wall-clock
+    tag would put the resumed run in a different file from the one it is appending to.
+
+    `pickup` supersedes `initial_conditions`: `set!` still runs at build time and is then overwritten.
 
 11. **Setups** (`src/Setups/Setups.jl` registry, one lowercase file per fjord beside it) — the
     built-in fjords, each a zero-arg function returning a fresh `FjordConfig`: `oslofjorden()`,
@@ -387,10 +587,18 @@ modules, in `include` order from `src/FjordSim.jl`:
     them in write order.
 
     `log_path` puts the transcript under the simulation config's `results_root`, beside the output it
-    describes, and creates that directory if absent. It dispatches on `config.simulation_config` just
-    like `simulation_forcing_path`, because `results_root` is a *simulation*-config field and a setup
-    need not name one: `drammensfjorden` has no results directory, so every step of it falls back to
-    `fjordsim.log` in the working directory. That fallback is why the name stays in `.gitignore`.
+    describes, and creates that directory if absent. Its name carries the run tag —
+    `fjordsim_<run_tag>.log` — so runs of different windows do not overwrite each other's transcript,
+    matching how `results_path` tags the output. It dispatches on `config.simulation_config` just
+    like `simulation_forcing_path`, because `results_root` and `start_date` are *simulation*-config
+    fields and a setup need not name one: `drammensfjorden` has no results directory and no run to
+    tag, so every step of it falls back to `LOG_FILE` (`fjordsim.log`) in the working directory. That
+    fallback is why the name stays in `.gitignore`.
+
+    Every subcommand for a setup that does name a simulation config writes to the *same* tagged log,
+    so a later step overwrites an earlier one's transcript. That is pre-existing behaviour plus a tag,
+    not a regression, but it means a `run_simulation` transcript does not survive a subsequent
+    `add_rivers`.
 
     Two things about it are load-bearing. The failure is **caught inside** the redirect and reported
     with `showerror`: an exception left to propagate would be printed by `Base._start` after
@@ -497,7 +705,12 @@ gives wind relative to its own grid axes.
 
 Simulation — `AbstractSimulationConfig`, consumed by `build_simulation`: **no hooks**. It is data
 only, read field by field, so an alternative simulation config is a subtype supplying the field
-set its docstring lists. It inherits `results_path`.
+set its docstring lists. It inherits `results_path`, `run_tag` and `coverage_window` — the last two
+read `start_date`, so a subtype omitting it inherits none of the three.
+
+The `coverage` keyword `prepare_forcing` and `prepare_atmosphere` now take is a pipeline *argument*,
+not a hook: the `FjordConfig` drivers derive it with `coverage_window` and every source inherits the
+padding unchanged. No source gains a hook for it.
 
 Required fields are listed in each supertype's docstring in `src/Configs.jl`. Path resolution
 (`bathymetry_path`, `forcing_path`, `forcing_directory`, `river_forcing_path`, `atmosphere_path`,
@@ -527,9 +740,13 @@ make both atmosphere steps and `run_simulation` no-ops the same way.
 
 The simulation config is rooted separately, at `~/FjordSim_results/<fjord>/` rather than under
 `data_root`, since it writes rather than reads. Unlike every other config, `SimulationConfig` has
-**no defaults at all**: `oslofjorden()` names all 22 fields, because each is a scientific choice
+**no defaults at all**: `oslofjorden()` names all 25 fields, because each is a scientific choice
 about that fjord and a default would let the next setup silently inherit it. Adding a field to
 `SimulationConfig` therefore breaks every setup until each names it, which is the intent.
+
+`start_date` and `stop_time` also decide what the prepare steps write, since both pad their time
+axes to that window — so changing either is a data change, not just a run change. See "Changing
+`start_date` or `stop_time`" under Commands.
 
 Each step is a `FjordConfig` method on the generic function of the same name —
 `prepare_bathymetry`, `download_forcing`, `prepare_forcing`, `add_rivers`, `download_atmosphere`,
@@ -602,9 +819,10 @@ forcings.
 - `Base.@kwdef` on a *parametric* struct does not convert its arguments, unlike on a
   non-parametric one: the generated constructor keeps the declared field types in its signature,
   so `SimulationConfig(stop_time = 3600, ...)` is a `MethodError` where `stop_time = 1hour` is
-  fine. Every `Oceananigans.Units` constant is already a `Float64`, so writing durations with
-  them — `365days`, `1hour`, `3minutes` — sidesteps this. Every other config is non-parametric
-  and so has never hit it.
+  fine, and `checkpoint_interval = 0` is one where `0.0` is fine. Every `Oceananigans.Units`
+  constant is already a `Float64`, so writing durations with them — `365days`, `1hour`, `3minutes`
+  — sidesteps this. `loops` is the one new field this does *not* apply to, being an `Int` already.
+  Every other config is non-parametric and so has never hit it.
 
 ## Key conventions
 

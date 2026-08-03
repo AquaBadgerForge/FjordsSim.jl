@@ -37,6 +37,8 @@ export
     atmosphere_directory,
     results_path,
     plot_path,
+    run_tag,
+    coverage_window,
     # extension hooks a new config subtype overloads
     bathymetry_dataset,
     regrid_options,
@@ -75,6 +77,8 @@ export
     top_bottom_boundary_conditions,
     # simulations
     coupled_hydrostatic_simulation,
+    FromForcing,
+    FromResults,
     # utils
     recursive_merge,
     progress,

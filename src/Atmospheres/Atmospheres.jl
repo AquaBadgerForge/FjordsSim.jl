@@ -20,6 +20,7 @@ using Oceananigans
 using Oceananigans.Grids: x_domain, y_domain
 using ArchGDAL
 using Dates: DateTime, Hour
+import Dates
 using NCDatasets
 using NumericalEarth.DataWrangling: first_date, last_date
 
@@ -27,7 +28,8 @@ using ..Configs:
     AbstractAtmosphereConfig,
     FjordConfig,
     atmosphere_path,
-    atmosphere_directory
+    atmosphere_directory,
+    coverage_window
 using ..Plotting: plot_atmosphere
 
 include("NORA3.jl")
@@ -424,11 +426,17 @@ Its layout is what `FjordSim.Atmospheres.NORA3.MultiYearNORA3` reads and is ther
 `Float32` variables of shape `(longitude, latitude, time)`, uniformly spaced `Float64` `lon` and
 `lat` cell centers, and a CF-encoded `time`.
 
+# Coverage
+
+`coverage` is the `(first, last)` calendar interval the run needs, from `coverage_window`. The time
+axis is padded to reach both ends by replicating the nearest record; `nothing` prepares exactly the
+downloaded range. See `pad_atmosphere_records`.
+
 # Returns
 
 A named tuple `(; output_file, times, variables)`.
 """
-function prepare_atmosphere(target_grid, config::AbstractAtmosphereConfig)
+function prepare_atmosphere(target_grid, config::AbstractAtmosphereConfig; coverage = nothing)
     variable_names = atmosphere_variable_names(config)
     isempty(variable_names) && error("$(nameof(typeof(config))) names no atmosphere variables to prepare")
     # Sorted so the prepared file's variable order does not depend on Dict iteration order.
@@ -436,6 +444,7 @@ function prepare_atmosphere(target_grid, config::AbstractAtmosphereConfig)
 
     records = atmosphere_time_steps(config)
     validate_atmosphere_records(records)
+    records = pad_atmosphere_records(records, coverage)
     source = atmosphere_source_grid(config, first(records).filepath)
     validate_source_consistency(config, records, source)
 
@@ -456,7 +465,7 @@ function prepare_atmosphere(target_grid, config::AbstractAtmosphereConfig)
     )
 end
 
-prepare_atmosphere(target_grid, ::Nothing) = nothing
+prepare_atmosphere(target_grid, ::Nothing; coverage = nothing) = nothing
 
 """
     prepare_atmosphere(config::FjordConfig)
@@ -468,6 +477,9 @@ This is the setup-level driver, the same shape as `download_atmosphere(config::F
 needs no bathymetry: the prepared grid is derived from the setup's longitude/latitude domain
 rather than from the ocean grid's land mask, so unlike `prepare_forcing` it does not depend on
 `prepare_bathymetry`. It does read the files `download_atmosphere` wrote.
+
+The coverage window comes from the setup's simulation config, so the prepared file spans the run the
+setup describes; a setup naming no simulation config gets `nothing` and the downloaded range.
 
 # Returns
 The `prepare_atmosphere(target_grid, config)` named tuple with `plot_file` added.
@@ -483,7 +495,11 @@ function prepare_atmosphere(config::FjordConfig)
     )
 
     grid = LatitudeLongitudeGrid(CPU(), config.grid_config)
-    result = prepare_atmosphere(grid, atmosphere_config)
+    result = prepare_atmosphere(
+        grid,
+        atmosphere_config;
+        coverage = coverage_window(config.simulation_config),
+    )
     plot_file = plot_atmosphere(atmosphere_config)
 
     @info "Prepared variables: $(join(result.variables, ", "))"
@@ -513,6 +529,78 @@ function validate_atmosphere_records(records)
     end
 
     return nothing
+end
+
+"""
+    pad_atmosphere_records(records, coverage)
+
+Extend `records` to span `coverage`, replicating the nearest record at each end that falls short. A
+`nothing` coverage leaves `records` alone.
+
+Applied after `validate_atmosphere_records`, whose hourly-gap warning would otherwise fire on a pad
+that is deliberately off the hourly cadence — the run's window need not land on an hour of the
+downloaded axis.
+
+A pad points at the same file and index as the record it copies, so the written field is identical
+to its neighbour and `validate_source_consistency`, which walks the records' distinct files, sees
+nothing new. See `FjordSim.Forcing.pad_time_steps` for why both prepared files are padded rather
+than the readers being made tolerant: both read with `Cyclical()` time indexing, which fills a
+shortfall by wrapping to the far end of the year instead of failing.
+
+A pad may reach at most one record spacing past the downloaded axis, for the reason spelled out
+there: unbounded, it would manufacture the very coverage `Simulations.validate_time_coverage` exists
+to verify.
+"""
+pad_atmosphere_records(records, ::Nothing) = records
+
+function pad_atmosphere_records(records, coverage)
+    first_needed, last_needed = coverage
+    padded = collect(records)
+
+    if first(padded).date > first_needed
+        head = first(padded)
+        spacing = atmosphere_record_spacing(padded)
+        head.date - first_needed <= spacing || error(
+            "The run starts at $first_needed but the downloaded atmosphere only begins at " *
+            "$(head.date), more than one record spacing " *
+            "($(Dates.canonicalize(spacing))) later. Download the preceding period, or move the " *
+            "simulation config's `start_date` to " *
+            "$(head.date - spacing) or later.",
+        )
+        pushfirst!(padded, AtmosphereRecord(first_needed, head.filepath, head.index))
+        @info "Padded atmosphere start: replicated $(head.date) at $first_needed"
+    end
+
+    if last(padded).date < last_needed
+        tail = last(padded)
+        spacing = atmosphere_record_spacing(padded)
+        last_needed - tail.date <= spacing || error(
+            "The run ends at $last_needed but the downloaded atmosphere already stops at " *
+            "$(tail.date), more than one record spacing " *
+            "($(Dates.canonicalize(spacing))) earlier. Download the following period, or shorten " *
+            "`stop_time` so the run ends by " *
+            "$(tail.date + spacing).",
+        )
+        push!(padded, AtmosphereRecord(last_needed, tail.filepath, tail.index))
+        @info "Padded atmosphere end: replicated $(tail.date) at $last_needed"
+    end
+
+    return padded
+end
+
+"""
+    atmosphere_record_spacing(records)
+
+The axis's record spacing, taken from its first pair — `validate_atmosphere_records` has already
+reported any departure from hourly, so one pair speaks for the whole axis. A single-record axis has
+no spacing to bound a pad by, and is an error rather than a guess.
+"""
+function atmosphere_record_spacing(records)
+    length(records) >= 2 || error(
+        "Cannot pad an atmosphere axis of $(length(records)) record(s): its record spacing, " *
+        "which bounds how far a pad may reach, is unknown.",
+    )
+    return records[2].date - records[1].date
 end
 
 """

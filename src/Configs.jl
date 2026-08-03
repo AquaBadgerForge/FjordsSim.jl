@@ -14,7 +14,11 @@ export AbstractGridConfig,
     atmosphere_path,
     atmosphere_directory,
     results_path,
-    plot_path
+    plot_path,
+    run_tag,
+    coverage_window
+
+using Dates: DateTime, Second, format
 
 """
     AbstractGridConfig
@@ -164,13 +168,18 @@ configs.
 # Fields a subtype provides
 - `results_root`, `output_file`: resolved by `results_path`, the simulation's output file.
 - `architecture`: `:auto`, `:cpu` or `:gpu`, resolved by `simulation_architecture`.
-- `buoyancy`, `closure`, `tracer_advection`, `momentum_advection`, `tracers`,
-  `initial_conditions`, `coriolis`, `sea_ice`, `biogeochemistry`: passed to
-  `coupled_hydrostatic_simulation` as they are.
+- `buoyancy`, `closure`, `tracer_advection`, `momentum_advection`, `tracers`, `coriolis`,
+  `sea_ice`, `biogeochemistry`: passed to `coupled_hydrostatic_simulation` as they are.
+- `initial_conditions`: where the ocean state starts from, resolved by
+  `FjordSim.Simulations.resolve_initial_conditions` before it reaches
+  `coupled_hydrostatic_simulation`.
 - `free_surface_cfl`, `bottom_drag_coefficient`: the grid-dependent components are built from
   these, since neither can exist before the grid does.
-- `stop_time`, `output_interval`, `progress_interval`, `overwrite_existing`, `time_step_cfl`,
-  `max_time_step`, `max_time_step_change`: run control, read by `build_simulation`.
+- `start_date`: the calendar instant model time zero stands for. Read by `run_tag` and
+  `coverage_window` as well as by `build_simulation`.
+- `stop_time`, `loops`, `output_interval`, `progress_interval`, `overwrite_existing`,
+  `checkpoint_interval`, `pickup`, `time_step_cfl`, `max_time_step`, `max_time_step_change`: run
+  control, read by `build_simulation` and `run_simulation`.
 
 `FjordSim.Simulations.SimulationConfig` is the built-in implementation.
 """
@@ -222,13 +231,68 @@ unchanged.
 atmosphere_directory(config::AbstractAtmosphereConfig) = joinpath(config.data_root, config.output_directory)
 
 """
+    run_tag(config)
+
+The run's identity as a filename fragment: its `start_date`, as `yyyymmddTHHMM`.
+
+Derived from the simulated start instant rather than the wall clock, so a config always names the
+same files. That makes the path predictable for post-processing, and — load-bearing — it is what
+lets a `pickup` append to the file it was already writing rather than to a fresh one.
+
+It therefore distinguishes *configurations*, not invocations: two runs of the same config share a
+name, which is what `overwrite_existing` is for.
+"""
+run_tag(config::AbstractSimulationConfig) = format(config.start_date, "yyyymmddTHHMM")
+
+"""
     results_path(config)
+    results_path(config, loop)
 
 Resolve `config.output_file` against `config.results_root`: the file the simulation writes its
 snapshots to. Results are rooted separately from the input data, which is why this reads
-`results_root` rather than `data_root`. An absolute `output_file` is returned unchanged.
+`results_root` rather than `data_root`. An absolute `output_file` keeps its own directory.
+
+`run_tag(config)` is inserted before the extension so runs from different `start_date`s do not
+overwrite each other, and the two-argument form appends the loop index on top of it, which is how a
+looped run gives each repetition its own file.
 """
-results_path(config::AbstractSimulationConfig) = joinpath(config.results_root, config.output_file)
+results_path(config::AbstractSimulationConfig) = tagged_path(config, run_tag(config))
+
+results_path(config::AbstractSimulationConfig, loop::Int) =
+    tagged_path(config, string(run_tag(config), "_loop", lpad(loop, 2, '0')))
+
+"""
+    tagged_path(config, tag)
+
+`config.output_file` with `_tag` inserted before its extension, resolved against `results_root`
+unless it is absolute — so an absolute `output_file` still relocates just that file, and the tag
+lands on the basename either way.
+"""
+function tagged_path(config::AbstractSimulationConfig, tag)
+    directory, file = splitdir(config.output_file)
+    stem, extension = splitext(file)
+    tagged = string(stem, "_", tag, extension)
+    isabspath(config.output_file) && return joinpath(directory, tagged)
+    return joinpath(config.results_root, directory, tagged)
+end
+
+"""
+    coverage_window(config)
+
+The calendar interval a run needs its prepared inputs to span, as `(first, last)` — or `nothing`
+for a setup naming no simulation config.
+
+Passed to `prepare_forcing` and `prepare_atmosphere` as their `coverage`, so each pads its own time
+axis to reach both ends. A plain tuple of dates rather than the config itself, so neither pipeline
+ever sees a simulation config.
+
+A looped run reuses one window rather than extending it, so this is `stop_time` from `start_date`
+and not `loops * stop_time`.
+"""
+coverage_window(::Nothing) = nothing
+
+coverage_window(config::AbstractSimulationConfig) =
+    (config.start_date, config.start_date + Second(round(Int, config.stop_time)))
 
 """
     FjordConfig
