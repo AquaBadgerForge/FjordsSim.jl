@@ -14,7 +14,7 @@ using Oceananigans:
     WENO,
     WENOVectorInvariant
 using Oceananigans.TurbulenceClosures: HorizontalScalarBiharmonicDiffusivity
-using Oceananigans.Units: days, hour, minute, minutes
+using Oceananigans.Units: days, hour, minute, minutes, second
 using SeawaterPolynomials.TEOS10: TEOS10EquationOfState
 using NumericalEarth: FreezingLimitedOceanTemperature
 
@@ -59,14 +59,22 @@ struct MinimalAtmosphere <: AbstractAtmosphereConfig
 end
 
 struct MinimalSimulation <: AbstractSimulationConfig
+    # The supertype-level minimum, and nothing else. `results_root` is what `results_path` and
+    # `FjordSim.CLI.log_path` root against — the *filename* comes from a writer, not from here —
+    # and `coverage_window` reports the interval the prepare steps pad to, so `start_date` and
+    # `stop_time` are part of the field set as much as `results_root` is. An alternative simulation
+    # config omitting one would inherit neither helper.
     results_root::String
-    output_file::String
-    # `results_path` tags the output with `run_tag`, and `coverage_window` reports the interval the
-    # prepare steps pad to, so these two are part of the supertype's field set as much as
-    # `results_root` is — an alternative simulation config that omitted them would inherit neither.
     start_date::DateTime
     stop_time::Float64
 end
+
+# The four supertypes `SimulationConfig` nests, each with no hook overloaded, so the "Config
+# extensibility" testset can assert that a missing hook surfaces as a `MethodError` naming it.
+struct MinimalModel <: AbstractCoupledSimulationConfig end
+struct MinimalBoundary <: AbstractBoundaryConditionConfig end
+struct MinimalWriter <: AbstractWriterConfig end
+struct MinimalTimeStepping <: AbstractTimeSteppingConfig end
 
 # A stand-in for a coupled-model component that does have a clock, so `rewind_clock!`'s
 # has-a-clock branch can be exercised without building a model.
@@ -179,65 +187,23 @@ Where a test simulation config's output resolves to.
 Under `tempdir()` rather than the real `~/FjordSim_results`, so every `results_path` assertion is
 exact and machine-independent and nothing a test builds can land beside a real run's snapshots.
 Nothing creates it: a test that actually builds a simulation passes `results_root` from its own
-`mktempdir`, because `coupled_hydrostatic_simulation` mkpaths whatever it is given.
+`mktempdir`, because `build_simulation` mkpaths whatever it is given.
 """
 const TEST_RESULTS_ROOT = joinpath(tempdir(), "fjordsim_test_results")
 
 """
-    test_simulation_fields(; kwargs...)
+    override_fields(fields, name_of_factory, kwargs)
 
-Every one of `SimulationConfig`'s fields, as a `Dict` the constructor can be splatted from.
+Apply `kwargs` to a fixture's field `Dict`, rejecting a name the config does not have.
 
-A `Dict` rather than a `NamedTuple` because the "no field has a default" sweep needs to *remove* one
-field at a time, which `delete!(copy(fields), name)` does and a `NamedTuple` cannot.
-
-Three values are not free: `tracers` must name `T` and `S` (`top_bottom_boundary_conditions` and
-`attach_writers!` reach for them by name); `buoyancy` must be a `SeawaterBuoyancy` over a
-`TEOS10EquationOfState`, the only pair NumericalEarth's `reference_density`/`heat_capacity` have
-methods for; and `sea_ice` must not be `nothing`. Everything else is a neutral value chosen here.
+Shared by the five config fixtures below: a typo in an override would otherwise be silently ignored
+and the test would assert against the default it meant to replace.
 """
-function test_simulation_fields(; kwargs...)
-    fields = Dict{Symbol,Any}(
-        :results_root => TEST_RESULTS_ROOT,
-        :output_file => "snapshots_test.nc",
-        :architecture => :cpu,          # pinned, never :auto — no test may depend on a GPU
-        :buoyancy => SeawaterBuoyancy(equation_of_state = TEOS10EquationOfState()),
-        # CATKE plus a horizontal biharmonic operator at their own defaults. The shapes matter and
-        # the numbers do not: CATKE is the case where the closure owns a tracer the config does not
-        # name, and the pair is what sets the halo floor a coupled build needs.
-        :closure => (CATKEVerticalDiffusivity(), HorizontalScalarBiharmonicDiffusivity()),
-        :tracer_advection => (T = WENO(), S = WENO()),
-        :momentum_advection => WENOVectorInvariant(),
-        :tracers => (:T, :S),
-        # A literal NamedTuple, so `resolve_initial_conditions` passes it through by identity and
-        # nothing built from this fixture also depends on a forcing file having a record at
-        # `start_date`. The other two shapes are exercised directly in "initial conditions".
-        :initial_conditions => (T = 5.0, S = 33.0),
-        :coriolis => HydrostaticSphericalCoriolis(),
-        :sea_ice => FreezingLimitedOceanTemperature(),
-        :biogeochemistry => nothing,
-        :free_surface_cfl => 0.7,
-        :bottom_drag_coefficient => 0.003,
-        # Noon, matching what `write_prepared_forcing` puts on its time axis, so a config from this
-        # fixture passes `validate_time_coverage` against a fixture forcing file.
-        :start_date => DateTime(2020, 1, 1, 12),
-        :stop_time => 1minute,
-        :loops => 1,
-        :output_interval => 1hour,
-        :progress_interval => 1hour,
-        :overwrite_existing => true,
-        :checkpoint_interval => 30days,
-        :pickup => false,
-        :time_step_cfl => 0.1,
-        :max_time_step => 3minutes,
-        :max_time_step_change => 1.01,
-    )
-
+function override_fields(fields, name_of_factory, kwargs)
     for (name, value) in kwargs
         haskey(fields, name) || throw(
             ArgumentError(
-                "`test_simulation_fields` does not name `$name`; `SimulationConfig`'s fields are " *
-                "$(fieldnames(SimulationConfig))",
+                "`$name_of_factory` does not name `$name`; it names $(join(keys(fields), ", "))",
             ),
         )
         fields[name] = value
@@ -247,17 +213,119 @@ function test_simulation_fields(; kwargs...)
 end
 
 """
+    test_model_fields(; kwargs...)
+    test_model_config(; kwargs...)
+
+Every one of `CoupledHydrostaticSimulation`'s fields, and the config built from them.
+
+Three values are not free: `tracers` must name `T` and `S` (`TopBottomFluxes` builds a top condition
+for each by name); `buoyancy` must be a `SeawaterBuoyancy` over a `TEOS10EquationOfState`, the only
+pair NumericalEarth's `reference_density`/`heat_capacity` have methods for; and `sea_ice` must not be
+`nothing`. Everything else is a neutral value chosen here.
+"""
+function test_model_fields(; kwargs...)
+    fields = Dict{Symbol,Any}(
+        :buoyancy => SeawaterBuoyancy(equation_of_state = TEOS10EquationOfState()),
+        # CATKE plus a horizontal biharmonic operator at their own defaults. The shapes matter and
+        # the numbers do not: CATKE is the case where the closure owns a tracer the config does not
+        # name, and the pair is what sets the halo floor a coupled build needs.
+        :closure => (CATKEVerticalDiffusivity(), HorizontalScalarBiharmonicDiffusivity()),
+        :tracer_advection => (T = WENO(), S = WENO()),
+        :momentum_advection => WENOVectorInvariant(),
+        :tracers => (:T, :S),
+        :coriolis => HydrostaticSphericalCoriolis(),
+        :sea_ice => FreezingLimitedOceanTemperature(),
+        :biogeochemistry => nothing,
+        :free_surface_cfl => 0.7,
+    )
+
+    return override_fields(fields, "test_model_fields", kwargs)
+end
+
+test_model_config(; kwargs...) =
+    CoupledHydrostaticSimulation(; test_model_fields(; kwargs...)...)
+
+"""
+    test_snapshot_writer(; kwargs...)
+    test_checkpoint_writer(; kwargs...)
+    test_time_stepping(; kwargs...)
+    test_boundary_conditions()
+
+The nested run-level configs on the suite's own values.
+
+`test_snapshot_writer`'s `variables` must be fields the fixture model actually has, since
+`snapshot_outputs` rejects a name the model does not carry.
+"""
+test_snapshot_writer(;
+    name = :ocean,
+    output_file = "snapshots_test.nc",
+    variables = (:T, :S, :u, :v),
+    interval = 1hour,
+    overwrite_existing = true,
+) = SnapshotWriter(; name, output_file, variables, interval, overwrite_existing)
+
+test_checkpoint_writer(; interval = 30days, overwrite_existing = true, cleanup = true) =
+    CheckpointWriter(; interval, overwrite_existing, cleanup)
+
+test_time_stepping(;
+    initial_time_step = 1second,
+    cfl = 0.1,
+    max_time_step = 3minutes,
+    max_time_step_change = 1.01,
+) = AdaptiveTimeStep(; initial_time_step, cfl, max_time_step, max_time_step_change)
+
+test_boundary_conditions() =
+    (TopBottomFluxes(bottom_drag_coefficient = 0.003), OpenLateralBoundary())
+
+"""
+    test_simulation_fields(; kwargs...)
+
+Every one of `SimulationConfig`'s fields, as a `Dict` the constructor can be splatted from.
+
+A `Dict` rather than a `NamedTuple` because the "no field has a default" sweep needs to *remove* one
+field at a time, which `delete!(copy(fields), name)` does and a `NamedTuple` cannot.
+
+The five nested-config fields come from the factories above, so a test that cares about one of them
+overrides just that one.
+"""
+function test_simulation_fields(; kwargs...)
+    fields = Dict{Symbol,Any}(
+        :results_root => TEST_RESULTS_ROOT,
+        :architecture => :cpu,          # pinned, never :auto — no test may depend on a GPU
+        :model => test_model_config(),
+        :boundary_conditions => test_boundary_conditions(),
+        :writers => (test_snapshot_writer(), test_checkpoint_writer()),
+        :time_stepping => test_time_stepping(),
+        # A literal NamedTuple, so `resolve_initial_conditions` passes it through by identity and
+        # nothing built from this fixture also depends on a forcing file having a record at
+        # `start_date`. The other two shapes are exercised directly in "initial conditions".
+        :initial_conditions => (T = 5.0, S = 33.0),
+        # Noon, matching what `write_prepared_forcing` puts on its time axis, so a config from this
+        # fixture passes `validate_time_coverage` against a fixture forcing file.
+        :start_date => DateTime(2020, 1, 1, 12),
+        :stop_time => 1minute,
+        :loops => 1,
+        :progress_interval => 1hour,
+        :pickup => false,
+    )
+
+    return override_fields(fields, "test_simulation_fields", kwargs)
+end
+
+"""
     test_simulation_config(; kwargs...)
 
 A `SimulationConfig` on the test suite's own values, with `kwargs` overriding named fields.
 
-Every duration is written with an `Oceananigans.Units` constant, which is the style the field types
-force: `Base.@kwdef` on a parametric struct dispatches rather than converting, so `stop_time = 3600`
-is a `MethodError` where `1hour` is fine.
+Every duration is written with an `Oceananigans.Units` constant, which is the style `SimulationConfig`'s
+own field types force: `Base.@kwdef` on a parametric struct dispatches rather than converting, so
+`stop_time = 3600` is a `MethodError` where `1hour` is fine. The nested configs each have a
+hand-written keyword constructor that *does* convert, so an integer duration is fine in one of those.
 
-Overriding one of the nine parametric fields yields a different `SimulationConfig` type, and so a
-fresh `build_simulation` specialization — a full recompile of the coupled model. Vary only the
-`Float64`/`Int`/`Bool` fields inside a testset that builds one.
+Overriding `model`, `boundary_conditions`, `writers`, `time_stepping` or `initial_conditions` yields a
+different `SimulationConfig` type, and so a fresh `build_simulation` specialization — a full recompile
+of the coupled model. Vary only the `String`/`Symbol`/`Float64`/`Int`/`Bool` fields inside a testset
+that builds one.
 """
 test_simulation_config(; kwargs...) = SimulationConfig(; test_simulation_fields(; kwargs...)...)
 

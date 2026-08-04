@@ -6,6 +6,10 @@ export AbstractGridConfig,
     AbstractRiverConfig,
     AbstractAtmosphereConfig,
     AbstractSimulationConfig,
+    AbstractCoupledSimulationConfig,
+    AbstractBoundaryConditionConfig,
+    AbstractWriterConfig,
+    AbstractTimeSteppingConfig,
     FjordConfig,
     bathymetry_path,
     forcing_path,
@@ -153,7 +157,7 @@ interpolates between them — so it only has to cover the ocean domain with a ma
 - `download_atmosphere(target_grid, config)`: fetch the source data. Only if it downloads.
 - `prescribed_atmosphere(config, architecture; reference_date)`,
   `prescribed_radiation(config, architecture; reference_date)`: read the prepared file back at
-  simulation time, as the NumericalEarth objects `coupled_hydrostatic_simulation` consumes.
+  simulation time, as the NumericalEarth objects `coupled_simulation` consumes.
   Only if the setup is simulated.
 - `atmosphere_date_range(config)`: first and last date of the prepared file, for
   `build_simulation`'s coverage check. Optional; the default is `nothing`, which skips the check.
@@ -173,27 +177,126 @@ the grid, and the knobs for the ones that do.
 Unlike the other supertypes this one declares **fields only, no hooks**. `build_simulation` is
 generic over the whole `FjordConfig` rather than over a simulation source, because everything
 dataset-specific — which forcing file, which atmosphere reader — already comes from the other
-configs.
+configs. What *is* dispatched on lives one level down, in the four nested configs below, each of
+which has its own supertype and its own hook.
 
 # Fields a subtype provides
-- `results_root`, `output_file`: resolved by `results_path`, the simulation's output file.
+- `results_root`: the directory the run writes into, and what a writer's `output_file` and
+  `FjordSim.CLI.log_path` resolve against. The one config rooted at a results directory rather
+  than a `data_root`, being the only one that writes rather than reads.
 - `architecture`: `:auto`, `:cpu` or `:gpu`, resolved by `simulation_architecture`.
-- `buoyancy`, `closure`, `tracer_advection`, `momentum_advection`, `tracers`, `coriolis`,
-  `sea_ice`, `biogeochemistry`: passed to `coupled_hydrostatic_simulation` as they are.
+- `model`: an `AbstractCoupledSimulationConfig` — what the model *is*, assembled by
+  `coupled_simulation`.
+- `boundary_conditions`: a tuple of `AbstractBoundaryConditionConfig`s, merged by
+  `FjordSim.BoundaryConditions.field_boundary_conditions`. Tuple order is merge precedence.
+- `writers`: a tuple of `AbstractWriterConfig`s, attached by `attach_writer!`.
+- `time_stepping`: an `AbstractTimeSteppingConfig`, attached by `attach_time_stepping!`.
 - `initial_conditions`: where the ocean state starts from, resolved by
-  `FjordSim.Simulations.resolve_initial_conditions` before it reaches
-  `coupled_hydrostatic_simulation`.
-- `free_surface_cfl`, `bottom_drag_coefficient`: the grid-dependent components are built from
-  these, since neither can exist before the grid does.
+  `FjordSim.Simulations.resolve_initial_conditions` before it reaches `coupled_simulation`.
 - `start_date`: the calendar instant model time zero stands for. Read by `coverage_window` as well
   as by `build_simulation`.
-- `stop_time`, `loops`, `output_interval`, `progress_interval`, `overwrite_existing`,
-  `checkpoint_interval`, `pickup`, `time_step_cfl`, `max_time_step`, `max_time_step_change`: run
-  control, read by `build_simulation` and `run_simulation`.
+- `stop_time`, `loops`, `progress_interval`, `pickup`: run control, read by `build_simulation` and
+  `run_simulation`.
+
+`results_root`, `start_date` and `stop_time` are the supertype-level minimum: the first is what
+`FjordSim.CLI.log_path` and `results_path` root against, and the other two are what
+`coverage_window` reports. A subtype omitting one inherits neither helper.
 
 `FjordSim.Simulations.SimulationConfig` is the built-in implementation.
 """
 abstract type AbstractSimulationConfig end
+
+"""
+    AbstractCoupledSimulationConfig
+
+Supertype for coupled-model configurations. A concrete subtype names the model components that do
+not depend on the grid, and its `coupled_simulation` method assembles them into a `Simulation`.
+
+This is the seam that lets a setup run something other than a hydrostatic free-surface ocean inside
+an `OceanSeaIceModel`: `build_simulation` derives the grid, the forcing, the boundary conditions,
+the initial state and the atmosphere and then hands all of it to one generic call, so a different
+model assembly is a new subtype rather than an edit to an existing method body.
+
+# Methods a subtype provides
+- `coupled_simulation(model, grid; forcing, boundary_conditions, initial_conditions, atmosphere,
+  radiation, stop_time, initial_time_step)`: build and return the coupled `Simulation`. Required.
+- `model_tracers(model)`: the tracer names the model carries, as a tuple of `Symbol`s. Required —
+  `build_simulation` needs them before the model exists, to pick which forcing terms to build,
+  which lateral tracer boundaries to open and which state variables to read back.
+
+`FjordSim.Simulations.CoupledHydrostaticSimulation` is the built-in implementation.
+"""
+abstract type AbstractCoupledSimulationConfig end
+
+"""
+    AbstractBoundaryConditionConfig
+
+Supertype for boundary-condition configurations. A concrete subtype describes one *contribution* to
+the model's boundary conditions, and its `boundary_conditions` method builds that contribution.
+
+A simulation config names a **tuple** of these rather than one, so a setup composes its boundaries
+out of independent pieces — surface fluxes and bottom drag are one statement, an open lateral edge
+another — and opts out of a piece by leaving it out. `field_boundary_conditions` merges the tuple
+with `FjordSim.Utils.recursive_merge` and materializes the result, so each method returns the
+*nested named tuple* shape (`(u = (top = …, bottom = …), T = (top = …,))`), not
+`FieldBoundaryConditions`.
+
+# Methods a subtype provides
+- `boundary_conditions(config, grid, forcing, forcing_config, tracers)`: the nested named tuple this
+  piece contributes. Required.
+
+`FjordSim.BoundaryConditions.TopBottomFluxes` and `FjordSim.BoundaryConditions.OpenLateralBoundary`
+are the built-in implementations.
+"""
+abstract type AbstractBoundaryConditionConfig end
+
+"""
+    AbstractWriterConfig
+
+Supertype for output-writer configurations. A concrete subtype describes one thing a run writes, and
+its `attach_writer!` method attaches it to the simulation.
+
+A tuple of these replaces the hardcoded snapshot writer and the `checkpoint_interval` threshold that
+used to decide whether a `Checkpointer` existed: a setup that wants no checkpoints names no
+checkpointing writer, and a setup that wants two snapshot files at different intervals names two
+writers. Which simulation a writer attaches to — the coupled one or the ocean sub-simulation — is
+the method's business, not the caller's.
+
+# Fields a subtype provides
+- `output_file`: resolved by `results_path`, **only** for a writer whose `output_path_trait` is
+  `FjordSim.Simulations.NamesOutputFile`. A writer that names no product file (a checkpointer,
+  whose files carry no run tag and are pruned) needs no such field, and `results_path` reports that
+  as an error rather than reaching for a field that is not there.
+
+# Methods a subtype provides
+- `attach_writer!(simulation, writer, config, loop)`: attach this writer for repetition `loop`.
+  Required.
+- `FjordSim.Simulations.checkpoint_trait(writer)`: whether this writer contributes a `Checkpointer`.
+  Defaults to `NotCheckpointing()`.
+- `FjordSim.Simulations.output_path_trait(writer)`: whether this writer names a file the run should
+  report. Defaults to `NamesNoOutputFile()`.
+
+`FjordSim.Simulations.SnapshotWriter` and `FjordSim.Simulations.CheckpointWriter` are the built-in
+implementations.
+"""
+abstract type AbstractWriterConfig end
+
+"""
+    AbstractTimeSteppingConfig
+
+Supertype for time-stepping configurations. A concrete subtype describes how the model's time step
+is chosen, and its `attach_time_stepping!` method installs that choice on the simulation.
+
+# Methods a subtype provides
+- `attach_time_stepping!(simulation, config)`: install the time-step policy. Required. It must not
+  set `simulation.Δt` — the step a loop starts from is `initial_time_step`, applied once when the
+  simulation is built, and `FjordSim.Simulations.restart_loop!` deliberately leaves `Δt` alone so a
+  repetition keeps the step the previous one converged on.
+- `initial_time_step(config)`: the `Δt` the simulation starts at, in seconds. Required.
+
+`FjordSim.Simulations.AdaptiveTimeStep` is the built-in implementation.
+"""
+abstract type AbstractTimeSteppingConfig end
 
 """
     bathymetry_path(config)
@@ -258,34 +361,46 @@ runs differently.
 run_tag(::AbstractSimulationConfig) = LAUNCH_TAG[]
 
 """
-    results_path(config)
-    results_path(config, loop)
+    results_path(writer, config)
+    results_path(writer, config, loop)
 
-Resolve `config.output_file` against `config.results_root`: the file the simulation writes its
-snapshots to. Results are rooted separately from the input data, which is why this reads
-`results_root` rather than `data_root`. An absolute `output_file` keeps its own directory.
+Resolve `writer.output_file` against `config.results_root`: the file that writer writes to. Results
+are rooted separately from the input data, which is why this reads `results_root` rather than
+`data_root`. An absolute `output_file` keeps its own directory.
 
 `run_tag(config)` is inserted before the extension so separate runs do not overwrite each other, and
-the two-argument form appends the loop index on top of it, which is how a looped run gives each
+the three-argument form appends the loop index on top of it, which is how a looped run gives each
 repetition its own file.
+
+The filename is the *writer's* rather than the simulation config's, so a setup can name several
+outputs at different intervals. A writer that names no product file has no `output_file` and gets an
+error saying so, rather than a `getproperty` failure — see `AbstractWriterConfig`.
 """
-results_path(config::AbstractSimulationConfig) = tagged_path(config, run_tag(config))
+results_path(writer::AbstractWriterConfig, config::AbstractSimulationConfig) =
+    tagged_path(writer, config, run_tag(config))
 
-results_path(config::AbstractSimulationConfig, loop::Int) =
-    tagged_path(config, string(run_tag(config), "_loop", lpad(loop, 2, '0')))
+results_path(writer::AbstractWriterConfig, config::AbstractSimulationConfig, loop::Int) =
+    tagged_path(writer, config, string(run_tag(config), "_loop", lpad(loop, 2, '0')))
 
 """
-    tagged_path(config, tag)
+    tagged_path(writer, config, tag)
 
-`config.output_file` with `_tag` inserted before its extension, resolved against `results_root`
+`writer.output_file` with `_tag` inserted before its extension, resolved against `results_root`
 unless it is absolute — so an absolute `output_file` still relocates just that file, and the tag
 lands on the basename either way.
 """
-function tagged_path(config::AbstractSimulationConfig, tag)
-    directory, file = splitdir(config.output_file)
+function tagged_path(writer::AbstractWriterConfig, config::AbstractSimulationConfig, tag)
+    hasproperty(writer, :output_file) || throw(
+        ArgumentError(
+            "$(typeof(writer)) names no `output_file`, so it has no `results_path`. Only a writer " *
+            "whose `output_path_trait` is `NamesOutputFile` resolves to one.",
+        ),
+    )
+
+    directory, file = splitdir(writer.output_file)
     stem, extension = splitext(file)
     tagged = string(stem, "_", tag, extension)
-    isabspath(config.output_file) && return joinpath(directory, tagged)
+    isabspath(writer.output_file) && return joinpath(directory, tagged)
     return joinpath(config.results_root, directory, tagged)
 end
 

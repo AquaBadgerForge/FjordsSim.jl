@@ -28,13 +28,22 @@ alongside these methods.
 
 | Supertype | Defined at | Built-in subtype | Required hooks |
 |---|---|---|---|
-| [`AbstractGridConfig`](#abstractgridconfig) | `src/Configs.jl:44` | `EvenGrid` | 1 |
-| [`AbstractBathymetryConfig`](#abstractbathymetryconfig) | `src/Configs.jl:64` | `DybdedataConfig` | 1 |
-| [`AbstractForcingConfig`](#abstractforcingconfig) | `src/Configs.jl:93` | `NorKystConfig` | 3 (+1 if it downloads) |
-| [`AbstractRiverConfig`](#abstractriverconfig) | `src/Configs.jl:121` | `OF800RiversConfig` | 2 (+1 if it downloads) |
-| [`AbstractAtmosphereConfig`](#abstractatmosphereconfig) | `src/Configs.jl:164` | `NORA3Config` | 3 (+1 if it downloads, +2 if simulated) |
-| [`AbstractSimulationConfig`](#abstractsimulationconfig) | `src/Configs.jl:196` | `SimulationConfig` | 0 — fields only |
-| [`FjordConfig`](#fjordconfig) | `src/Configs.jl:340` | — (not a supertype) | — |
+| [`AbstractGridConfig`](#abstractgridconfig) | `src/Configs.jl:48` | `EvenGrid` | 1 |
+| [`AbstractBathymetryConfig`](#abstractbathymetryconfig) | `src/Configs.jl:68` | `DybdedataConfig` | 1 |
+| [`AbstractForcingConfig`](#abstractforcingconfig) | `src/Configs.jl:97` | `NorKystConfig` | 3 (+1 if it downloads) |
+| [`AbstractRiverConfig`](#abstractriverconfig) | `src/Configs.jl:125` | `OF800RiversConfig` | 2 (+1 if it downloads) |
+| [`AbstractAtmosphereConfig`](#abstractatmosphereconfig) | `src/Configs.jl:168` | `NORA3Config` | 3 (+1 if it downloads, +2 if simulated) |
+| [`AbstractSimulationConfig`](#abstractsimulationconfig) | `src/Configs.jl:207` | `SimulationConfig` | 0 — fields only |
+| [`AbstractCoupledSimulationConfig`](#abstractcoupledsimulationconfig) | `src/Configs.jl:229` | `CoupledHydrostaticSimulation` | 2 |
+| [`AbstractBoundaryConditionConfig`](#abstractboundaryconditionconfig) | `src/Configs.jl:251` | `TopBottomFluxes`, `OpenLateralBoundary` | 1 |
+| [`AbstractWriterConfig`](#abstractwriterconfig) | `src/Configs.jl:282` | `SnapshotWriter`, `CheckpointWriter` | 1 |
+| [`AbstractTimeSteppingConfig`](#abstracttimesteppingconfig) | `src/Configs.jl:299` | `AdaptiveTimeStep` | 2 |
+| [`FjordConfig`](#fjordconfig) | `src/Configs.jl:455` | — (not a supertype) | — |
+
+The last four are nested one level below `AbstractSimulationConfig`, in its `model`,
+`boundary_conditions`, `writers` and `time_stepping` fields — the same way a river config hangs off
+the forcing config's `rivers`. They are what carries the dispatch `AbstractSimulationConfig` itself
+has none of.
 
 ---
 
@@ -90,8 +99,8 @@ Dybdedata source. Template file: `src/Bathymetry/geonorge.jl`.
 | Function | Defined at |
 |---|---|
 | `prepare_bathymetry(target_grid, config; regrid_kw...)` | `src/Bathymetry/Bathymetry.jl:87` |
-| `bathymetry_path(config)` | `src/Configs.jl:209` |
-| `plot_path(config)` | `src/Configs.jl:212` |
+| `bathymetry_path(config)` | `src/Configs.jl:312` |
+| `plot_path(config)` | `src/Configs.jl:315` |
 | `plot_bathymetry(grid, bottom_height, config; title, figure_size)` | `src/Plotting.jl:97` |
 
 ---
@@ -135,10 +144,10 @@ not on the config.
 | `forcing_from_file(config; grid, tracers, reference_date)` | `src/Forcing/Forcing.jl:289` |
 | `interpolation_architecture(config)` | `src/Forcing/Forcing.jl:314` |
 | `add_rivers(target_grid, config)` → dispatches on `config.rivers` | `src/Forcing/rivers.jl:212` |
-| `simulation_forcing_path(config, rivers)` | `src/Simulations.jl:376-377` |
-| `forcing_path(config)` | `src/Configs.jl:210` |
-| `forcing_directory(config)` | `src/Configs.jl:223` |
-| `plot_path(config)` | `src/Configs.jl:213` |
+| `simulation_forcing_path(config, rivers)` | `src/Simulations.jl:499-500` |
+| `forcing_path(config)` | `src/Configs.jl:313` |
+| `forcing_directory(config)` | `src/Configs.jl:326` |
+| `plot_path(config)` | `src/Configs.jl:316` |
 | `plot_forcing(grid, config)` | `src/Plotting.jl:168` |
 
 ---
@@ -174,9 +183,9 @@ has to define a no-op.
 | Function | Defined at |
 |---|---|
 | `add_rivers(target_grid, forcing_config, rivers)` | `src/Forcing/rivers.jl:216` |
-| `river_forcing_path(config)` | `src/Configs.jl:232` |
-| `simulation_forcing_path(forcing_config, rivers)` | `src/Simulations.jl:377` |
-| `forcing_prerequisite(rivers)` → `"add_rivers"` | `src/Simulations.jl:386` |
+| `river_forcing_path(config)` | `src/Configs.jl:335` |
+| `simulation_forcing_path(forcing_config, rivers)` | `src/Simulations.jl:500` |
+| `forcing_prerequisite(rivers)` → `"add_rivers"` | `src/Simulations.jl:509` |
 
 The last two are why naming rivers changes the *run*, not just the rivers step: the simulation reads
 `river_forcing_path` instead of `forcing_path`, so `add_rivers` becomes a prerequisite of
@@ -231,9 +240,9 @@ the only thing keeping the atmosphere and the forcing in phase.
 |---|---|
 | `prepare_atmosphere(target_grid, config; coverage)` | `src/Atmospheres/Atmospheres.jl:439` |
 | `atmosphere_target_axes(target_grid, config)` | `src/Atmospheres/Atmospheres.jl:231` |
-| `atmosphere_path(config)` | `src/Configs.jl:211` |
-| `atmosphere_directory(config)` | `src/Configs.jl:241` |
-| `plot_path(config)` | `src/Configs.jl:214` |
+| `atmosphere_path(config)` | `src/Configs.jl:314` |
+| `atmosphere_directory(config)` | `src/Configs.jl:344` |
+| `plot_path(config)` | `src/Configs.jl:317` |
 | `plot_atmosphere(config)` | `src/Plotting.jl:226` |
 | `MultiYearNORA3(config)` — the reader for a prepared file | `src/Atmospheres/NORA3.jl:99` |
 
@@ -246,21 +255,22 @@ returns the identity mapping from `atmosphere_variable_names`.
 
 ## `AbstractSimulationConfig`
 
-Built-in subtype: `SimulationConfig` (`src/Simulations.jl:98`). Template: the `SimulationConfig` block
+Built-in subtype: `SimulationConfig` (`src/Simulations.jl:253`). Template: the `SimulationConfig` block
 in `src/Setups/oslofjorden.jl`.
 
 ### Required hooks
 
 **None.** This supertype is data only, read field by field, because everything dataset-specific
-already comes from the other configs. An alternative simulation config is a subtype supplying the
-field set its docstring lists — `results_root`, `output_file`, `start_date` and `stop_time` are the
-supertype-level minimum. No method anywhere dispatches on the concrete `SimulationConfig`.
+already comes from the other configs — and everything that *is* dispatched on comes from the four
+nested configs below. An alternative simulation config is a subtype supplying the field set its
+docstring lists; `results_root`, `start_date` and `stop_time` are the supertype-level minimum. No
+method anywhere dispatches on the concrete `SimulationConfig`.
 
 ### Optional hooks
 
 | Hook | Default | Default at |
 |---|---|---|
-| `run_tag(config)` → the run's identity as a filename fragment | `LAUNCH_TAG[]`, the wall-clock instant the process started | `src/Configs.jl:258` |
+| `run_tag(config)` → the run's identity as a filename fragment | `LAUNCH_TAG[]`, the wall-clock instant the process started | `src/Configs.jl:361` |
 
 `run_tag` is the one exception to "no hooks". It takes a config it does not read, precisely so a
 subtype can name its runs differently.
@@ -269,25 +279,152 @@ subtype can name its runs differently.
 
 | Function | Defined at |
 |---|---|
-| `results_path(config)` / `results_path(config, loop)` | `src/Configs.jl:272`, `:274` |
-| `coverage_window(config)` → the interval the prepared inputs must span | `src/Configs.jl:307` |
-| `simulation_architecture(config)` | `src/Simulations.jl:135` |
-| `loop_output_path(config, loop)` | `src/Simulations.jl:433` |
-| `checkpointed_loops(config)` | `src/Simulations.jl:458` |
-| `resume_loop(config)` | `src/Simulations.jl:480` |
-| `attach_writers!(simulation, config, loop)` | `src/Simulations.jl:509` |
-| `attach_checkpointer!(simulation, config, loop)` | `src/Simulations.jl:547` |
-| `restart_loop!(simulation, config, loop)` | `src/Simulations.jl:607` |
+| `results_path(writer, config)` / `results_path(writer, config, loop)` | `src/Configs.jl:379`, `:382` |
+| `coverage_window(config)` → the interval the prepared inputs must span | `src/Configs.jl:422` |
+| `simulation_architecture(config)` | `src/Simulations.jl:277` |
+| `loop_output_path(writer, config, loop)` | `src/Simulations.jl:556` |
+| `checkpoints(config)` → whether any writer checkpoints | `src/Simulations.jl:588` |
+| `loop_output_paths(config, loop)` → every product file one repetition writes | `src/Simulations.jl:626` |
+| `checkpointed_loops(config)` | `src/Simulations.jl:666` |
+| `resume_loop(config)` | `src/Simulations.jl:693` |
+| `attach_writers!(simulation, config, loop)` | `src/Simulations.jl:722` |
+| `restart_loop!(simulation, config, loop)` | `src/Simulations.jl:890` |
+| `validate_writers(config)` | `src/Simulations.jl:1050` |
 | `log_path(config)` | `src/CLI.jl:102` |
 
-`coverage_window` reads `start_date`, so a subtype omitting that field inherits only the other two
-path helpers.
+`coverage_window` reads `start_date`, so a subtype omitting that field inherits only the path
+helpers. `results_path` takes the *writer* whose file it names, so a subtype needs no `output_file`
+of its own.
+
+---
+
+## `AbstractCoupledSimulationConfig`
+
+Built-in subtype: `CoupledHydrostaticSimulation` (`src/Simulations.jl:69`). Lives in the simulation
+config's `model` field.
+
+### Required hooks
+
+| Hook | Returns | Built-in |
+|---|---|---|
+| `coupled_simulation(model, grid; forcing, boundary_conditions, initial_conditions, atmosphere, radiation, stop_time, initial_time_step)` | the coupled `Simulation` | `src/Simulations.jl:1145` |
+| `model_tracers(model)` | the tracer names, as a tuple of `Symbol`s | `src/Simulations.jl:92` |
+
+`model_tracers` is a hook rather than a field read because `build_simulation` needs the answer before
+the model exists: `forcing_from_file` builds one term per tracer, `OpenLateralBoundary` opens one
+lateral condition per tracer, and `resolve_initial_conditions` reads one state variable per tracer.
+
+The free surface is built inside `coupled_simulation` rather than passed in, because
+`SplitExplicitFreeSurface` needs the grid — which this function has and the config does not.
+
+### Optional hooks / inherited generics
+
+None. The config is consumed entirely through the two hooks above.
+
+---
+
+## `AbstractBoundaryConditionConfig`
+
+Built-in subtypes: `TopBottomFluxes` (`src/BoundaryConditions.jl:174`) and `OpenLateralBoundary`
+(`:195`). A simulation config names a **tuple** of these in `boundary_conditions`.
+
+### Required hooks
+
+| Hook | Returns | Built-in |
+|---|---|---|
+| `boundary_conditions(config, grid, forcing, forcing_config, tracers)` | the nested named tuple this piece contributes | `src/BoundaryConditions.jl:178`, `:197` |
+
+The return shape is `(u = (top = …, bottom = …), T = (top = …,))` — nested named tuples, *not*
+`FieldBoundaryConditions`. `field_boundary_conditions` merges the whole tuple with
+`recursive_merge` and materializes the result once.
+
+`boundary_conditions` is exported by `FjordSim.BoundaryConditions` but deliberately **not**
+re-exported from `FjordSim`: `Oceananigans.Fields.boundary_conditions` exists, so a script doing
+`using FjordSim, Oceananigans.Fields` would be ambiguous. Extend it as
+`FjordSim.BoundaryConditions.boundary_conditions`.
+
+### Inherited generics
+
+| Function | Defined at |
+|---|---|
+| `field_boundary_conditions(configs, grid, forcing, forcing_config, tracers)` | `src/BoundaryConditions.jl:216` |
+
+Merging is last-wins, so the tuple's order is its precedence order. `()` is a valid statement — the
+model's own defaults everywhere — and yields `(;)`.
+
+---
+
+## `AbstractWriterConfig`
+
+Built-in subtypes: `SnapshotWriter` (`src/Simulations.jl:110`) and `CheckpointWriter` (`:149`). A
+simulation config names a **tuple** of these in `writers`; `()` writes nothing.
+
+### Required hooks
+
+| Hook | Does | Built-in |
+|---|---|---|
+| `attach_writer!(simulation, writer, config, loop)` | attach this writer for repetition `loop` | `src/Simulations.jl:778`, `:811` |
+
+Which simulation a writer attaches to is the method's business: `SnapshotWriter` goes on
+`simulation.model.ocean`, because it writes ocean fields; `CheckpointWriter` goes on the **coupled**
+simulation, because `prognostic_state` of the coupled model is what a resumable state is and
+`run!(…; pickup)` looks for its checkpointer there.
+
+### Optional hooks
+
+| Hook | Default | Default at |
+|---|---|---|
+| `checkpoint_trait(writer)` → `Checkpointing()` / `NotCheckpointing()` | `NotCheckpointing()` | `src/Simulations.jl:576` |
+| `output_path_trait(writer)` → `NamesOutputFile()` / `NamesNoOutputFile()` | `NamesNoOutputFile()` | `src/Simulations.jl:604` |
+
+Two Holy traits rather than `isa` tests, because three separate sites need an exact answer:
+`checkpoint_at_end` with no checkpointer to find writes into the working directory behind a `@warn`,
+`run!(…; pickup)` needs exactly one, and `resume_loop` rejects `pickup` without one. The second trait
+is not the negation of the first: a checkpointer writes files, but they are scratch rather than
+product.
+
+### Inherited generics
+
+| Function | Defined at |
+|---|---|
+| `results_path(writer, config)` / `results_path(writer, config, loop)` | `src/Configs.jl:379`, `:382` |
+| `loop_output_path(writer, config, loop)` | `src/Simulations.jl:556` |
+| `checkpoints(writer)` | `src/Simulations.jl:585` |
+| `reported_paths(writer, config, loop)` | `src/Simulations.jl:613` |
+| `writer_keys(writer)` | `src/Simulations.jl:636` |
+
+`results_path` reads `writer.output_file`, which only a writer whose `output_path_trait` is
+`NamesOutputFile` needs; on any other it raises an `ArgumentError` saying so rather than failing with
+a missing field.
+
+---
+
+## `AbstractTimeSteppingConfig`
+
+Built-in subtype: `AdaptiveTimeStep` (`src/Simulations.jl:175`). Lives in the simulation config's
+`time_stepping` field.
+
+### Required hooks
+
+| Hook | Does | Built-in |
+|---|---|---|
+| `attach_time_stepping!(simulation, config)` | install the time-step policy | `src/Simulations.jl:833` |
+| `initial_time_step(config)` | the `Δt` the simulation starts at, in seconds | `src/Simulations.jl:197` |
+
+Two hooks rather than one because the two happen at different moments: the step is needed when the
+`Simulation` is constructed, the policy only once it exists. `attach_time_stepping!` must **not** set
+`simulation.Δt` — `restart_loop!` deliberately leaves it alone so a repetition keeps the step the
+previous one converged on rather than re-ramping from one second.
+
+### Optional hooks / inherited generics
+
+None.
 
 ---
 
 ## `FjordConfig`
 
-`FjordConfig` (`src/Configs.jl:340`) is not a supertype — it is the concrete container holding one of
+`FjordConfig` (`src/Configs.jl:455`) is not a supertype — it is the concrete container holding one of
 each config, parametrically so every instantiation stays concretely typed. `atmosphere_config` and
 `simulation_config` default to `nothing`; a river config hangs off the forcing config's `rivers`
 field instead.
@@ -304,14 +441,14 @@ and each maps one-to-one onto a CLI subcommand (`src/CLI.jl:18-26`), in this ord
 | `add_rivers(config)` | `add_rivers` | `src/Forcing/rivers.jl:188` |
 | `download_atmosphere(config)` | `download_atmosphere` | `src/Atmospheres/Atmospheres.jl:169` |
 | `prepare_atmosphere(config)` | `prepare_atmosphere` | `src/Atmospheres/Atmospheres.jl:487` |
-| `run_simulation(config)` | `run_simulation` | `src/Simulations.jl:787` |
+| `run_simulation(config)` | `run_simulation` | `src/Simulations.jl:1094` |
 
 Two `FjordConfig` methods have no subcommand:
 
 | Function | Defined at | What it is for |
 |---|---|---|
-| `build_simulation(config)` | `src/Simulations.jl:648` | returns the instrumented `Simulation` without running it — the REPL and debugger entry point |
-| `simulation_forcing_path(config)` | `src/Simulations.jl:373` | which prepared forcing file the run reads, dispatching on `config.forcing_config.rivers` |
+| `build_simulation(config)` | `src/Simulations.jl:931` | returns the instrumented `Simulation` without running it — the REPL and debugger entry point |
+| `simulation_forcing_path(config)` | `src/Simulations.jl:496` | which prepared forcing file the run reads, dispatching on `config.forcing_config.rivers` |
 
 A step the setup opts out of returns `nothing` rather than raising. "You asked for a step this setup
 does not configure" is user input, so it is reported by `CLI.main`, not by a pipeline.

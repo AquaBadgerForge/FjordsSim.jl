@@ -1,16 +1,23 @@
 module Simulations
 
 export SimulationConfig,
+    CoupledHydrostaticSimulation,
+    SnapshotWriter,
+    CheckpointWriter,
+    AdaptiveTimeStep,
     FromForcing,
     FromResults,
     simulation_architecture,
+    model_tracers,
+    coupled_simulation,
+    attach_writer!,
+    attach_time_stepping!,
+    initial_time_step,
     build_simulation,
-    run_simulation,
-    coupled_hydrostatic_simulation
+    run_simulation
 
 using Oceananigans
-using Oceananigans.BoundaryConditions
-using Oceananigans.Units
+using Oceananigans: fields
 using Oceananigans.Utils: prettytime
 using Oceananigans.TimeSteppers: reset!, update_state!
 using NumericalEarth
@@ -19,6 +26,9 @@ using NCDatasets
 
 using ..Configs:
     AbstractSimulationConfig,
+    AbstractCoupledSimulationConfig,
+    AbstractWriterConfig,
+    AbstractTimeSteppingConfig,
     AbstractForcingConfig,
     AbstractRiverConfig,
     FjordConfig,
@@ -27,59 +37,204 @@ using ..Configs:
     river_forcing_path,
     results_path,
     run_tag
-using ..Utils: recursive_merge, progress, cell_advection_timescale_coupled_model
+using ..Utils: progress, cell_advection_timescale_coupled_model
 using ..Atmospheres: prescribed_atmosphere, prescribed_radiation, atmosphere_date_range
 using ..Forcing: forcing_from_file, interpolation_architecture
-using ..BoundaryConditions: top_bottom_boundary_conditions, lateral_tracer_open_boundary_conditions
+using ..BoundaryConditions: field_boundary_conditions
 using ..Grids: ImmersedBoundaryGrid
 
 """
-    SimulationConfig(; results_root, buoyancy, closure, coriolis, ...)
+    CoupledHydrostaticSimulation(; buoyancy, closure, tracer_advection, momentum_advection,
+                                 tracers, coriolis, sea_ice, biogeochemistry, free_surface_cfl)
+
+What the model *is*: a `HydrostaticFreeSurfaceModel` inside a NumericalEarth `OceanSeaIceModel`.
+
+Holds the components that depend on neither the grid nor the device, so they are stored as the
+objects `coupled_simulation` consumes rather than as knobs it has to interpret. `free_surface_cfl`
+is the one exception and the reason it is a plain `Float64`: `SplitExplicitFreeSurface` needs the
+grid, which only exists inside `coupled_simulation`.
+
+**No field has a default**, deliberately. Every one is a scientific choice about a particular fjord,
+and a default would let the next setup silently inherit it, so a setup that forgets one gets an
+`UndefKeywordError` naming it rather than a plausible-looking run.
+
+Eight type parameters, one per prebuilt component. A ninth is the signal to collapse them into a
+single `NamedTuple` field instead of adding another; the "Simulation config" testset guards the
+count.
+
+Note that `Base.@kwdef` on a *parametric* struct generates a constructor that does not convert, so
+`free_surface_cfl = 1` is a `MethodError` where `1.0` is fine.
+"""
+Base.@kwdef struct CoupledHydrostaticSimulation{B,C,TA,MA,TR,CO,SI,BG} <:
+                   AbstractCoupledSimulationConfig
+    buoyancy::B
+    closure::C
+    tracer_advection::TA
+    momentum_advection::MA
+    tracers::TR
+    coriolis::CO
+    sea_ice::SI
+    biogeochemistry::BG
+    free_surface_cfl::Float64
+end
+
+"""
+    model_tracers(model)
+
+The tracer names a coupled-model config carries.
+
+A hook rather than a field read, because `build_simulation` needs them long before the model exists:
+`forcing_from_file` builds one term per tracer, `OpenLateralBoundary` opens one lateral condition per
+tracer, and `resolve_initial_conditions` reads one state variable per tracer. All three ask the model
+config what it simulates rather than being told a second time.
+"""
+model_tracers(model::CoupledHydrostaticSimulation) = model.tracers
+
+"""
+    SnapshotWriter(; name, output_file, variables, interval, overwrite_existing)
+
+A NetCDF snapshot of named ocean fields, on a `TimeInterval` schedule.
+
+# Fields
+- `name`: the key it lives under in the ocean sub-simulation's `output_writers`, and what makes two
+  snapshot writers distinguishable. Stated rather than derived, so a test or a post-processing step
+  can name the writer it wants.
+- `output_file`: resolved by `results_path`, which inserts the run tag and, for a looped run, the
+  loop index.
+- `variables`: the field names to write, as `Symbol`s, resolved against the model by
+  `snapshot_outputs`. Anything `Oceananigans.fields` exposes — velocities, tracers, the free
+  surface, auxiliaries — so a setup that adds a biogeochemical tracer writes it by naming it.
+- `interval`, `overwrite_existing`: the schedule and the clobber policy.
+"""
+struct SnapshotWriter{V<:Tuple{Vararg{Symbol}}} <: AbstractWriterConfig
+    name::Symbol
+    output_file::String
+    variables::V
+    interval::Float64
+    overwrite_existing::Bool
+end
+
+function SnapshotWriter(; name, output_file, variables, interval, overwrite_existing)
+    interval > 0 || throw(
+        ArgumentError("A snapshot writer's `interval` must be positive, got $interval."),
+    )
+    isempty(variables) &&
+        throw(ArgumentError("Snapshot writer :$name names no `variables` to write."))
+
+    return SnapshotWriter(
+        Symbol(name),
+        String(output_file),
+        Tuple(Symbol(variable) for variable in variables),
+        Float64(interval),
+        Bool(overwrite_existing),
+    )
+end
+
+"""
+    CheckpointWriter(; interval, overwrite_existing, cleanup)
+
+A JLD2 checkpoint of the coupled model's prognostic state, on a `TimeInterval` schedule.
+
+Naming one is what makes a run resumable; a setup that names none writes no checkpoints at all,
+which is how "checkpointing off" is now spelled. `pickup` without one is a configuration error
+rather than a run that fails on its first `run!`.
+
+Oceananigans 0.110 checkpoints *only* `prognostic_state(simulation)`, so the `Checkpointer`
+docstring's warning that objects containing functions cannot be serialized does not apply here:
+`ForcingFromFile`, its `FieldTimeSeries` backend and the `FreshwaterExchange` in the tracer top
+boundary conditions are all outside that state. CATKE's diffusivities and its `e` tracer are inside
+it, which is why a checkpoint is a few hundred MB on a real grid and why `cleanup` exists.
+"""
+struct CheckpointWriter <: AbstractWriterConfig
+    interval::Float64
+    overwrite_existing::Bool
+    cleanup::Bool
+end
+
+function CheckpointWriter(; interval, overwrite_existing, cleanup)
+    interval > 0 || throw(
+        ArgumentError(
+            "A checkpoint writer's `interval` must be positive, got $interval. A setup that wants " *
+            "no checkpoints names no `CheckpointWriter` at all.",
+        ),
+    )
+
+    return CheckpointWriter(Float64(interval), Bool(overwrite_existing), Bool(cleanup))
+end
+
+"""
+    AdaptiveTimeStep(; initial_time_step, cfl, max_time_step, max_time_step_change)
+
+An Oceananigans time-step wizard: the step is chosen each iteration from the advective CFL, starting
+from `initial_time_step` and growing by at most `max_time_step_change` per step.
+
+The wizard uses `cell_advection_timescale_coupled_model`, which reaches through the coupled model to
+the ocean — the coupled model has no advective timescale of its own.
+"""
+struct AdaptiveTimeStep <: AbstractTimeSteppingConfig
+    initial_time_step::Float64
+    cfl::Float64
+    max_time_step::Float64
+    max_time_step_change::Float64
+end
+
+AdaptiveTimeStep(; initial_time_step, cfl, max_time_step, max_time_step_change) = AdaptiveTimeStep(
+    Float64(initial_time_step),
+    Float64(cfl),
+    Float64(max_time_step),
+    Float64(max_time_step_change),
+)
+
+"""
+    initial_time_step(config)
+
+The `Δt` a simulation starts at, in seconds.
+
+Separate from `attach_time_stepping!` because the two happen at different moments: the step is needed
+when the `Simulation` is constructed, the policy only once it exists.
+"""
+initial_time_step(config::AdaptiveTimeStep) = config.initial_time_step
+
+"""
+    SimulationConfig(; results_root, architecture, model, boundary_conditions, writers, ...)
 
 Simulation configuration: how a setup whose data is already prepared is run.
 
-**No field has a default.** Every knob is a scientific choice about a particular fjord, and a
-default would let one setup silently inherit another's — so a setup that forgets one gets an
-`UndefKeywordError` naming it rather than a plausible-looking run. The setup file is therefore the
-complete statement of what the simulation is; nothing about it is hidden in this struct.
+**No field has a default**, here and in each of the four nested configs. Every knob is a scientific
+choice about a particular fjord, and a default would let one setup silently inherit another's — so a
+setup that forgets one gets an `UndefKeywordError` naming it rather than a plausible-looking run.
+The setup file is the complete statement of what the simulation is; nothing about it is hidden here.
 
-The split between the two halves of the field list is not stylistic. `buoyancy`, `closure`,
-`tracer_advection`, `momentum_advection`, `tracers`, `coriolis`, `sea_ice` and `biogeochemistry`
-are grid-independent, so they are stored as the objects `coupled_hydrostatic_simulation` consumes;
-`initial_conditions` sits with them but is resolved on the way through, since reading a state
-needs the grid. The free surface, the boundary conditions, the forcing
-and the atmosphere are *not* — they need the grid, the architecture, or another config — so what
-is stored here is the knob and `build_simulation` does the construction. Nothing that could be
-derived from another config is a field at all: which forcing file, which open boundary and which
-atmosphere reader all come from `forcing_config` and `atmosphere_config`.
+The fields split into four nested configs and the run control that ties them together, and the split
+is by *what dispatches on what*. `model` is assembled by `coupled_simulation`, `boundary_conditions`
+by `field_boundary_conditions`, each writer by `attach_writer!`, and `time_stepping` by
+`attach_time_stepping!` — four generic functions, so a different model, a new boundary-condition
+piece or another kind of output is a new subtype rather than an edit to `build_simulation`.
 
 # Fields
-- `results_root`: Directory the output resolves against, via `results_path`.
-- `output_file`: The snapshot file, via `results_path`.
+- `results_root`: the directory every writer, and the run log, resolves against.
 - `architecture`: `:auto`, `:cpu` or `:gpu`, resolved by `simulation_architecture`. A `Symbol`
   rather than a live `CPU()`/`GPU()` so this config's field types stay concrete and a setup file
   loads on a machine with no GPU.
-- `buoyancy`, `closure`, `tracer_advection`, `momentum_advection`, `tracers`, `coriolis`,
-  `sea_ice`, `biogeochemistry`: passed to `coupled_hydrostatic_simulation` unchanged.
+- `model`: an `AbstractCoupledSimulationConfig`.
+- `boundary_conditions`: a tuple of `AbstractBoundaryConditionConfig`s. Tuple order is merge
+  precedence; `()` means the model's defaults everywhere.
+- `writers`: a tuple of `AbstractWriterConfig`s. `()` writes nothing.
+- `time_stepping`: an `AbstractTimeSteppingConfig`.
 - `initial_conditions`: where the ocean state starts from — a `NamedTuple` of constants, fields or
   functions, a `FromForcing`, or a `FromResults`. `build_simulation` puts it through
-  `resolve_initial_conditions`, so what reaches `coupled_hydrostatic_simulation` is always a
-  `NamedTuple` `set!` accepts.
-- `free_surface_cfl`: `SplitExplicitFreeSurface` needs the grid, so only the CFL is stored.
-- `bottom_drag_coefficient`: passed to `top_bottom_boundary_conditions`, which needs the grid.
+  `resolve_initial_conditions`, so what reaches `coupled_simulation` is always a `NamedTuple` `set!`
+  accepts.
 - `start_date`: the calendar instant model time zero stands for.
 - `stop_time`: seconds of simulated time one pass through the run window lasts.
 - `loops`: how many times to run that window, carrying the ocean state across each restart. `1`
   runs it once. See `run_simulation`.
-- `output_interval`, `overwrite_existing`: the snapshot writer's schedule and clobber policy.
 - `progress_interval`: how often the `progress` callback reports.
-- `checkpoint_interval`: how often to write a JLD2 checkpoint; `0.0` attaches no `Checkpointer`.
 - `pickup`: resume from the newest checkpoint under `results_root` instead of starting fresh.
-- `time_step_cfl`, `max_time_step`, `max_time_step_change`: the time-step wizard's settings.
+  Requires a `CheckpointWriter`.
 
-A relative `output_file` resolves against `results_root`; an absolute one relocates just that
-file. Either way `results_path` inserts `run_tag` — the launch instant — before the extension, and a
-looped run appends the loop index on top of that, so runs and repetitions land in separate files.
+Nothing that could be derived from another config is a field at all: which forcing file, which open
+boundary and which atmosphere reader all come from `forcing_config` and `atmosphere_config`.
 
 `start_date` is a field rather than something derived from an input file because every prepared
 file has its *own* first record, and each reader used to zero its own axis there: the Oslofjord
@@ -88,39 +243,25 @@ of phase. One stated instant is the only thing they can all agree on, and
 `validate_time_coverage` checks each file actually spans `[start_date, start_date + stop_time]`
 rather than letting `Cyclical()` wrap the shortfall.
 
-Every duration is in seconds, and must be written as a `Float64` — with `Oceananigans.Units`
-(`365days`, `1hour`, `3minutes`), whose constants already are one. `Base.@kwdef` on a
-*parametric* struct generates a constructor that does not convert, unlike the non-parametric
-configs elsewhere in FjordSim, so `stop_time = 3600` is a `MethodError` where `stop_time = 1hour`
-is fine, and `checkpoint_interval = 0` is one where `0.0` is fine. `loops` is the exception, being
-an `Int` already.
+Every duration is in seconds. `Base.@kwdef` on a *parametric* struct generates a constructor that
+does not convert, so `stop_time = 3600` is a `MethodError` where `stop_time = 1hour` is fine — write
+durations with `Oceananigans.Units`, whose constants are already `Float64`. `loops` is the exception,
+being an `Int` already, and the nested configs are the other one: each has a hand-written keyword
+constructor that converts, so an integer duration is fine in a writer or a time-stepping config.
 """
-Base.@kwdef mutable struct SimulationConfig{B,C,TA,MA,TR,I,CO,SI,BG} <: AbstractSimulationConfig
+Base.@kwdef mutable struct SimulationConfig{M,BC,W,TS,I} <: AbstractSimulationConfig
     results_root::String
-    output_file::String
     architecture::Symbol
-    buoyancy::B
-    closure::C
-    tracer_advection::TA
-    momentum_advection::MA
-    tracers::TR
+    model::M
+    boundary_conditions::BC
+    writers::W
+    time_stepping::TS
     initial_conditions::I
-    coriolis::CO
-    sea_ice::SI
-    biogeochemistry::BG
-    free_surface_cfl::Float64
-    bottom_drag_coefficient::Float64
     start_date::DateTime
     stop_time::Float64
     loops::Int
-    output_interval::Float64
     progress_interval::Float64
-    overwrite_existing::Bool
-    checkpoint_interval::Float64
     pickup::Bool
-    time_step_cfl::Float64
-    max_time_step::Float64
-    max_time_step_change::Float64
 end
 
 """
@@ -191,14 +332,14 @@ initial_conditions_date(initial_conditions::FromForcing, start_date) = initial_c
 
 Turn a setup's `initial_conditions` into the `NamedTuple` `set!(model; ...)` consumes.
 
-Dispatched on the kind of source, so `coupled_hydrostatic_simulation` never learns that there is
-more than one: it still receives something splattable and still applies it with a single `set!`.
+Dispatched on the kind of source, so `coupled_simulation` never learns that there is more than one:
+it still receives something splattable and still applies it with a single `set!`.
 A `NamedTuple` — constants, functions or fields — passes straight through, which is what every
 setup did before the other two existed.
 
-What gets set is every tracer `config.tracers` names plus `u` and `v`, intersected with what the
-source file actually carries — see `state_variables`. Nothing is enumerated here, so adding a
-biogeochemical tracer to a setup is enough to have it read back.
+What gets set is every tracer `model_tracers(config.model)` names plus `u` and `v`, intersected with
+what the source file actually carries — see `state_variables`. Nothing is enumerated here, so adding
+a biogeochemical tracer to a setup is enough to have it read back.
 
 The free surface `η` and any closure-owned tracer the config does not name (CATKE's `e`) keep their
 defaults, so reading a state in is a *warm start*, not a restart: the barotropic mode and the
@@ -210,14 +351,14 @@ resolve_initial_conditions(initial_conditions::NamedTuple, grid, forcing_file, c
 function resolve_initial_conditions(initial_conditions::FromForcing, grid, forcing_file, config)
     date = initial_conditions_date(initial_conditions, config.start_date)
     @info "Initial conditions from forcing $forcing_file at $date"
-    return forcing_state(forcing_file, grid, date, config.tracers)
+    return forcing_state(forcing_file, grid, date, model_tracers(config.model))
 end
 
 function resolve_initial_conditions(initial_conditions::FromResults, grid, forcing_file, config)
     filepath = results_state_path(initial_conditions, config)
     isfile(filepath) || error("Results file $filepath does not exist.")
     @info "Initial conditions from results $filepath"
-    return results_state(filepath, grid, initial_conditions.date, config.tracers)
+    return results_state(filepath, grid, initial_conditions.date, model_tracers(config.model))
 end
 
 """
@@ -345,25 +486,6 @@ function validate_state_dimensions(filepath, ds, grid, names)
 end
 
 """
-    open_boundary_conditions(::Val{edge})
-
-The open boundary condition for the forcing config's `relaxation_edge`, as a nested named tuple
-`recursive_merge` can merge into `top_bottom_boundary_conditions`. The open component is the
-velocity normal to that edge.
-
-Derived rather than configured: the relaxation edge is by construction the edge the regional
-domain is open on, so a setup that named it twice could only ever disagree with itself.
-"""
-open_boundary_conditions(::Val{:south}) = (v = (south = NormalFlowBoundaryCondition(nothing),),)
-open_boundary_conditions(::Val{:north}) = (v = (north = NormalFlowBoundaryCondition(nothing),),)
-open_boundary_conditions(::Val{:west}) = (u = (west = NormalFlowBoundaryCondition(nothing),),)
-open_boundary_conditions(::Val{:east}) = (u = (east = NormalFlowBoundaryCondition(nothing),),)
-
-open_boundary_conditions(::Val{edge}) where {edge} = throw(
-    ArgumentError("relaxation_edge must be one of (:south, :north, :west, :east), got :$edge"),
-)
-
-"""
     simulation_forcing_path(config)
 
 Which prepared forcing file the simulation reads: the rivers-augmented copy `add_rivers` wrote
@@ -424,14 +546,95 @@ forcing_date_range(filepath) = NCDataset(filepath) do ds
 end
 
 """
-    loop_output_path(config, loop)
+    loop_output_path(writer, config, loop)
 
-The snapshot file for one repetition: the plain run-tagged name for a setup that runs its window
+One writer's file for one repetition: the plain run-tagged name for a setup that runs its window
 once, and the loop-indexed one when it repeats. A single run therefore keeps the shorter name
 rather than gaining a `_loop01` nobody asked for.
 """
-loop_output_path(config::AbstractSimulationConfig, loop) =
-    config.loops == 1 ? results_path(config) : results_path(config, loop)
+loop_output_path(writer::AbstractWriterConfig, config::AbstractSimulationConfig, loop) =
+    config.loops == 1 ? results_path(writer, config) : results_path(writer, config, loop)
+
+"""
+    CheckpointTrait
+
+Whether a writer config contributes a `Checkpointer` — `Checkpointing()` or `NotCheckpointing()`,
+defaulting to the latter.
+
+A trait rather than an `isa` test at each of the three sites that need the answer, because the
+answer has to be exact. `run!(…; checkpoint_at_end)` with no checkpointer to find does not fail: it
+writes `checkpoint_iteration<N>.jld2` into the working directory behind a `@warn`, and
+`run!(…; pickup)` with two of them cannot tell which to resume. It is also what lets
+`build_simulation` reject `pickup` without a checkpointing writer as a configuration error, which
+was not expressible while checkpointing was a threshold on a float.
+"""
+abstract type CheckpointTrait end
+struct Checkpointing <: CheckpointTrait end
+struct NotCheckpointing <: CheckpointTrait end
+
+checkpoint_trait(::AbstractWriterConfig) = NotCheckpointing()
+checkpoint_trait(::CheckpointWriter) = Checkpointing()
+
+"""
+    checkpoints(writer)
+    checkpoints(config)
+
+Whether a writer contributes a `Checkpointer`, or whether any of a simulation config's does.
+"""
+checkpoints(writer::AbstractWriterConfig) = checkpoints(checkpoint_trait(writer))
+checkpoints(::Checkpointing) = true
+checkpoints(::NotCheckpointing) = false
+checkpoints(config::AbstractSimulationConfig) = any(checkpoints, config.writers)
+
+"""
+    OutputPathTrait
+
+Whether a writer names a file the run should report — `NamesOutputFile()` or
+`NamesNoOutputFile()`, defaulting to the latter.
+
+Not simply the negation of `CheckpointTrait`: a checkpointer does write files, but they are
+scratch rather than product — they carry no run tag, `cleanup` prunes them, and a `pickup` finds
+them by scanning rather than by being told a path. A writer could reasonably be both or neither.
+"""
+abstract type OutputPathTrait end
+struct NamesOutputFile <: OutputPathTrait end
+struct NamesNoOutputFile <: OutputPathTrait end
+
+output_path_trait(::AbstractWriterConfig) = NamesNoOutputFile()
+output_path_trait(::SnapshotWriter) = NamesOutputFile()
+
+"""
+    reported_paths(writer, config, loop)
+
+The files `writer` writes for repetition `loop` that `run_simulation` should report, as a tuple —
+empty for a writer that names none, so flattening over the whole tuple is total.
+"""
+reported_paths(writer::AbstractWriterConfig, config::AbstractSimulationConfig, loop) =
+    reported_paths(output_path_trait(writer), writer, config, loop)
+
+reported_paths(::NamesOutputFile, writer, config, loop) =
+    (loop_output_path(writer, config, loop),)
+
+reported_paths(::NamesNoOutputFile, writer, config, loop) = ()
+
+"""
+    loop_output_paths(config, loop)
+
+Every product file one repetition writes.
+"""
+loop_output_paths(config::AbstractSimulationConfig, loop) = String[
+    path for writer in config.writers for path in reported_paths(writer, config, loop)
+]
+
+"""
+    writer_keys(writer)
+
+The `output_writers` keys a writer occupies, as a tuple. Used to reject a setup naming two writers
+that would silently replace one another in the same dictionary.
+"""
+writer_keys(writer::AbstractWriterConfig) = writer_keys(output_path_trait(writer), writer)
+writer_keys(::NamesOutputFile, writer) = (writer.name,)
+writer_keys(::NamesNoOutputFile, ::AbstractWriterConfig) = ()
 
 """
     checkpoint_prefix(loop)
@@ -454,6 +657,10 @@ checkpoint_prefix(loop) = string("checkpoint_loop", lpad(loop, 2, '0'))
     checkpointed_loops(config)
 
 Every loop index that has a checkpoint under `results_root`.
+
+The pattern is the exact inverse of `checkpoint_prefix`, and the coupling is silent: a
+`CheckpointWriter` that gained a `prefix` field would leave this finding nothing, so `resume_loop`
+would warn and replay the whole spin-up. Change both or neither.
 """
 function checkpointed_loops(config::AbstractSimulationConfig)
     isdir(config.results_root) || return Int[]
@@ -471,6 +678,11 @@ otherwise.
 `build_simulation` attaches its writers for this loop rather than unconditionally for the first, so a
 resumed run writes into the loop it left off in.
 
+`pickup` with no checkpointing writer is rejected here rather than left to fail inside `run!`,
+because it is a statement the config contradicts: nothing this run writes could ever be resumed
+from. That check only became expressible once checkpointing was a writer rather than a threshold on
+a float.
+
 Since checkpoints carry no run tag, this is whatever state `results_root` holds, whichever launch
 wrote it and whatever `start_date` it was written under — there is one resumable run per results
 directory, and a second launch overwrites the first's checkpoints. The snapshots are per launch, so a
@@ -479,6 +691,13 @@ file.
 """
 function resume_loop(config::AbstractSimulationConfig)
     config.pickup || return 1
+
+    checkpoints(config) || throw(
+        ArgumentError(
+            "`pickup` is set but no writer checkpoints, so there is nothing to resume from. Add a " *
+            "`CheckpointWriter` to `writers`, or set `pickup = false`.",
+        ),
+    )
 
     loops = checkpointed_loops(config)
     if isempty(loops)
@@ -493,67 +712,130 @@ end
 """
     attach_writers!(simulation, config, loop)
 
-Point the snapshot writer, and the checkpointer if there is one, at `loop`'s own files.
+Point every writer the config names at `loop`'s own files.
 
-Called once by `build_simulation` and again by `restart_loop!` for each subsequent repetition. A
-*fresh* writer each time rather than a renamed one, because a `TimeInterval` accumulates its
+Called once by `build_simulation` and again by `restart_loop!` for each subsequent repetition. What
+each writer does with that is `attach_writer!`'s business — including which simulation it attaches
+to, which is not the same for all of them.
+"""
+function attach_writers!(simulation, config::AbstractSimulationConfig, loop)
+    for writer in config.writers
+        attach_writer!(simulation, writer, config, loop)
+    end
+
+    return simulation
+end
+
+"""
+    snapshot_outputs(writer, ocean_model)
+
+The fields `writer.variables` names, as the `NamedTuple` `NetCDFWriter` consumes.
+
+Resolved through `Oceananigans.fields`, the model's own flattened view of its velocities, free
+surface, tracers and auxiliary fields — so a setup that adds a biogeochemical tracer, or names `w`,
+`η` or CATKE's `e`, gets it written without this module learning what those are. Nothing is
+enumerated here, the same rule `state_variables` follows on the read side.
+
+A name the model does not have is an **error**, unlike `state_variables`, which intersects and moves
+on. The asymmetry is deliberate and worth keeping: that function serves two kinds of file whose
+variable sets legitimately differ and which no config named, while here the setup wrote the name
+down. An over-eager error costs a typo fix; a silently dropped variable costs a whole run.
+"""
+function snapshot_outputs(writer::SnapshotWriter, ocean_model)
+    available = fields(ocean_model)
+    unknown = filter(name -> !haskey(available, name), writer.variables)
+
+    isempty(unknown) || throw(
+        ArgumentError(
+            "Snapshot writer :$(writer.name) names $(join(unknown, ", ")), which the ocean model " *
+            "does not have. Available: $(join(keys(available), ", ")).",
+        ),
+    )
+
+    return NamedTuple(name => available[name] for name in writer.variables)
+end
+
+"""
+    attach_writer!(simulation, writer::SnapshotWriter, config, loop)
+
+Attach a NetCDF snapshot writer to the *ocean* sub-simulation, under `writer.name`.
+
+A *fresh* writer each loop rather than a renamed one, because a `TimeInterval` accumulates its
 actuation count: reused after a clock reset it would believe it was thousands of records ahead and
 never fire again. The old one is closed first — it holds an open `NCDataset`, so replacing it
 silently would leak a handle and an unflushed tail per loop.
 
-The snapshot file records `start_date` as a global attribute so `FromResults(path, date)` can later
-turn a date into a record — and, since the name carries the launch instant rather than the simulated
-one, it is also the only place the window a file covers is written down. See
+The file records `start_date` as a global attribute so `FromResults(path, date)` can later turn a
+date into a record — and, since the name carries the launch instant rather than the simulated one,
+it is also the only place the window a file covers is written down. See
 `RESULTS_START_DATE_ATTRIBUTE`.
+
+The `mkpath` is load-bearing: `NetCDFWriter` creates only its `dir` keyword, which is left at the
+default while the whole path goes in as `filename`, so nothing else would create the directory an
+absolute `output_file` points into.
 """
-function attach_writers!(simulation, config::AbstractSimulationConfig, loop)
+function attach_writer!(simulation, writer::SnapshotWriter, config::AbstractSimulationConfig, loop)
     ocean_sim = simulation.model.ocean
-    ocean_model = ocean_sim.model
 
-    haskey(ocean_sim.output_writers, :ocean) &&
-        close(pop!(ocean_sim.output_writers, :ocean))
+    haskey(ocean_sim.output_writers, writer.name) &&
+        close(pop!(ocean_sim.output_writers, writer.name))
 
-    ocean_sim.output_writers[:ocean] = NetCDFWriter(
-        ocean_model,
-        (
-            T = ocean_model.tracers.T,
-            S = ocean_model.tracers.S,
-            u = ocean_model.velocities.u,
-            v = ocean_model.velocities.v,
-        );
-        filename = loop_output_path(config, loop),
-        schedule = TimeInterval(config.output_interval),
-        overwrite_existing = config.overwrite_existing,
+    filepath = loop_output_path(writer, config, loop)
+    mkpath(dirname(filepath))
+
+    ocean_sim.output_writers[writer.name] = NetCDFWriter(
+        ocean_sim.model,
+        snapshot_outputs(writer, ocean_sim.model);
+        filename = filepath,
+        schedule = TimeInterval(writer.interval),
+        overwrite_existing = writer.overwrite_existing,
         global_attributes = Dict(RESULTS_START_DATE_ATTRIBUTE => string(config.start_date)),
     )
 
-    return attach_checkpointer!(simulation, config, loop)
+    return simulation
 end
 
 """
-    attach_checkpointer!(simulation, config, loop)
+    attach_writer!(simulation, writer::CheckpointWriter, config, loop)
 
-Attach a `Checkpointer` for `loop`, or nothing at all when `checkpoint_interval` is zero.
+Attach a `Checkpointer` to the *coupled* simulation, under `loop`'s own prefix.
 
-It goes on the *coupled* simulation, not the ocean one, for two reasons that both fail otherwise:
-`prognostic_state` of the `OceanSeaIceModel` is what a resumable state actually is, and
-`run!(…; pickup)` looks for its checkpointer in `simulation.output_writers`.
+The coupled one, not the ocean one, for two reasons that both fail otherwise: `prognostic_state` of
+the `OceanSeaIceModel` is what a resumable state actually is, and `run!(…; pickup)` looks for its
+checkpointer in `simulation.output_writers`.
 
-`NumericalEarth` keeps this cheap: a coupled checkpoint holds the ocean's prognostic fields, CATKE's
-diffusivities and every component's clock, but the prescribed atmosphere and radiation contribute
-only their clock. So none of the things that cannot be serialized — `ForcingFromFile` and its
-`FieldTimeSeries`, the `FreshwaterExchange` in the tracer top boundary conditions — is ever written.
+Replaced rather than closed and popped, unlike the snapshot writer: a `Checkpointer` holds no open
+file handle, and its schedule is rebuilt with it.
 """
-function attach_checkpointer!(simulation, config::AbstractSimulationConfig, loop)
-    config.checkpoint_interval > 0 || return simulation
-
+function attach_writer!(simulation, writer::CheckpointWriter, config::AbstractSimulationConfig, loop)
     simulation.output_writers[:checkpointer] = Checkpointer(
         simulation.model;
-        schedule = TimeInterval(config.checkpoint_interval),
+        schedule = TimeInterval(writer.interval),
         dir = config.results_root,
         prefix = checkpoint_prefix(loop),
-        overwrite_existing = config.overwrite_existing,
-        cleanup = true,
+        overwrite_existing = writer.overwrite_existing,
+        cleanup = writer.cleanup,
+    )
+
+    return simulation
+end
+
+"""
+    attach_time_stepping!(simulation, config::AdaptiveTimeStep)
+
+Install an Oceananigans time-step wizard on `simulation`.
+
+Deliberately does not touch `simulation.Δt`: the starting step is `initial_time_step`, applied once
+when the `Simulation` is constructed, and `restart_loop!` leaves `Δt` alone so a repetition keeps the
+step the previous one converged on rather than re-ramping from one second.
+"""
+function attach_time_stepping!(simulation, config::AdaptiveTimeStep)
+    conjure_time_step_wizard!(
+        simulation;
+        cfl = config.cfl,
+        max_Δt = config.max_time_step,
+        max_change = config.max_time_step_change,
+        cell_advection_timescale = cell_advection_timescale_coupled_model,
     )
 
     return simulation
@@ -639,9 +921,9 @@ Every input comes from the setup's own prepared files — `bathymetry_path`, the
 it, rather than as a read error from deep inside NetCDF.
 
 The initial conditions go through `resolve_initial_conditions`, so a `FromForcing` or `FromResults`
-is read here — where the grid and the forcing path are known — and what
-`coupled_hydrostatic_simulation` receives is always a plain `NamedTuple`. Note that `pickup`
-supersedes them: the checkpoint restores the state that `set!` had just written.
+is read here — where the grid and the forcing path are known — and what `coupled_simulation`
+receives is always a plain `NamedTuple`. Note that `pickup` supersedes them: the checkpoint restores
+the state that `set!` had just written.
 
 Returns `nothing` for a setup naming no simulation config.
 """
@@ -663,12 +945,7 @@ function build_simulation(config::FjordConfig)
 
     simulation_config.loops >= 1 ||
         throw(ArgumentError("loops must be at least 1, got $(simulation_config.loops)"))
-    simulation_config.checkpoint_interval >= 0 || throw(
-        ArgumentError(
-            "checkpoint_interval must not be negative, got " *
-            "$(simulation_config.checkpoint_interval)",
-        ),
-    )
+    validate_writers(simulation_config)
 
     start_date = simulation_config.start_date
     stop_time = simulation_config.stop_time
@@ -691,27 +968,29 @@ function build_simulation(config::FjordConfig)
 
     architecture = simulation_architecture(simulation_config)
     grid = ImmersedBoundaryGrid(bathymetry_file, architecture, config.grid_config.halo)
+    tracers = model_tracers(simulation_config.model)
+
+    # The one place a results directory is created. `coupled_simulation` is about assembling a
+    # model, and `NetCDFWriter` only creates the `dir` keyword it is not given.
+    mkpath(simulation_config.results_root)
 
     # Every time axis is zeroed at the same instant, so the components stay in phase: each
     # prepared file has its own first record, and left to itself each reader would zero there.
     forcing = forcing_from_file(;
         grid = grid,
         filepath = forcing_file,
-        tracers = simulation_config.tracers,
+        tracers = tracers,
         reference_date = start_date,
     )
-    boundary_conditions = map(
-        x -> FieldBoundaryConditions(; x...),
-        recursive_merge(
-            recursive_merge(
-                top_bottom_boundary_conditions(;
-                    grid = grid,
-                    bottom_drag_coefficient = simulation_config.bottom_drag_coefficient,
-                ),
-                open_boundary_conditions(Val(config.forcing_config.relaxation_edge)),
-            ),
-            lateral_tracer_open_boundary_conditions(grid, forcing, config.forcing_config, simulation_config.tracers),
-        ),
+    # Named `model_boundary_conditions` rather than `boundary_conditions`, which is the hook each
+    # piece of it was built by: assigning to that name here would make it a local and shadow the
+    # function for the rest of this body.
+    model_boundary_conditions = field_boundary_conditions(
+        simulation_config.boundary_conditions,
+        grid,
+        forcing,
+        config.forcing_config,
+        tracers,
     )
 
     initial_conditions = resolve_initial_conditions(
@@ -721,24 +1000,24 @@ function build_simulation(config::FjordConfig)
         simulation_config,
     )
 
-    simulation = coupled_hydrostatic_simulation(
-        grid,
-        simulation_config.buoyancy,
-        simulation_config.closure,
-        simulation_config.tracer_advection,
-        simulation_config.momentum_advection,
-        simulation_config.tracers,
-        initial_conditions,
-        SplitExplicitFreeSurface(grid, cfl = simulation_config.free_surface_cfl),
-        simulation_config.coriolis,
-        forcing,
-        boundary_conditions,
-        prescribed_atmosphere(config.atmosphere_config, architecture; reference_date = start_date),
-        prescribed_radiation(config.atmosphere_config, architecture; reference_date = start_date),
-        simulation_config.sea_ice,
-        simulation_config.biogeochemistry;
-        results_dir = simulation_config.results_root,
-        stop_time,
+    simulation = coupled_simulation(
+        simulation_config.model,
+        grid;
+        forcing = forcing,
+        boundary_conditions = model_boundary_conditions,
+        initial_conditions = initial_conditions,
+        atmosphere = prescribed_atmosphere(
+            config.atmosphere_config,
+            architecture;
+            reference_date = start_date,
+        ),
+        radiation = prescribed_radiation(
+            config.atmosphere_config,
+            architecture;
+            reference_date = start_date,
+        ),
+        stop_time = stop_time,
+        initial_time_step = initial_time_step(simulation_config.time_stepping),
     )
 
     simulation.callbacks[:progress] =
@@ -749,18 +1028,43 @@ function build_simulation(config::FjordConfig)
     start_loop = resume_loop(simulation_config)
     attach_writers!(simulation, simulation_config, start_loop)
 
-    @info "Run $(run_tag(simulation_config)): snapshots to " *
-          "$(loop_output_path(simulation_config, start_loop))"
+    @info "Run $(run_tag(simulation_config)): output to " *
+          "$(join(loop_output_paths(simulation_config, start_loop), ", "))"
 
-    conjure_time_step_wizard!(
-        simulation;
-        cfl = simulation_config.time_step_cfl,
-        max_Δt = simulation_config.max_time_step,
-        max_change = simulation_config.max_time_step_change,
-        cell_advection_timescale = cell_advection_timescale_coupled_model,
-    )
+    attach_time_stepping!(simulation, simulation_config.time_stepping)
 
     return simulation
+end
+
+"""
+    validate_writers(config)
+
+Reject a writers tuple the simulation cannot honour, before anything is read or allocated.
+
+Two failure modes, both silent otherwise. More than one checkpointing writer: `run!(…; pickup)`
+requires exactly one to resume from, and `checkpoint_at_end` with several writes its file behind a
+`@warn`. And two writers under the same key: the second simply replaces the first in the
+`output_writers` dictionary, so one of the files the setup asked for is never written.
+"""
+function validate_writers(config::AbstractSimulationConfig)
+    checkpointing = count(checkpoints, config.writers)
+    checkpointing <= 1 || throw(
+        ArgumentError(
+            "A simulation may name at most one checkpointing writer, got $checkpointing. " *
+            "`run!` cannot tell which of several to resume from.",
+        ),
+    )
+
+    # Not named `keys`: a local of that name shadows `Base.keys` for the rest of the body.
+    names = [name for writer in config.writers for name in writer_keys(writer)]
+    allunique(names) || throw(
+        ArgumentError(
+            "Writer names must be unique, got $(join(names, ", ")). Two writers under one name " *
+            "replace each other and only the last one writes.",
+        ),
+    )
+
+    return nothing
 end
 
 """
@@ -801,78 +1105,78 @@ function run_simulation(config::FjordConfig)
     for loop = start_loop:simulation_config.loops
         loop > start_loop && restart_loop!(simulation, simulation_config, loop)
 
-        output_file = loop_output_path(simulation_config, loop)
-        push!(output_files, output_file)
-        @info "Loop $loop of $(simulation_config.loops): snapshots to $output_file"
+        loop_files = loop_output_paths(simulation_config, loop)
+        append!(output_files, loop_files)
+        @info "Loop $loop of $(simulation_config.loops): output to $(join(loop_files, ", "))"
 
         # `pickup` applies to the loop we resume into and to no other: the loops after it start from
         # a reset clock, and picking up there would send them back to the checkpoint every time.
         run!(
             simulation;
             pickup = simulation_config.pickup && loop == start_loop,
-            checkpoint_at_end = simulation_config.checkpoint_interval > 0,
+            checkpoint_at_end = checkpoints(simulation_config),
         )
 
         @info "Loop $loop reached $(prettytime(simulation.model.clock.time)) of model time"
     end
 
-    @info "Snapshots saved to $(join(output_files, ", "))"
+    # A setup may legitimately name no writer at all, in which case there is nothing to report.
+    isempty(output_files) || @info "Output saved to $(join(output_files, ", "))"
 
     return (; simulation, output_files)
 end
 
 """
-    coupled_hydrostatic_simulation(grid, buoyancy, closure, ...)
+    coupled_simulation(model, grid; forcing, boundary_conditions, initial_conditions,
+                       atmosphere, radiation, stop_time, initial_time_step)
 
-Assemble a `HydrostaticFreeSurfaceModel` inside a NumericalEarth `OceanSeaIceModel` and return the
-coupled `Simulation`.
+Assemble the coupled `Simulation` a model config describes, on `grid`, and return it without
+running it.
 
-The low-level entry point, taking every component already built: `build_simulation` is the one
-that takes a `FjordConfig` and derives them.
+The low-level entry point, dispatched on the model config and taking every grid-dependent component
+already built — `build_simulation` is what takes a `FjordConfig` and derives them. Adding a
+different kind of model is a new `AbstractCoupledSimulationConfig` subtype and a new method here;
+neither `build_simulation` nor anything above it changes.
+
+The method below builds a `HydrostaticFreeSurfaceModel` inside a NumericalEarth `OceanSeaIceModel`.
+The free surface is built here rather than passed in because `SplitExplicitFreeSurface` needs the
+grid, which is exactly what this function is given and the config is not.
 """
-function coupled_hydrostatic_simulation(
-    grid,
-    buoyancy,
-    closure,
-    tracer_advection,
-    momentum_advection,
-    tracers,
-    initial_conditions,
-    free_surface,
-    coriolis,
+function coupled_simulation(
+    model::CoupledHydrostaticSimulation,
+    grid;
     forcing,
     boundary_conditions,
+    initial_conditions,
     atmosphere,
-    downwelling_radiation,
-    sea_ice,
-    biogeochemistry;
-    results_dir = joinpath(homedir(), "FjordSim_results"),
-    stop_time = 365days,
+    radiation,
+    stop_time,
+    initial_time_step,
 )
-    isdir(results_dir) || mkpath(results_dir)
-
-    println("Start compiling HydrostaticFreeSurfaceModel")
+    @info "Compiling HydrostaticFreeSurfaceModel"
     ocean_model = HydrostaticFreeSurfaceModel(
         grid;
-        buoyancy,
-        closure,
-        tracer_advection,
-        momentum_advection,
-        tracers,
-        free_surface,
-        coriolis,
-        forcing,
-        boundary_conditions,
-        biogeochemistry,
+        buoyancy = model.buoyancy,
+        closure = model.closure,
+        tracer_advection = model.tracer_advection,
+        momentum_advection = model.momentum_advection,
+        tracers = model.tracers,
+        free_surface = SplitExplicitFreeSurface(grid, cfl = model.free_surface_cfl),
+        coriolis = model.coriolis,
+        forcing = forcing,
+        boundary_conditions = boundary_conditions,
+        biogeochemistry = model.biogeochemistry,
     )
-    println("Done compiling HydrostaticFreeSurfaceModel")
+    @info "Compiled HydrostaticFreeSurfaceModel"
+
     set!(ocean_model; initial_conditions...)
-    Δt = 1second
+
+    Δt = initial_time_step
     ocean_sim = Simulation(ocean_model; Δt, stop_time)
-    coupled_model = OceanSeaIceModel(ocean_sim, sea_ice; atmosphere, radiation = downwelling_radiation)
-    println("Initialized coupled model")
-    coupled_simulation = Simulation(coupled_model; Δt, stop_time)
-    return coupled_simulation
-end  # function coupled_hydrostatic_simulation
+    coupled_model = OceanSeaIceModel(ocean_sim, model.sea_ice; atmosphere, radiation)
+    @info "Initialized coupled model"
+
+    return Simulation(coupled_model; Δt, stop_time)
+end
 
 end  # module Simulations

@@ -10,7 +10,7 @@ using Oceananigans:
     WENO,
     WENOVectorInvariant
 using Oceananigans.TurbulenceClosures: HorizontalScalarBiharmonicDiffusivity
-using Oceananigans.Units: days, hour, minutes
+using Oceananigans.Units: days, hour, minutes, second
 using Dates: DateTime
 using SeawaterPolynomials.TEOS10: TEOS10EquationOfState
 using NumericalEarth: FreezingLimitedOceanTemperature
@@ -20,7 +20,15 @@ using ..Grids: EvenGrid
 using ..Bathymetry: DybdedataConfig
 using ..Atmospheres: NORA3Config
 using ..Forcing: NorKystConfig, OF800RiversConfig
-using ..Simulations: SimulationConfig, FromForcing, FromResults
+using ..BoundaryConditions: TopBottomFluxes, OpenLateralBoundary
+using ..Simulations:
+    SimulationConfig,
+    CoupledHydrostaticSimulation,
+    SnapshotWriter,
+    CheckpointWriter,
+    AdaptiveTimeStep,
+    FromForcing,
+    FromResults
 
 include("oslofjorden.jl")
 include("drammensfjorden.jl")

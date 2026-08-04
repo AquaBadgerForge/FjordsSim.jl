@@ -176,7 +176,7 @@ download_atmosphere(target_grid, ::Nothing) = nothing
     prescribed_radiation(config, architecture; reference_date = nothing)
 
 Read the prepared atmosphere file back at simulation time, as the NumericalEarth
-`PrescribedAtmosphere` and `PrescribedRadiation` that `coupled_hydrostatic_simulation` consumes.
+`PrescribedAtmosphere` and `PrescribedRadiation` that `coupled_simulation` consumes.
 
 These are the only atmosphere hooks the simulation side needs, and they are what keeps
 `FjordSim.Simulations` from naming a dataset: which reader, which file and which backend are all

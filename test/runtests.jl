@@ -55,7 +55,10 @@ include("utilities.jl")
             :RiverLocation,
             :geodatabase_path,
             :top_bottom_boundary_conditions,
-            :coupled_hydrostatic_simulation,
+            :field_boundary_conditions,
+            :TopBottomFluxes,
+            :OpenLateralBoundary,
+            :coupled_simulation,
             :recursive_merge,
             :progress,
             :cell_advection_timescale_coupled_model,
@@ -81,6 +84,18 @@ include("utilities.jl")
             :drammensfjorden,
             # simulation
             :SimulationConfig,
+            :AbstractCoupledSimulationConfig,
+            :AbstractBoundaryConditionConfig,
+            :AbstractWriterConfig,
+            :AbstractTimeSteppingConfig,
+            :CoupledHydrostaticSimulation,
+            :SnapshotWriter,
+            :CheckpointWriter,
+            :AdaptiveTimeStep,
+            :model_tracers,
+            :attach_writer!,
+            :attach_time_stepping!,
+            :initial_time_step,
             :build_simulation,
             :run_simulation,
             :simulation_architecture,
@@ -108,7 +123,12 @@ include("utilities.jl")
             (:Simulations, :run_simulation),
             # Moved out of FjordSim.jl into Simulations; still re-exported, so the entry above in
             # `exported_symbols` and this one together pin both halves of that move.
-            (:Simulations, :coupled_hydrostatic_simulation),
+            (:Simulations, :coupled_simulation),
+            # Reachable through its module but deliberately *not* re-exported from FjordSim:
+            # `Oceananigans.Fields.boundary_conditions` exists, so a script doing
+            # `using FjordSim, Oceananigans.Fields` would be ambiguous. An out-of-tree config
+            # extends it as `FjordSim.BoundaryConditions.boundary_conditions`.
+            (:BoundaryConditions, :boundary_conditions),
             (:CLI, :parse_arguments),
         ]
 
@@ -118,7 +138,9 @@ include("utilities.jl")
         end
 
         @test isdefined(FjordSim, :Bathymetry)   # the one module no export above reaches through
-        @test parentmodule(coupled_hydrostatic_simulation) === FjordSim.Simulations
+        @test parentmodule(coupled_simulation) === FjordSim.Simulations
+        # The hook is reachable but not re-exported, for the reason above.
+        @test :boundary_conditions ∉ names(FjordSim)
     end
 
     @testset "boundary condition signatures" begin
@@ -211,6 +233,56 @@ include("utilities.jl")
             @test_throws ErrorException lateral_tracer_open_boundary_conditions(
                 grid, forcing, forcing_config, (:T, :not_prepared),
             )
+        end
+    end
+
+    @testset "boundary condition configs" begin
+        boundary_conditions = FjordSim.BoundaryConditions.boundary_conditions
+
+        mktempdir() do tmp
+            (; grid) = immersed_test_grid(joinpath(tmp, "bathymetry.nc"); size = (2, 3, 2))
+            forcing_config = test_forcing_config(data_root = tmp, relaxation_edge = :south)
+            write_prepared_forcing(forcing_path(forcing_config); size = (2, 3, 2))
+            forcing = forcing_from_file(forcing_config; grid, tracers = (:T, :S))
+
+            # `TopBottomFluxes` is the config face of `top_bottom_boundary_conditions`, so it must
+            # contribute exactly what that function returns.
+            fluxes = boundary_conditions(
+                TopBottomFluxes(bottom_drag_coefficient = 0.003),
+                grid, forcing, forcing_config, (:T, :S),
+            )
+            @test Set(keys(fluxes)) == Set((:u, :v, :T, :S))
+            @test keys(fluxes.u) == (:top, :bottom)
+            @test keys(fluxes.T) == (:top,)
+
+            # `OpenLateralBoundary` merges the normal-velocity wall with the tracer open boundaries
+            # in one contribution. That merge is what left `build_simulation`, and nothing but a
+            # full model build would otherwise exercise it.
+            open = boundary_conditions(
+                OpenLateralBoundary(), grid, forcing, forcing_config, (:T, :S),
+            )
+            @test Set(keys(open)) == Set((:v, :T, :S))
+            @test keys(open.v) == (:south,)
+            @test keys(open.T) == (:south,)
+
+            # The tuple materializer merges both into `FieldBoundaryConditions`, which is what a
+            # `HydrostaticFreeSurfaceModel` consumes. `v` gets its top, bottom *and* south, so the
+            # merge is a merge rather than a last-wins overwrite of whole variables.
+            materialized = field_boundary_conditions(
+                (TopBottomFluxes(bottom_drag_coefficient = 0.003), OpenLateralBoundary()),
+                grid, forcing, forcing_config, (:T, :S),
+            )
+            @test materialized.v isa FieldBoundaryConditions
+            @test !isnothing(materialized.v.top)
+            @test !isnothing(materialized.v.bottom)
+            @test materialized.v.south isa
+                  BoundaryCondition{<:Oceananigans.BoundaryConditions.NormalFlow}
+            @test materialized.T.south.classification.scheme isa
+                  Oceananigans.BoundaryConditions.PerturbationAdvection
+
+            # An empty tuple is a valid statement — the model's own defaults everywhere — rather
+            # than an error, so a setup can opt out of every piece.
+            @test field_boundary_conditions((), grid, forcing, forcing_config, (:T, :S)) == (;)
         end
     end
 
@@ -466,12 +538,7 @@ end
                 0.05,
                 0.1,
             ),
-            simulation_config = MinimalSimulation(
-                data_root,
-                "column_snapshots.nc",
-                DateTime(2021, 3, 4, 5),
-                7200.0,
-            ),
+            simulation_config = MinimalSimulation(data_root, DateTime(2021, 3, 4, 5), 7200.0),
         )
         rivers = MinimalRivers(data_root, "column_rivers.nc", 3600.0, 10)
 
@@ -512,14 +579,20 @@ end
         @test atmosphere_directory(config.atmosphere_config) == joinpath(data_root, "column_source")
         @test plot_path(config.atmosphere_config) == joinpath(data_root, "column_atmosphere.png")
         # The simulation config resolves against `results_root`, being the one config that writes, and
-        # inherits the run tag, the loop-indexed variant and the coverage window for free.
+        # inherits the run tag, the loop-indexed variant and the coverage window for free. The
+        # *filename* is the writer's, so this also proves a built-in writer type composes with a
+        # foreign simulation config.
         @test run_tag(config.simulation_config) == FjordSim.Configs.LAUNCH_TAG[]
+        column_writer = test_snapshot_writer(output_file = "column_snapshots.nc")
         with_run_tag() do
-            @test results_path(config.simulation_config) ==
+            @test results_path(column_writer, config.simulation_config) ==
                   joinpath(data_root, "column_snapshots_$PINNED_RUN_TAG.nc")
-            @test results_path(config.simulation_config, 12) ==
+            @test results_path(column_writer, config.simulation_config, 12) ==
                   joinpath(data_root, "column_snapshots_$(PINNED_RUN_TAG)_loop12.nc")
         end
+        # A writer that names no output file says so, rather than failing with `has no field
+        # output_file` from inside `tagged_path`.
+        @test_throws ArgumentError results_path(test_checkpoint_writer(), config.simulation_config)
         @test coverage_window(config.simulation_config) ==
               (DateTime(2021, 3, 4, 5), DateTime(2021, 3, 4, 7))
 
@@ -554,6 +627,30 @@ end
         # file but cannot be simulated says which methods it still owes.
         @test_throws MethodError prescribed_atmosphere(config.atmosphere_config, CPU())
         @test_throws MethodError prescribed_radiation(config.atmosphere_config, CPU())
+
+        # The four supertypes `SimulationConfig` nests own one hook contract each, and each is
+        # missing the same discoverable way.
+        @test MinimalModel() isa AbstractCoupledSimulationConfig
+        @test MinimalBoundary() isa AbstractBoundaryConditionConfig
+        @test MinimalWriter() isa AbstractWriterConfig
+        @test MinimalTimeStepping() isa AbstractTimeSteppingConfig
+
+        @test_throws MethodError model_tracers(MinimalModel())
+        @test_throws MethodError coupled_simulation(MinimalModel(), grid)
+        @test_throws MethodError FjordSim.BoundaryConditions.boundary_conditions(
+            MinimalBoundary(), grid, (;), config.forcing_config, (:T,),
+        )
+        @test_throws MethodError attach_writer!(
+            nothing, MinimalWriter(), config.simulation_config, 1,
+        )
+        @test_throws MethodError attach_time_stepping!(nothing, MinimalTimeStepping())
+        @test_throws MethodError initial_time_step(MinimalTimeStepping())
+
+        # Both writer traits default, so a new writer type only overloads the one that is not true
+        # of it — a plain writer neither checkpoints nor names a reported file.
+        @test !FjordSim.Simulations.checkpoints(MinimalWriter())
+        @test FjordSim.Simulations.output_path_trait(MinimalWriter()) isa
+              FjordSim.Simulations.NamesNoOutputFile
 
         # A forcing config carrying no rivers skips the step rather than needing a river dataset.
         @test isnothing(add_rivers(grid, config.forcing_config))
@@ -2010,8 +2107,11 @@ end
 
 @testset "Simulations" begin
     @testset "config" begin
-        open_boundary_conditions = FjordSim.Simulations.open_boundary_conditions
+        open_boundary_conditions = FjordSim.BoundaryConditions.open_boundary_conditions
         simulation_forcing_path = FjordSim.Simulations.simulation_forcing_path
+        checkpoints = FjordSim.Simulations.checkpoints
+        loop_output_paths = FjordSim.Simulations.loop_output_paths
+        validate_writers = FjordSim.Simulations.validate_writers
 
         # No field has a default, so omitting any is an UndefKeywordError rather than a
         # plausible-looking run. Every field is swept, not a hand-picked subset, so adding one to
@@ -2023,24 +2123,57 @@ end
         end
         @test_throws UndefKeywordError SimulationConfig()
 
+        # The same rule holds one level down, and that is where it now matters most: the model config
+        # is where the scientific choices live, so a default there would be one fjord's physics
+        # silently applied to another's.
+        model_fields = test_model_fields()
+        @test Set(keys(model_fields)) == Set(fieldnames(CoupledHydrostaticSimulation))
+        for name in fieldnames(CoupledHydrostaticSimulation)
+            @test_throws UndefKeywordError CoupledHydrostaticSimulation(;
+                delete!(copy(model_fields), name)...
+            )
+        end
+
         # `Base.@kwdef` on a *parametric* struct dispatches on the declared field types instead of
-        # converting, unlike the non-parametric configs elsewhere. So a duration written as an integer is
-        # a MethodError, not a silent promotion — which is why every setup writes durations with
-        # `Oceananigans.Units` constants, all of which are already Float64.
+        # converting. So a duration written as an integer is a MethodError, not a silent promotion —
+        # which is why every setup writes `SimulationConfig`'s durations with `Oceananigans.Units`
+        # constants, all of which are already Float64.
         @test_throws MethodError test_simulation_config(stop_time = 3600)
-        @test_throws MethodError test_simulation_config(checkpoint_interval = 0)
         @test test_simulation_config(stop_time = 1hour).stop_time === 3600.0
         # `loops` is the one field this does not apply to, being an Int already.
         @test test_simulation_config(loops = 2).loops === 2
+        # The nested configs are the other exception, and deliberately so: each has a hand-written
+        # keyword constructor that converts, so the rule a reader learns from `SimulationConfig` does
+        # not silently mislead them about the four types they will write far more often.
+        @test test_checkpoint_writer(interval = 3600).interval === 3600.0
+        @test test_snapshot_writer(interval = 3600).interval === 3600.0
+        @test test_time_stepping(cfl = 1//10).cfl === 0.1
+
+        # A writer with no schedule, or with nothing to write, is rejected at construction — that is
+        # a struct invariant, not something `build_simulation` should be discovering.
+        @test_throws ArgumentError test_snapshot_writer(interval = 0.0)
+        @test_throws ArgumentError test_snapshot_writer(variables = ())
+        @test_throws ArgumentError test_checkpoint_writer(interval = 0.0)
 
         config = test_simulation_config()
         @test config isa AbstractSimulationConfig
         # Every field is concrete or parameterized — `isconcretetype(typeof(config))` would be vacuous,
         # since `typeof` never returns an abstract type.
         @test all(isconcretetype, fieldtypes(typeof(config)))
-        # One parameter per prebuilt Oceananigans component. A tenth is the signal to collapse them
-        # into a single `NamedTuple` field instead of adding another.
-        @test length(typeof(config).parameters) == 9
+        @test all(isconcretetype, fieldtypes(typeof(test_snapshot_writer())))
+        @test all(isconcretetype, fieldtypes(CheckpointWriter))
+        @test all(isconcretetype, fieldtypes(AdaptiveTimeStep))
+        # Five structural parameters, one per nested config. They do not grow: a new kind of nested
+        # config is a new subtype of an existing supertype, not a new field.
+        @test length(typeof(config).parameters) == 5
+        # One parameter per prebuilt Oceananigans component, and *this* is the count under pressure.
+        # A ninth is the signal to collapse them into a single `NamedTuple` field instead of adding
+        # another.
+        @test length(typeof(test_model_config()).parameters) == 8
+
+        # The tracer list reaches `build_simulation` through a hook rather than a field read, so a
+        # model config that names its tracers differently still composes.
+        @test model_tracers(test_model_config()) == (:T, :S)
 
         # The device is a Symbol, not a live CPU()/GPU(), so a setup file loads without a GPU.
         @test fieldtype(typeof(config), :architecture) === Symbol
@@ -2054,22 +2187,51 @@ end
               FjordSim.Configs.LAUNCH_TAG[]
 
         # The tag is inserted before the extension either way, and the loop index goes on top of it so a
-        # looped run gives each repetition its own file.
+        # looped run gives each repetition its own file. The filename is the writer's; only the root
+        # is the simulation config's.
+        writer = test_snapshot_writer()
         with_run_tag() do
-            @test results_path(config) ==
+            @test results_path(writer, config) ==
                   joinpath(TEST_RESULTS_ROOT, "snapshots_test_$PINNED_RUN_TAG.nc")
-            @test results_path(config, 7) ==
+            @test results_path(writer, config, 7) ==
                   joinpath(TEST_RESULTS_ROOT, "snapshots_test_$(PINNED_RUN_TAG)_loop07.nc")
 
             # An absolute path relocates just that file.
-            relocated = test_simulation_config(output_file = "/elsewhere/run.nc")
-            @test results_path(relocated) == "/elsewhere/run_$PINNED_RUN_TAG.nc"
+            relocated = test_snapshot_writer(output_file = "/elsewhere/run.nc")
+            @test results_path(relocated, config) == "/elsewhere/run_$PINNED_RUN_TAG.nc"
         end
 
         # A single run keeps the shorter name; only a looped one gains the index.
-        @test FjordSim.Simulations.loop_output_path(config, 1) == results_path(config)
+        @test FjordSim.Simulations.loop_output_path(writer, config, 1) ==
+              results_path(writer, config)
         looped = test_simulation_config(loops = 3)
-        @test FjordSim.Simulations.loop_output_path(looped, 1) == results_path(looped, 1)
+        @test FjordSim.Simulations.loop_output_path(writer, looped, 1) ==
+              results_path(writer, looped, 1)
+
+        # Which writers checkpoint, and which name a file the run should report, are traits rather
+        # than `isa` tests — so a setup naming no `CheckpointWriter` writes none, and the reported
+        # list is the snapshots alone even though the checkpointer also writes files.
+        @test !checkpoints(test_snapshot_writer())
+        @test checkpoints(test_checkpoint_writer())
+        @test checkpoints(config)
+        snapshots_only = test_simulation_config(writers = (test_snapshot_writer(),))
+        @test !checkpoints(snapshots_only)
+        @test !checkpoints(test_simulation_config(writers = ()))
+        with_run_tag() do
+            @test loop_output_paths(config, 1) == [results_path(writer, config)]
+            @test loop_output_paths(test_simulation_config(writers = ()), 1) == String[]
+        end
+
+        # Two checkpointing writers, or two writers under one name, are rejected before anything is
+        # read: `run!` cannot tell which checkpoint to resume from, and the second writer under a
+        # name silently replaces the first so one of the requested files is never written.
+        @test isnothing(validate_writers(config))
+        @test_throws ArgumentError validate_writers(test_simulation_config(
+            writers = (test_checkpoint_writer(), test_checkpoint_writer()),
+        ))
+        @test_throws ArgumentError validate_writers(test_simulation_config(
+            writers = (test_snapshot_writer(), test_snapshot_writer(output_file = "other.nc")),
+        ))
 
         # The window every loop replays, which is what the prepare steps pad their axes to. It does not
         # grow with `loops`, since each repetition replays the same interval.
@@ -2419,6 +2581,13 @@ end
             with_run_tag() do
                 @test resume_loop(resuming(start_date = DateTime(2021, 5, 6, 7))) == 3
             end
+
+            # `pickup` with no checkpointing writer is a config contradicting itself — nothing this
+            # run writes could ever be resumed from — so it is rejected rather than left to fail
+            # inside `run!`. Only expressible now that checkpointing is a writer, not a threshold.
+            @test_throws ArgumentError resume_loop(
+                resuming(writers = (test_snapshot_writer(),)),
+            )
         end
     end
 
@@ -2444,9 +2613,10 @@ end
             # `atmosphere_config` stays unnamed, so both prescribed_atmosphere hooks yield nothing and the
             # coupled model runs ocean-only — which is what keeps this off the network and off a GPU.
             #
-            # Every build below varies only Float64/Int/Bool fields, so all four share one
-            # `SimulationConfig` instantiation and one `build_simulation` specialization. Overriding any
-            # of the nine parametric fields here would recompile the whole coupled model.
+            # Every build below varies only String/Float64/Int/Bool fields, so all of them share one
+            # `SimulationConfig` instantiation and one `build_simulation` specialization. Overriding
+            # any of the five nested-config fields here — `writers` above all — would change the
+            # config's type and recompile the whole coupled model.
             fjord(; kwargs...) = FjordConfig(;
                 grid_config,
                 bathymetry_config,
@@ -2456,6 +2626,7 @@ end
 
             config = fjord()
             simulation_config = config.simulation_config
+            snapshot, checkpointer = simulation_config.writers
             @test isnothing(config.atmosphere_config)
             @test isnothing(config.forcing_config.rivers)
 
@@ -2496,12 +2667,25 @@ end
                       Oceananigans.BoundaryConditions.PerturbationAdvection
             end
 
-            # The snapshot writer records `start_date`, which is the only thing that lets a later
-            # `FromResults(path, date)` turn a date into a record — a snapshot's own time axis is
-            # seconds from model zero and says nothing about the calendar.
-            ocean_writer = simulation.model.ocean.output_writers[:ocean]
-            @test ocean_writer.filepath == results_path(simulation_config)
+            # The snapshot writer lands under its own name, writes exactly the variables the config
+            # asked for — the check that closes the gap between "the writer is attached" and
+            # "`snapshot_outputs` resolved those Symbols to the right model fields" — and records
+            # `start_date`, which is the only thing that lets a later `FromResults(path, date)` turn
+            # a date into a record, a snapshot's own time axis being seconds from model zero.
+            #
+            # As a `Set` of `Symbol`, because `NetCDFWriter` re-keys the `NamedTuple` it is given
+            # into a `Dict{String}`: neither the order nor the key type survives.
+            ocean_writer = simulation.model.ocean.output_writers[snapshot.name]
+            @test ocean_writer.filepath == results_path(snapshot, simulation_config)
+            @test Set(Symbol.(keys(ocean_writer.outputs))) == Set(snapshot.variables)
             @test ocean_writer.global_attributes["start_date"] == string(simulation_config.start_date)
+
+            # A variable the model does not have is an error naming it, not a silently dropped
+            # column discovered a run later.
+            @test_throws ArgumentError FjordSim.Simulations.snapshot_outputs(
+                test_snapshot_writer(variables = (:T, :not_a_field)),
+                ocean_model,
+            )
 
             # The checkpointer goes on the *coupled* simulation: `prognostic_state` of the coupled model
             # is what a resumable state is, and `run!(…; pickup)` looks for it there. Exactly one, which
@@ -2514,19 +2698,31 @@ end
                 values(simulation.model.ocean.output_writers),
             )
 
-            # A zero interval attaches none at all, rather than one that never fires.
-            @test !any(
-                writer -> writer isa Checkpointer,
-                values(build_simulation(fjord(checkpoint_interval = 0.0)).output_writers),
+            # Naming no `CheckpointWriter` attaches none at all. Asserted on the config rather than
+            # by building a second simulation: dropping the writer changes `SimulationConfig`'s type
+            # and would recompile the whole coupled model for one boolean.
+            @test !FjordSim.Simulations.checkpoints(
+                test_simulation_config(results_root = tmp, writers = (snapshot,)),
             )
+            # ...and `attach_writers!` over that tuple leaves the coupled simulation's writers alone,
+            # which is the behavioral half of the same claim, on the simulation already built.
+            empty!(simulation.output_writers)
+            FjordSim.Simulations.attach_writers!(
+                simulation,
+                test_simulation_config(results_root = tmp, writers = (snapshot,)),
+                1,
+            )
+            @test !any(writer -> writer isa Checkpointer, values(simulation.output_writers))
+            # Put the checkpointer back, since later assertions in this testset expect it.
+            attach_writer!(simulation, checkpointer, simulation_config, 1)
 
             # Looping does not widen what the prepared files must span, so a two-loop run of the same
             # window still builds; the loop index reaches the output filename.
             looped_config = fjord(loops = 2)
             looped = build_simulation(looped_config)
             @test looped.stop_time == looped_config.simulation_config.stop_time
-            @test looped.model.ocean.output_writers[:ocean].filepath ==
-                  results_path(looped_config.simulation_config, 1)
+            @test looped.model.ocean.output_writers[snapshot.name].filepath ==
+                  results_path(snapshot, looped_config.simulation_config, 1)
 
             # Restarting a loop over the real object graph: every clock goes back to zero, the ocean
             # state does not, the writer is replaced with the next loop's file, and the ocean
@@ -2545,8 +2741,8 @@ end
             @test looped.model.ocean.model.clock.time == 0
             @test looped.model.ocean.model.clock.iteration == 0
             @test !looped.model.ocean.initialized
-            @test looped.model.ocean.output_writers[:ocean].filepath ==
-                  results_path(looped_config.simulation_config, 2)
+            @test looped.model.ocean.output_writers[snapshot.name].filepath ==
+                  results_path(snapshot, looped_config.simulation_config, 2)
             # The state carried over — that is the whole point of resetting only the clocks.
             @test maximum(interior(looped.model.ocean.model.tracers.T)) ≈ 9.0
             # stop_time is untouched, so the next repetition runs the same window.
@@ -2554,6 +2750,15 @@ end
 
             # A loop count below one is rejected before anything is read or allocated.
             @test_throws ArgumentError build_simulation(fjord(loops = 0))
+
+            # Building into a `results_root` that does not exist yet creates it. Nothing else would:
+            # `NetCDFWriter` creates only the `dir` keyword it is not given, and a setup naming no
+            # `CheckpointWriter` has nothing else that mkpaths. The old model-assembly function
+            # did it; `coupled_simulation` is about assembling a model, so `build_simulation` does.
+            fresh_root = joinpath(tmp, "not_created_yet", "nested")
+            @test !isdir(fresh_root)
+            @test build_simulation(fjord(results_root = fresh_root)) isa Simulation
+            @test isdir(fresh_root)
         end
     end
 

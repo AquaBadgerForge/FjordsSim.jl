@@ -8,10 +8,12 @@ The river config gets the same `data_root` as the rest of the setup, so the rive
 alongside it rather than being shared from elsewhere.
 
 It also names a `simulation_config`, so `run_simulation` works once the preparation steps have
-run. `SimulationConfig` has no defaults, so every knob the simulation uses — buoyancy, closure,
-advection, tracers, coriolis, sea ice, the run length and the wizard settings — is stated here
-and nowhere else. Results go to `~/FjordSim_results/oslofjorden/`, separate from the input data
-root, named after `start_date` so runs do not overwrite each other.
+run. Nothing about the run has a default, so every knob is stated here and nowhere else — split
+across four nested configs by what dispatches on it: `CoupledHydrostaticSimulation` is what the
+model is, the `boundary_conditions` tuple is what bounds it, the `writers` tuple is what it writes,
+and `AdaptiveTimeStep` is how its clock advances. Results go to `~/FjordSim_results/oslofjorden/`,
+separate from the input data root, and each writer's file carries the launch tag so runs do not
+overwrite each other.
 
 `start_date` and `stop_time` also decide what the prepare steps write: they pad the forcing and
 atmosphere time axes to span exactly this window, so changing either means re-running
@@ -73,27 +75,53 @@ function oslofjorden()
             years            = [2020],
         ),
         simulation_config = SimulationConfig(
-            results_root            = joinpath(homedir(), "FjordSim_results", "oslofjorden"),
-            output_file             = "snapshots_ocean.nc",
-            architecture            = :auto,
-            buoyancy                = SeawaterBuoyancy(FT, equation_of_state = TEOS10EquationOfState(FT)),
-            closure                 = (
-                CATKEVerticalDiffusivity(minimum_tke = 7e-6),
-                HorizontalScalarBiharmonicDiffusivity(ν = 1e5, κ = 1e4),
+            results_root       = joinpath(homedir(), "FjordSim_results", "oslofjorden"),
+            architecture       = :auto,
+            model              = CoupledHydrostaticSimulation(
+                buoyancy           = SeawaterBuoyancy(FT, equation_of_state = TEOS10EquationOfState(FT)),
+                closure            = (
+                    CATKEVerticalDiffusivity(minimum_tke = 7e-6),
+                    HorizontalScalarBiharmonicDiffusivity(ν = 1e5, κ = 1e4),
+                ),
+                tracer_advection   = (T = WENO(), S = WENO()),
+                momentum_advection = WENOVectorInvariant(FT),
+                tracers            = (:T, :S),
+                coriolis           = HydrostaticSphericalCoriolis(FT),
+                sea_ice            = FreezingLimitedOceanTemperature(),
+                biogeochemistry    = nothing,
+                free_surface_cfl   = 0.7,
             ),
-            tracer_advection        = (T = WENO(), S = WENO()),
-            momentum_advection      = WENOVectorInvariant(FT),
-            tracers                 = (:T, :S),
-            # FromForcing(): the NorKyst state at `start_date` rather than a uniform water 
-            # column: every tracer named above plus u and v, whichever of them the forcing 
+            # Surface fluxes with quadratic bottom drag, plus the open southern edge — which edge
+            # and how fast come from the forcing config, so `OpenLateralBoundary` carries no
+            # fields. Dropping it would close the domain; the tuple order is merge precedence.
+            boundary_conditions = (
+                TopBottomFluxes(bottom_drag_coefficient = 0.003),
+                OpenLateralBoundary(),
+            ),
+            # What the run writes. `variables` may name anything `Oceananigans.fields` exposes on
+            # the ocean model — add `:w`, `:η` or a biogeochemical tracer by naming it here.
+            # Dropping the `CheckpointWriter` turns checkpointing off entirely.
+            writers = (
+                SnapshotWriter(
+                    name               = :ocean,
+                    output_file        = "snapshots_ocean.nc",
+                    variables          = (:T, :S, :u, :v),
+                    interval           = 1hour,
+                    overwrite_existing = true,
+                ),
+                CheckpointWriter(interval = 30days, overwrite_existing = true, cleanup = true),
+            ),
+            time_stepping = AdaptiveTimeStep(
+                initial_time_step    = 1second,
+                cfl                  = 0.1,
+                max_time_step        = 3minutes,
+                max_time_step_change = 1.01,
+            ),
+            # FromForcing(): the NorKyst state at `start_date` rather than a uniform water
+            # column: every tracer the model names plus u and v, whichever of them the forcing
             # file carries. A literal NamedTuple (`(T = 5.0, S = 33.0)`) still works, and
             # `FromResults("snapshots_ocean_<tag>.nc")` continues from a previous run instead.
-            initial_conditions      = (T = 5.0, S = 33.0),
-            coriolis                = HydrostaticSphericalCoriolis(FT),
-            sea_ice                 = FreezingLimitedOceanTemperature(),
-            biogeochemistry         = nothing,
-            free_surface_cfl        = 0.7,
-            bottom_drag_coefficient = 0.003,
+            initial_conditions = (T = 5.0, S = 33.0),
             # The whole calendar year 2020, which is a leap year — so 366 days from midnight on
             # 1 January lands exactly on midnight a year later. Neither prepared file has a record
             # at either end natively (NorKyst's are daily at 12:00, NORA3's hourly from 00:00 to
@@ -101,19 +129,13 @@ function oslofjorden()
             # the forcing and one hour at the end of the atmosphere, each within the one-record-
             # spacing bound. That is what lets the window be a round year instead of being pinned
             # to whichever instant the forcing happened to start at.
-            start_date              = DateTime(2020, 1, 1),
-            stop_time               = 366days,
+            start_date         = DateTime(2020, 1, 1),
+            stop_time          = 366days,
             # One pass. Raise it to spin the deep basins up on the same forcing year, carrying the
             # state over; each repetition writes its own `_loopNN` file.
-            loops                   = 1,
-            output_interval         = 1hour,
-            progress_interval       = 1hour,
-            overwrite_existing      = true,
-            checkpoint_interval     = 30days,
-            pickup                  = false,
-            time_step_cfl           = 0.1,
-            max_time_step           = 3minutes,
-            max_time_step_change    = 1.01,
+            loops              = 1,
+            progress_interval  = 1hour,
+            pickup             = false,
         ),
     )
 end

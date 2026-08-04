@@ -1,14 +1,24 @@
 module BoundaryConditions
 
-export top_bottom_boundary_conditions, lateral_tracer_open_boundary_conditions
+export top_bottom_boundary_conditions,
+    lateral_tracer_open_boundary_conditions,
+    boundary_conditions,
+    field_boundary_conditions,
+    TopBottomFluxes,
+    OpenLateralBoundary
 
 using Oceananigans
-using Oceananigans.BoundaryConditions: FluxBoundaryCondition, ValueBoundaryCondition, PerturbationAdvection
+using Oceananigans.BoundaryConditions:
+    FluxBoundaryCondition,
+    NormalFlowBoundaryCondition,
+    PerturbationAdvection,
+    ValueBoundaryCondition
 using Oceananigans.Units: Time
 using Oceananigans.Fields: ZeroField
 using NumericalEarth.Oceans: u_quadratic_bottom_drag, v_quadratic_bottom_drag, build_tracer_top_bc
-using ..Configs: AbstractForcingConfig
+using ..Configs: AbstractBoundaryConditionConfig, AbstractForcingConfig
 using ..Forcing: boundary_value_time_series
+using ..Utils: recursive_merge
 
 """ Return a named tuple with boundary conditions """
 function top_bottom_boundary_conditions(; grid, bottom_drag_coefficient)
@@ -76,8 +86,8 @@ relaxing towards `name`'s own exterior `FieldTimeSeries` — the same series the
 band (`relaxation_lambda`) already reads, reused via `boundary_value_time_series` rather than
 rebuilt.
 
-The velocity component normal to this edge is a closed wall (`Simulations.open_boundary_conditions`,
-unchanged), so the advecting velocity `PerturbationAdvection` reads at this boundary is always
+The velocity component normal to this edge is a closed wall (`open_boundary_conditions`), so the
+advecting velocity `PerturbationAdvection` reads at this boundary is always
 exactly zero, which its own convention classifies as outflow — `inflow_timescale` therefore never
 fires here. Both timescales are set to `config.relaxation_timescale` (the boundary-most, untapered
 rate from `relaxation_lambda`) rather than exposing a separate, partly-inert knob.
@@ -105,9 +115,8 @@ boundary column, the band acts across the interior `relaxation_cells`. Errors if
 prepare one of `tracer_names` — naming a relaxation edge implies the forcing should supply every
 simulated tracer there.
 
-Velocity is untouched — the edge stays the closed wall `Simulations.open_boundary_conditions`
-builds; see that function's docstring for why a genuinely open velocity boundary is not attempted
-here.
+Velocity is untouched — the edge stays the closed wall `open_boundary_conditions` builds; see that
+function's docstring for why a genuinely open velocity boundary is not attempted here.
 """
 function lateral_tracer_open_boundary_conditions(grid, forcing, config::AbstractForcingConfig, tracer_names)
     edge = config.relaxation_edge
@@ -128,6 +137,91 @@ function lateral_tracer_open_boundary_conditions(grid, forcing, config::Abstract
         name => (; Symbol(edge) => tracer_open_boundary_condition(boundary_function, boundary_index, forcing, name, config))
         for name in tracer_names
     )
+end
+
+"""
+    open_boundary_conditions(::Val{edge})
+
+The open boundary condition for the forcing config's `relaxation_edge`, as a nested named tuple
+`recursive_merge` can merge into the rest. The open component is the velocity normal to that edge.
+
+Derived rather than configured: the relaxation edge is by construction the edge the regional domain
+is open on, so a setup that named it twice could only ever disagree with itself.
+"""
+open_boundary_conditions(::Val{:south}) = (v = (south = NormalFlowBoundaryCondition(nothing),),)
+open_boundary_conditions(::Val{:north}) = (v = (north = NormalFlowBoundaryCondition(nothing),),)
+open_boundary_conditions(::Val{:west}) = (u = (west = NormalFlowBoundaryCondition(nothing),),)
+open_boundary_conditions(::Val{:east}) = (u = (east = NormalFlowBoundaryCondition(nothing),),)
+
+open_boundary_conditions(::Val{edge}) where {edge} = throw(
+    ArgumentError("relaxation_edge must be one of $LATERAL_EDGES, got :$edge"),
+)
+
+"""
+    TopBottomFluxes(; bottom_drag_coefficient)
+
+The air-sea flux surface and the drag bottom: the boundary-condition piece every setup wants.
+
+Contributes wind stress and heat/salt flux fields at the top and quadratic drag at the bottom, by
+way of `top_bottom_boundary_conditions` — see that function for why the tracer top conditions carry
+a `FreshwaterExchange` rather than being bare flux conditions.
+
+Only `T` and `S` get a top condition, and that is deliberate rather than an oversight: NumericalEarth
+assembles air-sea fluxes for heat and salt specifically, so a third tracer has no exchange to write
+into and no `build_tracer_top_bc` method to build one with. A biogeochemical tracer's surface
+condition belongs in its own `AbstractBoundaryConditionConfig`.
+"""
+Base.@kwdef struct TopBottomFluxes <: AbstractBoundaryConditionConfig
+    bottom_drag_coefficient::Float64
+end
+
+boundary_conditions(config::TopBottomFluxes, grid, forcing, forcing_config, tracers) =
+    top_bottom_boundary_conditions(;
+        grid = grid,
+        bottom_drag_coefficient = config.bottom_drag_coefficient,
+    )
+
+"""
+    OpenLateralBoundary()
+
+The domain's open edge: a closed wall on the velocity normal to the forcing config's
+`relaxation_edge`, plus a relaxing `ValueBoundaryCondition` on every simulated tracer there.
+
+Carries no fields, because everything it needs is already stated in the forcing config — which edge
+(`relaxation_edge`) and how fast (`relaxation_timescale`) — and a second copy could only disagree
+with the interior relaxation band that reads the same two. A setup with no open edge leaves this out
+of its `boundary_conditions` tuple.
+"""
+struct OpenLateralBoundary <: AbstractBoundaryConditionConfig end
+
+boundary_conditions(::OpenLateralBoundary, grid, forcing, forcing_config, tracers) =
+    recursive_merge(
+        open_boundary_conditions(Val(forcing_config.relaxation_edge)),
+        lateral_tracer_open_boundary_conditions(grid, forcing, forcing_config, tracers),
+    )
+
+"""
+    field_boundary_conditions(configs, grid, forcing, forcing_config, tracers)
+
+Every boundary-condition config's contribution, merged and materialized into the `NamedTuple` of
+`FieldBoundaryConditions` a `HydrostaticFreeSurfaceModel` consumes.
+
+A separate name from `boundary_conditions` on purpose: one function returning a nested named tuple
+for a config and a materialized one for a tuple of configs would be two shapes behind one name, and
+a caller binding a local named `boundary_conditions` would shadow the hook it is trying to call.
+
+Merging is last-wins, so the tuple's order is its precedence order. An empty tuple is a valid
+statement — a model with default boundary conditions everywhere — and yields `(;)`.
+"""
+function field_boundary_conditions(configs::Tuple, grid, forcing, forcing_config, tracers)
+    merged = mapreduce(
+        config -> boundary_conditions(config, grid, forcing, forcing_config, tracers),
+        recursive_merge,
+        configs;
+        init = (;),
+    )
+
+    return map(sides -> FieldBoundaryConditions(; sides...), merged)
 end
 
 end  # module BoundaryConditions

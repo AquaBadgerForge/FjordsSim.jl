@@ -1,8 +1,9 @@
 # End-to-end Oslofjord simulation.
 #
 # Everything this run needs is in the setup: the grid, the prepared bathymetry, forcing and
-# atmosphere files, and the `SimulationConfig` naming the closure, the run length and the
-# outputs. To change any of it, edit `src/Setups/oslofjorden.jl` rather than this file.
+# atmosphere files, and the `SimulationConfig` naming the run length and, through its four nested
+# configs, the model, its boundary conditions, its writers and its time stepping. To change any of
+# it, edit `src/Setups/oslofjorden.jl` rather than this file.
 #
 # The preparation steps have to have run first:
 #

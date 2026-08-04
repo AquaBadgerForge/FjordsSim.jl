@@ -92,8 +92,18 @@ function drammensfjorden()
         ),
         atmosphere_config = NORA3Config(data_root = data_root, years = [2020], ...),
         simulation_config = SimulationConfig(
-            buoyancy           = SeawaterBuoyancy(FT, equation_of_state = TEOS10EquationOfState(FT)),
-            closure            = (CATKEVerticalDiffusivity(minimum_tke = 7e-6), ...),
+            model = CoupledHydrostaticSimulation(
+                buoyancy = SeawaterBuoyancy(FT, equation_of_state = TEOS10EquationOfState(FT)),
+                closure  = (CATKEVerticalDiffusivity(minimum_tke = 7e-6), ...),
+                tracers  = (:T, :S),
+                ...
+            ),
+            boundary_conditions = (TopBottomFluxes(bottom_drag_coefficient = 0.003),
+                                   OpenLateralBoundary()),
+            writers = (SnapshotWriter(name = :ocean, output_file = "snapshots_ocean.nc",
+                                      variables = (:T, :S, :u, :v), interval = 1hour,
+                                      overwrite_existing = true),),
+            time_stepping = AdaptiveTimeStep(initial_time_step = 1second, cfl = 0.1, ...),
             initial_conditions = FromForcing(),   # the prepared forcing's own state at start_date
             start_date         = DateTime(2020, 1, 1),
             stop_time          = 30days,          # a short window, not a full year
@@ -272,10 +282,23 @@ run!(simulation)
 ### What the simulation is made of
 
 The buoyancy, closure, advection schemes, tracers, initial conditions, coriolis, sea ice, run length,
-output interval and time-step wizard settings are all the `SimulationConfig` in
-`src/Setups/oslofjorden.jl`. `SimulationConfig` has **no defaults at all**, so that one block is the
-whole story: every knob is stated there, and omitting one is an `UndefKeywordError` naming it rather
-than a silently inherited value.
+outputs and time-step wizard settings are all the `SimulationConfig` in `src/Setups/oslofjorden.jl`.
+Nothing about a run has a default, so that one block is the whole story: every knob is stated there,
+and omitting one is an `UndefKeywordError` naming it rather than a silently inherited value.
+
+It states them through four nested configs, split by what dispatches on what:
+
+| Field | Supertype | Built-in | Generic function |
+|---|---|---|---|
+| `model` | `AbstractCoupledSimulationConfig` | `CoupledHydrostaticSimulation` | `coupled_simulation` |
+| `boundary_conditions` (a tuple) | `AbstractBoundaryConditionConfig` | `TopBottomFluxes`, `OpenLateralBoundary` | `boundary_conditions` |
+| `writers` (a tuple) | `AbstractWriterConfig` | `SnapshotWriter`, `CheckpointWriter` | `attach_writer!` |
+| `time_stepping` | `AbstractTimeSteppingConfig` | `AdaptiveTimeStep` | `attach_time_stepping!` |
+
+So a different model, another boundary-condition piece or another kind of output is a new subtype
+and a new method, not an edit to `build_simulation`. A `SnapshotWriter`'s `variables` may name
+anything `Oceananigans.fields` exposes on the ocean model, so adding `:w`, `:η` or a biogeochemical
+tracer to a run's output is one Symbol.
 
 `initial_conditions` takes one of three shapes:
 
@@ -289,10 +312,11 @@ Adams-Bashforth tendencies are not carried over, so the first hours are an adjus
 exact restart — the two are complementary rather than alternatives.
 
 A run can also repeat its window several times with the ocean state carried over (`loops`, a spin-up
-for basins that do not equilibrate within one forcing year), and can write periodic checkpoints
-(`checkpoint_interval`) that a later run resumes from with `pickup = true`. Both built-in setups set
-`loops = 1`; `oslofjorden()` shows checkpointing turned on. Both fields are documented on
-`SimulationConfig` in `src/Simulations.jl`.
+for basins that do not equilibrate within one forcing year), and can write periodic checkpoints that
+a later run resumes from with `pickup = true` by naming a `CheckpointWriter` among its `writers` —
+a setup naming none writes no checkpoints, which is how checkpointing is turned off. Both built-in
+setups set `loops = 1`; `oslofjorden()` names a `CheckpointWriter` and `drammensfjorden()` does not.
+Both are documented on `SimulationConfig` in `src/Simulations.jl`.
 
 ### The run log
 
@@ -417,9 +441,14 @@ define a struct subtyping the matching supertype and add methods for it to that 
 | Rivers (`AbstractRiverConfig`) | `add_rivers(target_grid, config)` | `river_locations`, `river_series`, `download_rivers` | `src/Forcing/of800_rivers.jl` |
 | Atmosphere (`AbstractAtmosphereConfig`) | `prepare_atmosphere(target_grid, config)`, `download_atmosphere(config)` | `atmosphere_time_steps`, `atmosphere_source_grid`, `atmosphere_variable_names`; `download_atmosphere(target_grid, config)` if it downloads; `prescribed_atmosphere`, `prescribed_radiation` if the setup is simulated | `src/Atmospheres/nora3_source.jl` |
 | Simulation (`AbstractSimulationConfig`) | `build_simulation(config)`, `run_simulation(config)` | none — fields only | `src/Setups/oslofjorden.jl` |
+| Model (`AbstractCoupledSimulationConfig`) | `coupled_simulation(model, grid; ...)` | `coupled_simulation`, `model_tracers` | `src/Simulations.jl` |
+| Boundary conditions (`AbstractBoundaryConditionConfig`) | `field_boundary_conditions(configs, ...)` | `boundary_conditions(config, grid, forcing, forcing_config, tracers)` | `src/BoundaryConditions.jl` |
+| Writers (`AbstractWriterConfig`) | `attach_writers!(simulation, config, loop)` | `attach_writer!`; optionally `checkpoint_trait`, `output_path_trait` | `src/Simulations.jl` |
+| Time stepping (`AbstractTimeSteppingConfig`) | `attach_time_stepping!(simulation, config)` | `attach_time_stepping!`, `initial_time_step` | `src/Simulations.jl` |
 
 A river config is not a `FjordConfig` field of its own — it goes in the forcing config's `rivers`
-field, `nothing` for a setup with no rivers.
+field, `nothing` for a setup with no rivers. The last four supertypes are likewise nested one level
+down, in the simulation config's `model`, `boundary_conditions`, `writers` and `time_stepping`.
 
 Path resolution (`bathymetry_path`, `forcing_path`, `forcing_directory`, `river_forcing_path`,
 `atmosphere_path`, `atmosphere_directory`, `results_path`, `plot_path`) and the diagnostic plots

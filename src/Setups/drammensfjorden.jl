@@ -12,13 +12,14 @@ drops each of the 24 with an `@info`, which is not an error: `add_rivers` fails 
 outlet lands. It is still a required step, since `simulation_forcing_path` picks the
 rivers-augmented copy once a setup names rivers.
 
-It also names an `atmosphere_config` and a `simulation_config` — the same buoyancy, closure,
-advection, tracers, coriolis, sea ice and time-step wizard settings as `oslofjorden()`, so it
-exercises the same physics. The two setups differ in scope, not in kind: this one runs a 30-day
-window (`start_date`/`stop_time`) rather than a full year, which is what makes it a fast first run
-to try the whole pipeline on, and its `initial_conditions` are `FromForcing()` rather than a literal
-`NamedTuple`, reading the state at `start_date` from that rivers-augmented copy once `add_rivers`
-has run. Results go to `~/FjordSim_results/drammensfjorden/`, separate from the input data root.
+It also names an `atmosphere_config` and a `simulation_config` — the same model, boundary conditions
+and time-step wizard settings as `oslofjorden()`, so it exercises the same physics. The three
+differences are all scope, not kind: it runs a 30-day window (`start_date`/`stop_time`) rather than a
+full year, which is what makes it a fast first run to try the whole pipeline on; its
+`initial_conditions` are `FromForcing()` rather than a literal `NamedTuple`, reading the state at
+`start_date` from that rivers-augmented copy once `add_rivers` has run; and it names no
+`CheckpointWriter`, so it writes snapshots and nothing else. Results go to
+`~/FjordSim_results/drammensfjorden/`, separate from the input data root.
 """
 function drammensfjorden()
     data_root = joinpath(homedir(), "FjordSim_data", "drammensfjorden")
@@ -68,39 +69,55 @@ function drammensfjorden()
             years            = [2020],
         ),
         simulation_config = SimulationConfig(
-            results_root            = joinpath(homedir(), "FjordSim_results", "drammensfjorden"),
-            output_file             = "snapshots_ocean.nc",
-            architecture            = :auto,
-            buoyancy                = SeawaterBuoyancy(FT, equation_of_state = TEOS10EquationOfState(FT)),
-            closure                 = (
-                CATKEVerticalDiffusivity(minimum_tke = 7e-6),
-                HorizontalScalarBiharmonicDiffusivity(ν = 1e5, κ = 1e4),
+            results_root       = joinpath(homedir(), "FjordSim_results", "drammensfjorden"),
+            architecture       = :auto,
+            model              = CoupledHydrostaticSimulation(
+                buoyancy           = SeawaterBuoyancy(FT, equation_of_state = TEOS10EquationOfState(FT)),
+                closure            = (
+                    CATKEVerticalDiffusivity(minimum_tke = 7e-6),
+                    HorizontalScalarBiharmonicDiffusivity(ν = 1e5, κ = 1e4),
+                ),
+                tracer_advection   = (T = WENO(), S = WENO()),
+                momentum_advection = WENOVectorInvariant(FT),
+                tracers            = (:T, :S),
+                coriolis           = HydrostaticSphericalCoriolis(FT),
+                sea_ice            = FreezingLimitedOceanTemperature(),
+                biogeochemistry    = nothing,
+                free_surface_cfl   = 0.7,
             ),
-            tracer_advection        = (T = WENO(), S = WENO()),
-            momentum_advection      = WENOVectorInvariant(FT),
-            tracers                 = (:T, :S),
-            # The NorKyst state at `start_date`: every tracer named above plus u and v, whichever
-            # of them the prepared forcing file carries.
-            initial_conditions      = FromForcing(),
-            coriolis                = HydrostaticSphericalCoriolis(FT),
-            sea_ice                 = FreezingLimitedOceanTemperature(),
-            biogeochemistry         = nothing,
-            free_surface_cfl        = 0.7,
-            bottom_drag_coefficient = 0.003,
+            boundary_conditions = (
+                TopBottomFluxes(bottom_drag_coefficient = 0.003),
+                OpenLateralBoundary(),
+            ),
+            # Snapshots only: a 30-day trial run has nothing worth resuming, and naming no
+            # `CheckpointWriter` is how checkpointing is turned off. The trailing comma is what
+            # makes this a one-element tuple rather than a bare writer.
+            writers = (
+                SnapshotWriter(
+                    name               = :ocean,
+                    output_file        = "snapshots_ocean.nc",
+                    variables          = (:T, :S, :u, :v),
+                    interval           = 1hour,
+                    overwrite_existing = true,
+                ),
+            ),
+            time_stepping = AdaptiveTimeStep(
+                initial_time_step    = 1second,
+                cfl                  = 0.1,
+                max_time_step        = 3minutes,
+                max_time_step_change = 1.01,
+            ),
+            # The NorKyst state at `start_date`: every tracer the model names plus u and v,
+            # whichever of them the prepared forcing file carries.
+            initial_conditions = FromForcing(),
             # A 30-day window rather than oslofjorden's full year, so this setup's `run_simulation`
             # finishes quickly as a first end-to-end run. Both prepare steps still pad their axes
             # to reach it.
-            start_date              = DateTime(2020, 1, 1),
-            stop_time               = 30days,
-            loops                   = 1,
-            output_interval         = 1hour,
-            progress_interval       = 1hour,
-            overwrite_existing      = true,
-            checkpoint_interval     = 0.0,
-            pickup                  = false,
-            time_step_cfl           = 0.1,
-            max_time_step           = 3minutes,
-            max_time_step_change    = 1.01,
+            start_date         = DateTime(2020, 1, 1),
+            stop_time          = 30days,
+            loops              = 1,
+            progress_interval  = 1hour,
+            pickup             = false,
         ),
     )
 end
