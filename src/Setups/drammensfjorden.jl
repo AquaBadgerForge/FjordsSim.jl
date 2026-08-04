@@ -26,6 +26,7 @@ function drammensfjorden()
     FT = Oceananigans.defaults.FloatType
 
     return FjordConfig(
+        # Overloads LatitudeLongitudeGrid(architecture, config) — the one grid hook.
         grid_config = EvenGrid(
             size      = (150, 200, 11),
             halo      = (7, 7, 7),
@@ -33,6 +34,8 @@ function drammensfjorden()
             latitude  = (59.58, 59.75),
             z_faces   = [-100.0, -75.0, -50.0, -25.0, -15.0, -10.0, -7.5, -5.0, -3.0, -2.0, -1.0, 0.0],
         ),
+        # Overloads bathymetry_dataset (required), regrid_options and smoothing_options (both
+        # optional) — the hooks prepare_bathymetry dispatches on.
         bathymetry_config = DybdedataConfig(
             data_root             = data_root,
             output_file           = "bathymetry.nc",
@@ -46,6 +49,10 @@ function drammensfjorden()
             geonorge_cache        = false,
             regrid_cache          = false,
         ),
+        # Overloads forcing_time_steps, forcing_source_grid, forcing_variable_names and
+        # download_forcing (required) — the hooks prepare_forcing and download_forcing dispatch
+        # on. simulation_forcing is left at its default, since this is the FjordSim NetCDF
+        # forcing contract build_simulation already reads.
         forcing_config = NorKystConfig(
             data_root            = data_root,
             output_directory     = "norkyst",
@@ -59,6 +66,9 @@ function drammensfjorden()
             years                = [2020],
             rivers               = OF800RiversConfig(data_root = data_root),
         ),
+        # Overloads atmosphere_time_steps, atmosphere_source_grid, atmosphere_variable_names,
+        # download_atmosphere, prescribed_atmosphere and prescribed_radiation — the hooks
+        # prepare_atmosphere, download_atmosphere and build_simulation dispatch on.
         atmosphere_config = NORA3Config(
             data_root        = data_root,
             output_directory = "nora3",
@@ -68,9 +78,13 @@ function drammensfjorden()
             padding          = 0.1,
             years            = [2020],
         ),
+        # SimulationConfig itself has no hooks — everything below dispatches through one of its
+        # four nested configs instead.
         simulation_config = SimulationConfig(
             results_root       = joinpath(homedir(), "FjordSim_results", "drammensfjorden"),
             architecture       = :auto,
+            # Overloads coupled_simulation and model_tracers — the model hooks build_simulation
+            # dispatches on.
             model              = CoupledHydrostaticSimulation(
                 buoyancy           = SeawaterBuoyancy(FT, equation_of_state = TEOS10EquationOfState(FT)),
                 closure            = (
@@ -83,15 +97,18 @@ function drammensfjorden()
                 coriolis           = HydrostaticSphericalCoriolis(FT),
                 sea_ice            = FreezingLimitedOceanTemperature(),
                 biogeochemistry    = nothing,
-                free_surface_cfl   = 0.7,
+                # Overloads free_surface(config, grid) — its own hook, called from inside
+                # coupled_simulation once the grid exists.
+                free_surface       = SplitExplicitFreeSurfaceConfig(cfl = 0.7),
             ),
+            # Both overload boundary_conditions — the hook field_boundary_conditions merges.
             boundary_conditions = (
                 TopBottomFluxes(bottom_drag_coefficient = 0.003),
                 OpenLateralBoundary(),
             ),
-            # Snapshots only: a 30-day trial run has nothing worth resuming, and naming no
-            # `CheckpointWriter` is how checkpointing is turned off. The trailing comma is what
-            # makes this a one-element tuple rather than a bare writer.
+            # Overloads attach_writer!. Snapshots only: a 30-day trial run has nothing worth
+            # resuming, and naming no `CheckpointWriter` is how checkpointing is turned off. The
+            # trailing comma is what makes this a one-element tuple rather than a bare writer.
             writers = (
                 SnapshotWriter(
                     name               = :ocean,
@@ -101,6 +118,7 @@ function drammensfjorden()
                     overwrite_existing = true,
                 ),
             ),
+            # Overloads attach_time_stepping! and initial_time_step.
             time_stepping = AdaptiveTimeStep(
                 initial_time_step    = 1second,
                 cfl                  = 0.1,

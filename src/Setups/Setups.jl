@@ -24,6 +24,7 @@ using ..BoundaryConditions: TopBottomFluxes, OpenLateralBoundary
 using ..Simulations:
     SimulationConfig,
     CoupledHydrostaticSimulation,
+    SplitExplicitFreeSurfaceConfig,
     SnapshotWriter,
     CheckpointWriter,
     AdaptiveTimeStep,

@@ -300,6 +300,11 @@ and a new method, not an edit to `build_simulation`. A `SnapshotWriter`'s `varia
 anything `Oceananigans.fields` exposes on the ocean model, so adding `:w`, `:η` or a biogeochemical
 tracer to a run's output is one Symbol.
 
+`CoupledHydrostaticSimulation` nests one further supertype of its own: its `free_surface` field is
+an `AbstractFreeSurfaceConfig` (built in: `SplitExplicitFreeSurfaceConfig`), built by its own
+`free_surface(config, grid)` hook rather than stored ready-made, since `SplitExplicitFreeSurface`
+needs the grid `coupled_simulation` is given but the config is not.
+
 `initial_conditions` takes one of three shapes:
 
 - a literal `NamedTuple` of constants, functions or fields, e.g. `(T = 5.0, S = 33.0)`;
@@ -437,18 +442,21 @@ define a struct subtyping the matching supertype and add methods for it to that 
 |---|---|---|---|
 | Grid (`AbstractGridConfig`) | — | `LatitudeLongitudeGrid(architecture, config)` | `src/Grids.jl` |
 | Bathymetry (`AbstractBathymetryConfig`) | `prepare_bathymetry(target_grid, config)` | `bathymetry_dataset(target_grid, config)`; optionally `regrid_options`, `smoothing_options` | `src/Bathymetry/geonorge.jl` |
-| Forcing (`AbstractForcingConfig`) | `prepare_forcing(target_grid, config)`, `download_forcing(config)` | `forcing_time_steps`, `forcing_source_grid`, `forcing_variable_names`; `download_forcing(target_grid, config)` if it downloads | `src/Forcing/norkyst.jl` |
+| Forcing (`AbstractForcingConfig`) | `prepare_forcing(target_grid, config)`, `download_forcing(config)` | `forcing_time_steps`, `forcing_source_grid`, `forcing_variable_names`; `download_forcing(target_grid, config)` if it downloads; optionally `simulation_forcing`, defaulting to `forcing_from_file` | `src/Forcing/norkyst.jl` |
 | Rivers (`AbstractRiverConfig`) | `add_rivers(target_grid, config)` | `river_locations`, `river_series`, `download_rivers` | `src/Forcing/of800_rivers.jl` |
 | Atmosphere (`AbstractAtmosphereConfig`) | `prepare_atmosphere(target_grid, config)`, `download_atmosphere(config)` | `atmosphere_time_steps`, `atmosphere_source_grid`, `atmosphere_variable_names`; `download_atmosphere(target_grid, config)` if it downloads; `prescribed_atmosphere`, `prescribed_radiation` if the setup is simulated | `src/Atmospheres/nora3_source.jl` |
 | Simulation (`AbstractSimulationConfig`) | `build_simulation(config)`, `run_simulation(config)` | none — fields only | `src/Setups/oslofjorden.jl` |
 | Model (`AbstractCoupledSimulationConfig`) | `coupled_simulation(model, grid; ...)` | `coupled_simulation`, `model_tracers` | `src/Simulations.jl` |
+| Free surface (`AbstractFreeSurfaceConfig`) | — (nested in the model config's `free_surface` field) | `free_surface(config, grid)` | `src/Simulations.jl` |
 | Boundary conditions (`AbstractBoundaryConditionConfig`) | `field_boundary_conditions(configs, ...)` | `boundary_conditions(config, grid, forcing, forcing_config, tracers)` | `src/BoundaryConditions.jl` |
 | Writers (`AbstractWriterConfig`) | `attach_writers!(simulation, config, loop)` | `attach_writer!`; optionally `checkpoint_trait`, `output_path_trait` | `src/Simulations.jl` |
 | Time stepping (`AbstractTimeSteppingConfig`) | `attach_time_stepping!(simulation, config)` | `attach_time_stepping!`, `initial_time_step` | `src/Simulations.jl` |
 
 A river config is not a `FjordConfig` field of its own — it goes in the forcing config's `rivers`
-field, `nothing` for a setup with no rivers. The last four supertypes are likewise nested one level
-down, in the simulation config's `model`, `boundary_conditions`, `writers` and `time_stepping`.
+field, `nothing` for a setup with no rivers. The model, boundary-conditions, writers and
+time-stepping supertypes are likewise nested one level down, in the simulation config's `model`,
+`boundary_conditions`, `writers` and `time_stepping`; the free-surface supertype is nested one level
+further still, in the model config's own `free_surface` field.
 
 Path resolution (`bathymetry_path`, `forcing_path`, `forcing_directory`, `river_forcing_path`,
 `atmosphere_path`, `atmosphere_directory`, `results_path`, `plot_path`) and the diagnostic plots

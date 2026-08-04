@@ -72,6 +72,7 @@ end
 # The four supertypes `SimulationConfig` nests, each with no hook overloaded, so the "Config
 # extensibility" testset can assert that a missing hook surfaces as a `MethodError` naming it.
 struct MinimalModel <: AbstractCoupledSimulationConfig end
+struct MinimalFreeSurface <: AbstractFreeSurfaceConfig end
 struct MinimalBoundary <: AbstractBoundaryConditionConfig end
 struct MinimalWriter <: AbstractWriterConfig end
 struct MinimalTimeStepping <: AbstractTimeSteppingConfig end
@@ -236,7 +237,7 @@ function test_model_fields(; kwargs...)
         :coriolis => HydrostaticSphericalCoriolis(),
         :sea_ice => FreezingLimitedOceanTemperature(),
         :biogeochemistry => nothing,
-        :free_surface_cfl => 0.7,
+        :free_surface => SplitExplicitFreeSurfaceConfig(cfl = 0.7),
     )
 
     return override_fields(fields, "test_model_fields", kwargs)

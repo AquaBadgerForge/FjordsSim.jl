@@ -2,6 +2,8 @@ module Simulations
 
 export SimulationConfig,
     CoupledHydrostaticSimulation,
+    SplitExplicitFreeSurfaceConfig,
+    free_surface,
     SnapshotWriter,
     CheckpointWriter,
     AdaptiveTimeStep,
@@ -27,6 +29,7 @@ using NCDatasets
 using ..Configs:
     AbstractSimulationConfig,
     AbstractCoupledSimulationConfig,
+    AbstractFreeSurfaceConfig,
     AbstractWriterConfig,
     AbstractTimeSteppingConfig,
     AbstractForcingConfig,
@@ -39,33 +42,59 @@ using ..Configs:
     run_tag
 using ..Utils: progress, cell_advection_timescale_coupled_model
 using ..Atmospheres: prescribed_atmosphere, prescribed_radiation, atmosphere_date_range
-using ..Forcing: forcing_from_file, interpolation_architecture
+using ..Forcing: simulation_forcing, interpolation_architecture
 using ..BoundaryConditions: field_boundary_conditions
 using ..Grids: ImmersedBoundaryGrid
 
 """
+    SplitExplicitFreeSurfaceConfig(; cfl)
+
+The one built-in `AbstractFreeSurfaceConfig`: a barotropic split-explicit solver at a given CFL.
+
+Holds only the knob, not the object — `SplitExplicitFreeSurface(grid, cfl = ...)` needs the grid,
+which does not exist until `coupled_simulation` builds it, so `free_surface` is what does that
+building once the grid is in hand.
+"""
+struct SplitExplicitFreeSurfaceConfig <: AbstractFreeSurfaceConfig
+    cfl::Float64
+end
+
+SplitExplicitFreeSurfaceConfig(; cfl) = SplitExplicitFreeSurfaceConfig(Float64(cfl))
+
+"""
+    free_surface(config::SplitExplicitFreeSurfaceConfig, grid)
+
+Build the `SplitExplicitFreeSurface` `coupled_simulation` passes to `HydrostaticFreeSurfaceModel`.
+"""
+free_surface(config::SplitExplicitFreeSurfaceConfig, grid) =
+    SplitExplicitFreeSurface(grid, cfl = config.cfl)
+
+"""
     CoupledHydrostaticSimulation(; buoyancy, closure, tracer_advection, momentum_advection,
-                                 tracers, coriolis, sea_ice, biogeochemistry, free_surface_cfl)
+                                 tracers, coriolis, sea_ice, biogeochemistry, free_surface)
 
 What the model *is*: a `HydrostaticFreeSurfaceModel` inside a NumericalEarth `OceanSeaIceModel`.
 
 Holds the components that depend on neither the grid nor the device, so they are stored as the
-objects `coupled_simulation` consumes rather than as knobs it has to interpret. `free_surface_cfl`
-is the one exception and the reason it is a plain `Float64`: `SplitExplicitFreeSurface` needs the
-grid, which only exists inside `coupled_simulation`.
+objects `coupled_simulation` consumes rather than as knobs it has to interpret. `free_surface` is
+the one exception: it is itself an `AbstractFreeSurfaceConfig`, built by its own `free_surface(config,
+grid)` hook rather than stored ready-made, for exactly the reason `coupled_simulation` — and not this
+struct — is what assembles the model: `SplitExplicitFreeSurface` needs the grid, which only exists
+once `coupled_simulation` is called.
 
 **No field has a default**, deliberately. Every one is a scientific choice about a particular fjord,
 and a default would let the next setup silently inherit it, so a setup that forgets one gets an
 `UndefKeywordError` naming it rather than a plausible-looking run.
 
-Eight type parameters, one per prebuilt component. A ninth is the signal to collapse them into a
-single `NamedTuple` field instead of adding another; the "Simulation config" testset guards the
-count.
+Nine type parameters, one per component. A tenth is the signal to collapse them into a single
+`NamedTuple` field instead of adding another; the "config" testset guards the count.
 
 Note that `Base.@kwdef` on a *parametric* struct generates a constructor that does not convert, so
-`free_surface_cfl = 1` is a `MethodError` where `1.0` is fine.
+`free_surface = SplitExplicitFreeSurfaceConfig(cfl = 1)` is a `MethodError` where `cfl = 1.0` is
+fine — though `SplitExplicitFreeSurfaceConfig`'s own keyword constructor converts, the same
+exception every nested config gets.
 """
-Base.@kwdef struct CoupledHydrostaticSimulation{B,C,TA,MA,TR,CO,SI,BG} <:
+Base.@kwdef struct CoupledHydrostaticSimulation{B,C,TA,MA,TR,CO,SI,BG,FS} <:
                    AbstractCoupledSimulationConfig
     buoyancy::B
     closure::C
@@ -75,7 +104,7 @@ Base.@kwdef struct CoupledHydrostaticSimulation{B,C,TA,MA,TR,CO,SI,BG} <:
     coriolis::CO
     sea_ice::SI
     biogeochemistry::BG
-    free_surface_cfl::Float64
+    free_surface::FS
 end
 
 """
@@ -84,7 +113,7 @@ end
 The tracer names a coupled-model config carries.
 
 A hook rather than a field read, because `build_simulation` needs them long before the model exists:
-`forcing_from_file` builds one term per tracer, `OpenLateralBoundary` opens one lateral condition per
+`simulation_forcing` builds one term per tracer, `OpenLateralBoundary` opens one lateral condition per
 tracer, and `resolve_initial_conditions` reads one state variable per tracer. All three ask the model
 config what it simulates rather than being told a second time.
 """
@@ -976,12 +1005,9 @@ function build_simulation(config::FjordConfig)
 
     # Every time axis is zeroed at the same instant, so the components stay in phase: each
     # prepared file has its own first record, and left to itself each reader would zero there.
-    forcing = forcing_from_file(;
-        grid = grid,
-        filepath = forcing_file,
-        tracers = tracers,
-        reference_date = start_date,
-    )
+    # Dispatched on the forcing config rather than a hardcoded `forcing_from_file` call, so a
+    # source whose prepared files are not that NetCDF contract could read a different way.
+    forcing = simulation_forcing(config.forcing_config, grid, forcing_file, tracers, start_date)
     # Named `model_boundary_conditions` rather than `boundary_conditions`, which is the hook each
     # piece of it was built by: assigning to that name here would make it a local and shadow the
     # function for the rest of this body.
@@ -1139,8 +1165,9 @@ different kind of model is a new `AbstractCoupledSimulationConfig` subtype and a
 neither `build_simulation` nor anything above it changes.
 
 The method below builds a `HydrostaticFreeSurfaceModel` inside a NumericalEarth `OceanSeaIceModel`.
-The free surface is built here rather than passed in because `SplitExplicitFreeSurface` needs the
-grid, which is exactly what this function is given and the config is not.
+`model.free_surface`'s own `free_surface(config, grid)` hook builds the free-surface object here
+rather than it arriving prebuilt, because `SplitExplicitFreeSurface` needs the grid, which is
+exactly what this function is given and the config is not.
 """
 function coupled_simulation(
     model::CoupledHydrostaticSimulation,
@@ -1161,7 +1188,7 @@ function coupled_simulation(
         tracer_advection = model.tracer_advection,
         momentum_advection = model.momentum_advection,
         tracers = model.tracers,
-        free_surface = SplitExplicitFreeSurface(grid, cfl = model.free_surface_cfl),
+        free_surface = free_surface(model.free_surface, grid),
         coriolis = model.coriolis,
         forcing = forcing,
         boundary_conditions = boundary_conditions,

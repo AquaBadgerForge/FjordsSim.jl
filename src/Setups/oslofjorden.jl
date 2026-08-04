@@ -25,7 +25,9 @@ function oslofjorden()
     data_root = joinpath(homedir(), "FjordSim_data", "oslofjorden")
     FT = Oceananigans.defaults.FloatType
 
+    # FjordConfig overload entry points like run_simulation(), download_forcing(), etc.
     return FjordConfig(
+        # Overloads LatitudeLongitudeGrid(architecture, config) — the one grid hook.
         grid_config = EvenGrid(
             size      = (240, 520, 18),
             halo      = (7, 7, 7),
@@ -36,6 +38,8 @@ function oslofjorden()
                 -75.0, -50.0, -25.0, -15.0, -10.0, -7.5, -5.0, -3.0, -2.0, -1.0, 0.0,
             ],
         ),
+        # Overloads bathymetry_dataset (required), regrid_options and smoothing_options (both
+        # optional) — the hooks prepare_bathymetry dispatches on.
         bathymetry_config = DybdedataConfig(
             data_root             = data_root,
             output_file           = "bathymetry.nc",
@@ -52,6 +56,10 @@ function oslofjorden()
             geonorge_cache        = true,
             regrid_cache          = false,
         ),
+        # Overloads forcing_time_steps, forcing_source_grid, forcing_variable_names and
+        # download_forcing (required) — the hooks prepare_forcing and download_forcing dispatch
+        # on. simulation_forcing is left at its default, since this is the FjordSim NetCDF
+        # forcing contract build_simulation already reads.
         forcing_config = NorKystConfig(
             data_root            = data_root,
             output_directory     = "norkyst",
@@ -65,6 +73,9 @@ function oslofjorden()
             years                = [2020],
             rivers               = OF800RiversConfig(data_root = data_root),
         ),
+        # Overloads atmosphere_time_steps, atmosphere_source_grid, atmosphere_variable_names,
+        # download_atmosphere, prescribed_atmosphere and prescribed_radiation — the hooks
+        # prepare_atmosphere, download_atmosphere and build_simulation dispatch on.
         atmosphere_config = NORA3Config(
             data_root        = data_root,
             output_directory = "nora3",
@@ -74,9 +85,13 @@ function oslofjorden()
             padding          = 0.1,
             years            = [2020],
         ),
+        # SimulationConfig itself has no hooks — everything below dispatches through one of its
+        # four nested configs instead.
         simulation_config = SimulationConfig(
             results_root       = joinpath(homedir(), "FjordSim_results", "oslofjorden"),
             architecture       = :auto,
+            # Overloads coupled_simulation and model_tracers — the model hooks build_simulation
+            # dispatches on.
             model              = CoupledHydrostaticSimulation(
                 buoyancy           = SeawaterBuoyancy(FT, equation_of_state = TEOS10EquationOfState(FT)),
                 closure            = (
@@ -89,8 +104,11 @@ function oslofjorden()
                 coriolis           = HydrostaticSphericalCoriolis(FT),
                 sea_ice            = FreezingLimitedOceanTemperature(),
                 biogeochemistry    = nothing,
-                free_surface_cfl   = 0.7,
+                # Overloads free_surface(config, grid) — its own hook, called from inside
+                # coupled_simulation once the grid exists.
+                free_surface       = SplitExplicitFreeSurfaceConfig(cfl = 0.7),
             ),
+            # Both overload boundary_conditions — the hook field_boundary_conditions merges.
             # Surface fluxes with quadratic bottom drag, plus the open southern edge — which edge
             # and how fast come from the forcing config, so `OpenLateralBoundary` carries no
             # fields. Dropping it would close the domain; the tuple order is merge precedence.
@@ -98,9 +116,10 @@ function oslofjorden()
                 TopBottomFluxes(bottom_drag_coefficient = 0.003),
                 OpenLateralBoundary(),
             ),
-            # What the run writes. `variables` may name anything `Oceananigans.fields` exposes on
-            # the ocean model — add `:w`, `:η` or a biogeochemical tracer by naming it here.
-            # Dropping the `CheckpointWriter` turns checkpointing off entirely.
+            # Both overload attach_writer! — what the run writes. `variables` may name anything
+            # `Oceananigans.fields` exposes on the ocean model — add `:w`, `:η` or a
+            # biogeochemical tracer by naming it here. Dropping the `CheckpointWriter` turns
+            # checkpointing off entirely.
             writers = (
                 SnapshotWriter(
                     name               = :ocean,
@@ -111,6 +130,7 @@ function oslofjorden()
                 ),
                 CheckpointWriter(interval = 30days, overwrite_existing = true, cleanup = true),
             ),
+            # Overloads attach_time_stepping! and initial_time_step.
             time_stepping = AdaptiveTimeStep(
                 initial_time_step    = 1second,
                 cfl                  = 0.1,

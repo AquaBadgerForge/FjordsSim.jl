@@ -28,6 +28,7 @@ include("utilities.jl")
             :NorKystConfig,
             :OF800RiversConfig,
             :forcing_from_file,
+            :simulation_forcing,
             :forcing_path,
             :forcing_directory,
             :river_forcing_path,
@@ -85,10 +86,13 @@ include("utilities.jl")
             # simulation
             :SimulationConfig,
             :AbstractCoupledSimulationConfig,
+            :AbstractFreeSurfaceConfig,
             :AbstractBoundaryConditionConfig,
             :AbstractWriterConfig,
             :AbstractTimeSteppingConfig,
             :CoupledHydrostaticSimulation,
+            :SplitExplicitFreeSurfaceConfig,
+            :free_surface,
             :SnapshotWriter,
             :CheckpointWriter,
             :AdaptiveTimeStep,
@@ -631,12 +635,14 @@ end
         # The four supertypes `SimulationConfig` nests own one hook contract each, and each is
         # missing the same discoverable way.
         @test MinimalModel() isa AbstractCoupledSimulationConfig
+        @test MinimalFreeSurface() isa AbstractFreeSurfaceConfig
         @test MinimalBoundary() isa AbstractBoundaryConditionConfig
         @test MinimalWriter() isa AbstractWriterConfig
         @test MinimalTimeStepping() isa AbstractTimeSteppingConfig
 
         @test_throws MethodError model_tracers(MinimalModel())
         @test_throws MethodError coupled_simulation(MinimalModel(), grid)
+        @test_throws MethodError free_surface(MinimalFreeSurface(), grid)
         @test_throws MethodError FjordSim.BoundaryConditions.boundary_conditions(
             MinimalBoundary(), grid, (;), config.forcing_config, (:T,),
         )
@@ -1575,6 +1581,14 @@ end
             # Only requested tracers are picked up, alongside the velocities.
             @test Set(keys(forcing_from_file(forcing_config; grid, tracers = (:T,)))) == Set((:T, :u, :v))
 
+            # `simulation_forcing` is the hook `build_simulation` calls instead of a hardcoded
+            # `forcing_from_file` — dispatched on the forcing config, taking the resolved filepath
+            # rather than resolving it, so it also serves the rivers-augmented copy. Every
+            # built-in source shares the default, which just forwards to `forcing_from_file`.
+            @test Set(keys(simulation_forcing(
+                forcing_config, grid, forcing_path(forcing_config), (:T, :S), nothing,
+            ))) == Set((:T, :S, :u, :v))
+
             # A grid the file was not written for must be rejected rather than silently misread.
             other = immersed_test_grid(
                 joinpath(tmp, "bathymetry_other.nc");
@@ -2166,14 +2180,21 @@ end
         # Five structural parameters, one per nested config. They do not grow: a new kind of nested
         # config is a new subtype of an existing supertype, not a new field.
         @test length(typeof(config).parameters) == 5
-        # One parameter per prebuilt Oceananigans component, and *this* is the count under pressure.
-        # A ninth is the signal to collapse them into a single `NamedTuple` field instead of adding
-        # another.
-        @test length(typeof(test_model_config()).parameters) == 8
+        # One parameter per component, and *this* is the count under pressure. A tenth is the
+        # signal to collapse them into a single `NamedTuple` field instead of adding another.
+        # `free_surface` counts here too: it is itself a config, not a bare `Float64`, dispatched
+        # by its own `free_surface(config, grid)` hook.
+        @test length(typeof(test_model_config()).parameters) == 9
 
         # The tracer list reaches `build_simulation` through a hook rather than a field read, so a
         # model config that names its tracers differently still composes.
         @test model_tracers(test_model_config()) == (:T, :S)
+
+        # `free_surface` is dispatched, not a plain scalar: a fixture grid is enough to build the
+        # object `coupled_simulation` would hand `HydrostaticFreeSurfaceModel`.
+        free_surface_grid = LatitudeLongitudeGrid(CPU(), test_grid_config())
+        @test free_surface(SplitExplicitFreeSurfaceConfig(cfl = 0.7), free_surface_grid) isa
+              SplitExplicitFreeSurface
 
         # The device is a Symbol, not a live CPU()/GPU(), so a setup file loads without a GPU.
         @test fieldtype(typeof(config), :architecture) === Symbol

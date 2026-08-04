@@ -269,6 +269,14 @@ modules, in `include` order from `src/FjordSim.jl`:
    indices in memory. `forcing_from_file` takes either a `filepath` keyword or an
    `AbstractForcingConfig` positionally, resolved by `forcing_path`.
 
+   `build_simulation` reaches this through one more layer of dispatch, `simulation_forcing(config,
+   grid, filepath, tracers, reference_date)`, rather than calling `forcing_from_file` directly: the
+   hook is what a forcing source overloads if its prepared files are not this NetCDF layout, and it
+   takes `filepath` rather than resolving it because `build_simulation` may pass the
+   rivers-augmented copy (`simulation_forcing_path`, in `Simulations`) instead of `forcing_path`
+   itself. Every built-in source shares one default, since the layout is a contract fixed by the
+   read side, not a per-source choice.
+
    `prepare_forcing(target_grid, config::AbstractForcingConfig)` regrids the downloaded source
    files onto the simulation grid: `forcing_variable_names(config)` picks the variables →
    `forcing_time_steps(config)` completed by `daily_time_steps` to a gap-free daily axis, then
@@ -430,20 +438,27 @@ modules, in `include` order from `src/FjordSim.jl`:
     `SimulationConfig` has 12 fields and 5 type parameters, one per nested config, and the split
     between it and them is by *what dispatches on what* rather than by convenience. Everything
     grid-independent about the model — `buoyancy`, `closure`, `tracer_advection`,
-    `momentum_advection`, `tracers`, `coriolis`, `sea_ice`, `biogeochemistry` — is stored on
-    `CoupledHydrostaticSimulation` as the objects `coupled_simulation` consumes, one type parameter
-    each, eight in total, which is the cost of the no-abstract-fields rule. A **ninth** is the signal
-    to collapse them into one `NamedTuple` field instead of adding another; the "config" testset
-    guards that count, and it is the count under pressure — `SimulationConfig`'s five are structural
-    and do not grow, since a new kind of nested config is a new subtype of an existing supertype.
-    `free_surface_cfl` is a scalar on the model config and `bottom_drag_coefficient` one on
-    `TopBottomFluxes` because `SplitExplicitFreeSurface` and `top_bottom_boundary_conditions` both
-    need the grid.
+    `momentum_advection`, `tracers`, `coriolis`, `sea_ice`, `biogeochemistry`, `free_surface` — is
+    stored on `CoupledHydrostaticSimulation` as the objects (or, for `free_surface`, the nested
+    config) `coupled_simulation` consumes, one type parameter each, nine in total, which is the cost
+    of the no-abstract-fields rule. A **tenth** is the signal to collapse them into one `NamedTuple`
+    field instead of adding another; the "config" testset guards that count, and it is the count
+    under pressure — `SimulationConfig`'s five are structural and do not grow, since a new kind of
+    nested config is a new subtype of an existing supertype.
+
+    `free_surface` is itself an `AbstractFreeSurfaceConfig` rather than a bare `Float64` CFL, with
+    its own `free_surface(config, grid)` hook — the same reason the model as a whole is a config
+    rather than a built object: `SplitExplicitFreeSurface` needs the grid, which does not exist
+    until `coupled_simulation` calls the hook. `bottom_drag_coefficient` stays a plain scalar on
+    `TopBottomFluxes` rather than following the same pattern, because
+    `top_bottom_boundary_conditions` is already the dispatched hook that needs the grid — there is
+    no second function for it to delegate to the way `coupled_simulation` delegates to
+    `free_surface`.
     `architecture` is a `Symbol` for the same reason as the forcing config's, and
     `simulation_architecture` resolves it by reusing `interpolation_architecture`'s `Val` methods.
 
     `model_tracers(model)` is a hook rather than a field read because `build_simulation` needs the
-    tracer list before the model exists: `forcing_from_file`, `OpenLateralBoundary` and
+    tracer list before the model exists: `simulation_forcing`, `OpenLateralBoundary` and
     `resolve_initial_conditions` each build one thing per tracer.
 
     No field has a default anywhere in this stack, deliberately, which is the one place these configs
@@ -461,7 +476,7 @@ modules, in `include` order from `src/FjordSim.jl`:
     derived. Every prepared file carries its own first record, and each reader used to zero its own
     time axis there — the Oslofjord forcing starts at 12:00 and its NORA3 atmosphere at 00:00, so
     the two ran twelve hours out of phase with nothing reporting it. One stated instant is the only
-    thing they can all agree on, so `build_simulation` passes it to `forcing_from_file` and to both
+    thing they can all agree on, so `build_simulation` passes it to `simulation_forcing` and to both
     atmosphere read hooks as their `reference_date`. Picking a `start_date` earlier than a file's
     first record is therefore an error rather than a shift.
 
@@ -753,6 +768,7 @@ Forcing — `AbstractForcingConfig`, consumed by `prepare_forcing`:
 | `forcing_source_grid(config, filepath)` → source grid | yes |
 | `forcing_variable_names(config)` → `Dict` source name => FjordSim name | yes |
 | `download_forcing(target_grid, config)` | only if it downloads |
+| `simulation_forcing(config, grid, filepath, tracers, reference_date)` → the forcing term object `coupled_simulation` consumes | no; defaults to `forcing_from_file`, the FjordSim NetCDF contract |
 | `source_field_grid(source, architecture)`, `projected_target_nodes(longitude, latitude, source)` | only for a source grid that is not a regular projected grid; dispatch on the source-grid type, not the config |
 
 Rivers — `AbstractRiverConfig`, consumed by `add_rivers`:
@@ -790,7 +806,7 @@ atmosphere config yields `nothing` for all three.
 `reference_date` is the instant the returned time axes are zeroed at, and is *not*
 `NORA3PrescribedAtmosphere`'s `start_date`: that one selects which records to load, this one
 selects where t = 0 sits. `build_simulation` passes the simulation config's `start_date` to both
-this hook and `forcing_from_file`, which is the only thing keeping the two in phase — see the
+this hook and `simulation_forcing`, which is the only thing keeping the two in phase — see the
 `Simulations` section.
 
 The prepared variable names and units are *not* a hook — they are fixed by the read side in
@@ -814,6 +830,14 @@ dispatched on comes from the four supertypes it nests, one hook table each:
 
 A writer needs an `output_file` field only when its `output_path_trait` is `NamesOutputFile`; on any
 other, `results_path` raises a stated `ArgumentError` rather than failing on a missing field.
+
+`CoupledHydrostaticSimulation`, the built-in `AbstractCoupledSimulationConfig`, nests one further
+supertype of its own: `free_surface` is an `AbstractFreeSurfaceConfig`, required hook
+`free_surface(config, grid)` → the free-surface object `coupled_simulation` passes to
+`HydrostaticFreeSurfaceModel`. It is not one of the four rows above — those are what
+`SimulationConfig` itself nests — but the same reasoning applies one level down: a different free
+surface is a new subtype and a new method, not an edit to `coupled_simulation`.
+`FjordSim.Simulations.SplitExplicitFreeSurfaceConfig` is the built-in implementation.
 
 The `coverage` keyword `prepare_forcing` and `prepare_atmosphere` now take is a pipeline *argument*,
 not a hook: the `FjordConfig` drivers derive it with `coverage_window` and every source inherits the

@@ -7,6 +7,7 @@ export AbstractGridConfig,
     AbstractAtmosphereConfig,
     AbstractSimulationConfig,
     AbstractCoupledSimulationConfig,
+    AbstractFreeSurfaceConfig,
     AbstractBoundaryConditionConfig,
     AbstractWriterConfig,
     AbstractTimeSteppingConfig,
@@ -90,6 +91,12 @@ how to download and subset it.
   `ProjectedSourceGrid`. Required.
 - `forcing_variable_names(config)`: source variable name => FjordSim forcing name. Required.
 - `download_forcing(target_grid, config)`: fetch the source data. Only if it downloads.
+- `simulation_forcing(config, grid, filepath, tracers, reference_date)`: the forcing term object
+  `coupled_simulation` consumes, read from the resolved forcing file at `filepath` — which may be
+  the rivers-augmented copy rather than `forcing_path(config)` itself, so this takes the path
+  rather than resolving it. Optional; defaults to `forcing_from_file`, the FjordSim NetCDF layout
+  every built-in source already writes. A source whose prepared files are not that contract
+  overrides it.
 
 `FjordSim.Forcing.NorKystConfig` is the built-in implementation, for NorKyst-800m;
 `src/Forcing/norkyst.jl` is the template to copy for a new dataset.
@@ -227,6 +234,24 @@ model assembly is a new subtype rather than an edit to an existing method body.
 `FjordSim.Simulations.CoupledHydrostaticSimulation` is the built-in implementation.
 """
 abstract type AbstractCoupledSimulationConfig end
+
+"""
+    AbstractFreeSurfaceConfig
+
+Supertype for free-surface configurations. A concrete subtype names a free-surface solver's knobs,
+and its `free_surface(config, grid)` method builds the object `coupled_simulation` passes to
+`HydrostaticFreeSurfaceModel`.
+
+Nested inside a coupled-simulation config as its own field rather than a plain scalar, for the same
+reason the model itself is a config rather than the built object: `SplitExplicitFreeSurface(grid,
+cfl = ...)` needs the grid, which does not exist until `coupled_simulation` is called.
+
+# Methods a subtype provides
+- `free_surface(config, grid)`: build the free-surface object. Required.
+
+`FjordSim.Simulations.SplitExplicitFreeSurfaceConfig` is the built-in implementation.
+"""
+abstract type AbstractFreeSurfaceConfig end
 
 """
     AbstractBoundaryConditionConfig

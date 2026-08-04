@@ -32,6 +32,7 @@ using ..Configs:
 using ..Plotting: plot_forcing
 
 export forcing_from_file,
+    simulation_forcing,
     prepare_forcing,
     download_forcing,
     interpolation_architecture,
@@ -324,6 +325,21 @@ Return the forcing named tuple for the prepared forcing file this setup names, r
 """
 forcing_from_file(config::AbstractForcingConfig; grid, tracers, reference_date = nothing) =
     forcing_from_file(; grid, filepath = forcing_path(config), tracers, reference_date)
+
+"""
+    simulation_forcing(config::AbstractForcingConfig, grid, filepath, tracers, reference_date)
+
+The forcing term object `coupled_simulation` consumes, read from `filepath` — the file
+`build_simulation` resolved via `simulation_forcing_path`, which may be the rivers-augmented copy
+rather than `forcing_path(config)` itself, so this hook takes the path instead of resolving it.
+
+A dispatched hook rather than a hardcoded `forcing_from_file` call, so a forcing source whose
+prepared files are not the FjordSim NetCDF layout `forcing_from_file` reads could supply a
+completely different reader. Every built-in source shares this one default, since that layout is a
+contract fixed by the read side, not a per-source detail — see `AbstractForcingConfig`.
+"""
+simulation_forcing(config::AbstractForcingConfig, grid, filepath, tracers, reference_date) =
+    forcing_from_file(; grid, filepath, tracers, reference_date)
 
 # --- Forcing preparation ---
 
