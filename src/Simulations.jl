@@ -30,7 +30,7 @@ using ..Configs:
 using ..Utils: recursive_merge, progress, cell_advection_timescale_coupled_model
 using ..Atmospheres: prescribed_atmosphere, prescribed_radiation, atmosphere_date_range
 using ..Forcing: forcing_from_file, interpolation_architecture
-using ..BoundaryConditions: top_bottom_boundary_conditions
+using ..BoundaryConditions: top_bottom_boundary_conditions, lateral_tracer_open_boundary_conditions
 using ..Grids: ImmersedBoundaryGrid
 
 """
@@ -703,11 +703,14 @@ function build_simulation(config::FjordConfig)
     boundary_conditions = map(
         x -> FieldBoundaryConditions(; x...),
         recursive_merge(
-            top_bottom_boundary_conditions(;
-                grid = grid,
-                bottom_drag_coefficient = simulation_config.bottom_drag_coefficient,
+            recursive_merge(
+                top_bottom_boundary_conditions(;
+                    grid = grid,
+                    bottom_drag_coefficient = simulation_config.bottom_drag_coefficient,
+                ),
+                open_boundary_conditions(Val(config.forcing_config.relaxation_edge)),
             ),
-            open_boundary_conditions(Val(config.forcing_config.relaxation_edge)),
+            lateral_tracer_open_boundary_conditions(grid, forcing, config.forcing_config, simulation_config.tracers),
         ),
     )
 

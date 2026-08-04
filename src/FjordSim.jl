@@ -75,6 +75,7 @@ export
     geodatabase_path,
     # boundary conditions
     top_bottom_boundary_conditions,
+    lateral_tracer_open_boundary_conditions,
     # simulations
     coupled_hydrostatic_simulation,
     FromForcing,

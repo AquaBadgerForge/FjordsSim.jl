@@ -169,6 +169,51 @@ include("utilities.jl")
         end
     end
 
+    @testset "lateral tracer open boundary" begin
+        mktempdir() do tmp
+            (; grid) = immersed_test_grid(joinpath(tmp, "bathymetry.nc"); size = (2, 3, 2))
+            forcing_config = test_forcing_config(data_root = tmp, relaxation_edge = :south)
+            write_prepared_forcing(
+                forcing_path(forcing_config);
+                size = (2, 3, 2),
+                names = ("T", "S"),
+                value = (name, index) -> name == "T" ? 6.0f0 : 30.0f0,
+            )
+            forcing = forcing_from_file(forcing_config; grid, tracers = (:T, :S))
+
+            bcs = lateral_tracer_open_boundary_conditions(grid, forcing, forcing_config, (:T, :S))
+            @test Set(keys(bcs)) == Set((:T, :S))
+            @test keys(bcs.T) == (:south,)
+
+            edge_bc = bcs.T.south
+            @test edge_bc.classification.scheme isa Oceananigans.BoundaryConditions.PerturbationAdvection
+            @test edge_bc.classification.scheme.inflow_timescale == forcing_config.relaxation_timescale
+            @test edge_bc.classification.scheme.outflow_timescale == forcing_config.relaxation_timescale
+
+            # The stored discrete function actually reads the forcing file's own exterior value at the
+            # true edge column (j = 1 for a south-relaxing setup, per the boundary_index this picks),
+            # not a stand-in — the check that closes the gap between "a scheme is attached" and "it
+            # reads the right data".
+            clock = (; time = 0.0)
+            @test edge_bc.condition.func(1, 1, grid, clock, NamedTuple(), edge_bc.condition.parameters) ≈ 6.0
+            @test bcs.S.south.condition.func(1, 1, grid, clock, NamedTuple(), bcs.S.south.condition.parameters) ≈ 30.0
+
+            # An edge (`:west`/`:east`) uses the x-face accessor and the un-off-by-one Center index —
+            # `grid.Nx`, not `grid.Nx + 1`, since a Center-located tracer has no face-row index.
+            east_config = test_forcing_config(data_root = tmp, relaxation_edge = :east)
+            east_bcs = lateral_tracer_open_boundary_conditions(grid, forcing, east_config, (:T,))
+            @test keys(east_bcs.T) == (:east,)
+            @test east_bcs.T.east.condition.parameters.boundary_index == grid.Nx
+
+            # Naming a tracer the forcing does not prepare is a configuration error, not a silently
+            # dropped boundary condition — the whole point of naming a relaxation edge is that the
+            # forcing supplies every simulated tracer there.
+            @test_throws ErrorException lateral_tracer_open_boundary_conditions(
+                grid, forcing, forcing_config, (:T, :not_prepared),
+            )
+        end
+    end
+
     @testset "MultiYearNORA3 fields" begin
         mktempdir() do tmp
             nora3_filename = "NORA3_test.nc"
@@ -1252,6 +1297,15 @@ end
             test_forcing_config(relaxation_edge = :up),
         )
 
+        # The band tapers rather than being uniform: full rate at the true edge, decreasing linearly
+        # to (but not reaching) zero at the band's inner edge.
+        tapered_config = test_forcing_config(relaxation_edge = :south, relaxation_cells = 2)
+        tapered = relaxation_lambda(wet, tapered_config)
+        rate_max = Float32(1 / tapered_config.relaxation_timescale)
+        @test all(==(rate_max), tapered[:, 1, 1])        # true edge (d = 0): full rate
+        @test all(==(rate_max / 2), tapered[:, 2, 1])    # one cell in (d = 1): half rate
+        @test all(iszero, tapered[:, 3, 1])              # outside the band entirely
+
         # Every cell resolves to the nearest valid source cell, so a fjord arm NorKyst treats as
         # land still receives data. Valid cells resolve to themselves.
         valid = falses(3, 3, 1)
@@ -1298,6 +1352,59 @@ end
         hourly_steps = @test_logs (:warn,) daily_time_steps(hourly)
         @test [step.date for step in hourly_steps] == [record.date for record in hourly]
         @test all(iszero(step.weight) for step in hourly_steps)
+    end
+
+    @testset "forcing terms" begin
+        forcing_term_x_flux = FjordSim.Forcing.forcing_term_x_flux
+        forcing_term_y_flux = FjordSim.Forcing.forcing_term_y_flux
+        forcing_term_relax = FjordSim.Forcing.forcing_term_relax
+        Ax = Oceananigans.Operators.Ax
+        Ay = Oceananigans.Operators.Ay
+        volume = Oceananigans.Operators.volume
+
+        mktempdir() do tmp
+            (; grid) = immersed_test_grid(joinpath(tmp, "bathymetry.nc"); size = (2, 3, 2))
+            i, j, k = 1, 1, 1
+            Ax_over_V = Ax(i, j, k, grid, Center(), Center(), Center()) /
+                        volume(i, j, k, grid, Center(), Center(), Center())
+            Ay_over_V = Ay(i, j, k, grid, Center(), Center(), Center()) /
+                        volume(i, j, k, grid, Center(), Center(), Center())
+
+            # Each formula is pinned against Oceananigans' own area/volume operators directly, rather
+            # than re-deriving the expected numbers by hand.
+            λ, flux = 3.7, 2.5
+            @test forcing_term_x_flux(λ, flux, i, j, k, grid) == flux * Ax_over_V
+            @test forcing_term_y_flux(λ, flux, i, j, k, grid) == flux * Ay_over_V
+
+            field, value = 12.0, 5.0
+            @test forcing_term_relax(0.3, value, i, j, k, grid, field) == -0.3 * (field - value)
+
+            # The `ForcingFromFile` kernel routes to the matching term by λ's sign/magnitude. No
+            # producer in this repo ever writes `|λ| > 1` (`relaxation_lambda` and the river forcing
+            # both stay inside `(-1, 1)`), so this is the only coverage of that routing at all.
+            forcing_config = test_forcing_config(data_root = tmp)
+
+            function forced_value(lambda)
+                write_prepared_forcing(
+                    forcing_path(forcing_config);
+                    size = (2, 3, 2),
+                    names = ("T",),
+                    value = (name, index) -> 4.0f0,
+                    lambda,
+                )
+                forcing = forcing_from_file(forcing_config; grid, tracers = (:T,))
+                clock = (; time = 0.0)
+                fields = (; T = zeros(Float64, 2, 3, 2))
+                return forcing.T(i, j, k, grid, clock, fields)
+            end
+
+            @test forced_value(2.0f0) ≈ 4.0 * Ax_over_V     # λ > 1 -> x-flux
+            @test forced_value(-2.0f0) ≈ 4.0 * Ay_over_V    # λ < -1 -> y-flux
+            # λ read back from the (Float32-written) file is promoted to Float64 from the *rounded*
+            # Float32 value, so the expected value is derived the same way rather than from a Float64
+            # literal that would differ in the last bit.
+            @test forced_value(0.3f0) ≈ -Float64(0.3f0) * (0.0 - 4.0)  # |λ| < 1 -> relaxation, field = 0
+        end
     end
 
     @testset "water mask" begin
@@ -2377,6 +2484,18 @@ end
             )
             @test edge_bc isa BoundaryCondition{<:Oceananigans.BoundaryConditions.NormalFlow}
 
+            # The tracer open boundary landed on the same edge, on T and S, with a real
+            # PerturbationAdvection scheme — proving the wiring reaches a real model, not just the
+            # isolated `lateral_tracer_open_boundary_conditions` function.
+            for name in (:T, :S)
+                tracer_edge_bc = getproperty(
+                    getproperty(ocean_model.tracers, name).boundary_conditions,
+                    config.forcing_config.relaxation_edge,
+                )
+                @test tracer_edge_bc.classification.scheme isa
+                      Oceananigans.BoundaryConditions.PerturbationAdvection
+            end
+
             # The snapshot writer records `start_date`, which is the only thing that lets a later
             # `FromResults(path, date)` turn a date into a record — a snapshot's own time axis is
             # seconds from model zero and says nothing about the calendar.
@@ -2435,6 +2554,42 @@ end
 
             # A loop count below one is rejected before anything is read or allocated.
             @test_throws ArgumentError build_simulation(fjord(loops = 0))
+        end
+    end
+
+    @testset "run! smoke test" begin
+        # No other test in this suite calls `run!`/`time_step!` for real — every other
+        # `build_simulation` call either stops at a prerequisite check or inspects the assembled
+        # model without stepping it. This is the check that would actually catch a `NaN` entering
+        # through the new tracer open boundary condition (or any other boundary-condition wiring),
+        # rather than just asserting object types.
+        mktempdir() do tmp
+            Nx, Ny, Nz = 16, 16, 8
+            bathymetry_config = test_bathymetry_config(data_root = tmp)
+            (; grid_config) = immersed_test_grid(
+                bathymetry_path(bathymetry_config);
+                size = (Nx, Ny, Nz),
+                halo = (7, 7, 7),
+            )
+
+            forcing_config = test_forcing_config(data_root = tmp)
+            write_prepared_forcing(forcing_path(forcing_config); size = (Nx, Ny, Nz))
+
+            config = FjordConfig(;
+                grid_config,
+                bathymetry_config,
+                forcing_config,
+                simulation_config = test_simulation_config(results_root = tmp),
+            )
+
+            simulation = build_simulation(config)
+            run!(simulation)
+
+            ocean_model = simulation.model.ocean.model
+            @test all(isfinite, interior(ocean_model.velocities.u))
+            @test all(isfinite, interior(ocean_model.velocities.v))
+            @test all(isfinite, interior(ocean_model.tracers.T))
+            @test all(isfinite, interior(ocean_model.tracers.S))
         end
     end
 end

@@ -47,7 +47,8 @@ export forcing_from_file,
     river_series,
     river_search_radius,
     RiverLocation,
-    OF800RiversConfig
+    OF800RiversConfig,
+    boundary_value_time_series
 
 """ Custom backend for FieldTimeSeries """
 struct NetCDFBackend <: AbstractInMemoryBackend{Int}
@@ -102,13 +103,33 @@ on_architecture(to, forcing::ForcingFromFile) = ForcingFromFile(
     on_architecture(to, forcing.field_name),
 )
 
-""" x direction """
-function forcing_term_u(λ, flux, i, j, k, grid, args...)
+"""
+    forcing_term_x_flux(λ, flux, i, j, k, grid, args...)
+
+Convert a face-crossing flux density `flux` (units `[C]·length/time`, e.g. a tracer flux in
+`units(C)·m/s`) entering cell `(i, j, k)` through its x-face into a volumetric tendency for
+whatever field the caller applies it to, mirroring one face-term of Oceananigans' own divergence
+operator `∇·f = (1/V)[δx(Ax·fx) + ...]` — but one-sided (a source, not a two-face divergence).
+
+Only dimensionally valid for a tracer-like field: a velocity tendency needs acceleration units,
+which nothing here supplies. `ForcingFromFile` is generic in `field_name`, so this is reachable for
+any field whose `λ` happens to fall in `λ > 1` — it is the caller's responsibility to only route a
+field here when `flux` really is a flux density for that field. There is currently no producer of
+this `λ` regime at all (`relaxation_lambda` and the river forcing both always write
+`|λ| = 1/relaxation_timescale < 1`), so this function is unreachable in practice; it is kept, named
+honestly, for the day a producer of `λ > 1` exists.
+"""
+function forcing_term_x_flux(λ, flux, i, j, k, grid, args...)
     return flux * Ax(i, j, k, grid, Center(), Center(), Center()) / volume(i, j, k, grid, Center(), Center(), Center())
 end
 
-""" y direction """
-function forcing_term_v(λ, flux, i, j, k, grid, args...)
+"""
+    forcing_term_y_flux(λ, flux, i, j, k, grid, args...)
+
+As `forcing_term_x_flux`, for a flux entering through the y-face (`Ay` in place of `Ax`). Reached
+when `λ < -1`.
+"""
+function forcing_term_y_flux(λ, flux, i, j, k, grid, args...)
     return flux * Ay(i, j, k, grid, Center(), Center(), Center()) / volume(i, j, k, grid, Center(), Center(), Center())
 end
 
@@ -126,12 +147,12 @@ Return a result to be added to the tendency contributions (a kernel function).
     result = 0.0
     result += @inbounds ifelse(
         λ > 1 && value > -990,
-        forcing_term_u(λ, value, i, j, k, grid, fields[i, j, k, p.field_name]),
+        forcing_term_x_flux(λ, value, i, j, k, grid, fields[i, j, k, p.field_name]),
         0,
     )
     result += @inbounds ifelse(
         λ < -1 && value > -990,
-        forcing_term_v(λ, value, i, j, k, grid, fields[i, j, k, p.field_name]),
+        forcing_term_y_flux(λ, value, i, j, k, grid, fields[i, j, k, p.field_name]),
         0,
     )
     result += @inbounds ifelse(
@@ -240,6 +261,21 @@ function forcing_get_tuple(
     result = NamedTuple{(Symbol(variable_name),)}((_forcing,))
     return result
 end
+
+"""
+    boundary_value_time_series(forcing, name)
+
+The `FieldTimeSeries` of prescribed exterior values `forcing_from_file` built for `name` — the same
+series `ForcingFromFile` already relaxes the interior band towards. Reused unchanged as the exterior
+value a lateral tracer open boundary condition relaxes towards at the domain edge itself:
+`prepare_forcing` already writes valid (non-`NaN`) data there for every field it prepares, since a
+Center-located tracer cell at the true edge is an ordinary active cell, not a halo — no masking
+special-case is needed the way the velocity face row needed `open_boundary_water!`.
+
+`forcing` is the named tuple `forcing_from_file` returns; `name` one of its keys — typically `:T`
+or `:S`.
+"""
+boundary_value_time_series(forcing, name::Symbol) = getproperty(forcing, name).fts_value
 
 """
 Return a named tuple of forcing functions for all available variables in a NetCDF file.
@@ -524,9 +560,10 @@ bathymetry. Only the target nodes, mask and output buffer are moved to the inter
 and only the finished slab comes back for each write, so a GPU run keeps the same streaming
 memory profile.
 
-Relaxation lambdas are `1 / config.relaxation_timescale` in the `config.relaxation_cells`-wide
-band along `config.relaxation_edge` and zero elsewhere, so only that band relaxes towards the
-source data.
+Relaxation lambdas taper linearly from `1 / config.relaxation_timescale` at the true edge to `0` at
+the inner edge of the `config.relaxation_cells`-wide band along `config.relaxation_edge`, and are
+zero elsewhere, so only that band relaxes towards the source data, most strongly right at the
+boundary.
 
 # Why the interpolation is not `NumericalEarth`'s
 
@@ -1136,11 +1173,32 @@ function interpolate_to_target!(output, source_field, x, y, z, mask, architectur
 end
 
 """
+    edge_distance(edge, i, j, Nx, Ny)
+
+Distance, in cells, of `(i, j)` from the true domain edge named by `edge` — `0` at the
+boundary-most row/column, increasing inward. Used to taper `relaxation_lambda`.
+"""
+function edge_distance(edge, i, j, Nx, Ny)
+    if edge === :south
+        return j - 1
+    elseif edge === :north
+        return Ny - j
+    elseif edge === :west
+        return i - 1
+    else
+        return Nx - i
+    end
+end
+
+"""
     relaxation_lambda(mask, config::AbstractForcingConfig)
 
-Relaxation rates for one variable: `1 / config.relaxation_timescale` in the water cells of the
-`config.relaxation_cells`-wide band along `config.relaxation_edge`, zero everywhere else.
-`|λ| < 1` routes the forcing through `forcing_term_relax`.
+Relaxation rates for one variable, in the water cells of the `config.relaxation_cells`-wide band
+along `config.relaxation_edge`, zero everywhere else. `config.relaxation_timescale` is the rate at
+the boundary-most cell (`1 / config.relaxation_timescale`), tapering linearly to `0` at the inner
+edge of the band — standard sponge/flow-relaxation-zone practice, rather than one uniform rate
+across the whole band, so the true edge relaxes strongly and the interior only weakly. `|λ| < 1`
+routes the forcing through `forcing_term_relax`.
 """
 function relaxation_lambda(mask, config::AbstractForcingConfig)
     config.relaxation_cells >= 0 || throw(ArgumentError("relaxation_cells must be >= 0"))
@@ -1161,8 +1219,10 @@ function relaxation_lambda(mask, config::AbstractForcingConfig)
     end
 
     lambda = zeros(Float32, Nx, Ny, Nz)
-    rate = Float32(1 / config.relaxation_timescale)
+    rate_max = Float32(1 / config.relaxation_timescale)
     for k = 1:Nz, j in y_range, i in x_range
+        distance = edge_distance(edge, i, j, Nx, Ny)
+        rate = rate_max * (cells - distance) / cells
         mask[i, j, k] && (lambda[i, j, k] = rate)
     end
 
