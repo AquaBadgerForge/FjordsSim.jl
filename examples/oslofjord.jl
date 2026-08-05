@@ -408,7 +408,7 @@ grid_config = EvenGrid(
 # Named rather than inlined into `NorKystConfig` below: the boundary sponge needs the same values
 # to place its mask on the same edge and band the open boundary condition uses.
 relaxation_edge = :south
-relaxation_cells = 10
+relaxation_cells = 0
 
 # A `let` block, not a bare top-level `sponge_ν(λ, φ, z, t) = ...` reading a global `sponge_mask`:
 # this closure runs inside a GPU-compiled kernel (`HorizontalScalarDiffusivity`'s `ν`), and a
@@ -447,27 +447,28 @@ FjordConfig(
         geonorge_cache        = true,
         regrid_cache          = false,
     ),
-    forcing_config = NorKystConfig(
-        data_root            = data_root,
-        output_directory     = "norkyst",
-        # Regridded fresh against the fixed bathymetry above rather than sharing `oslofjorden()`'s
-        # `forcing.nc`: `prepare_forcing`'s land/water mask is built from the bathymetry at
-        # regrid time (`water_mask`, via `peripheral_node`), so a copy regridded against the
-        # original shallow depths would still carry `NaN` at the vertical levels the floor newly
-        # made active — exactly the mismatch this variant's boundary instability was traced to.
-        output_file          = "forcing_boundary_fixed.nc",
-        plot_file            = "forcing_boundary_fixed.png",
-        relaxation_edge      = relaxation_edge,
-        relaxation_cells     = relaxation_cells,
-        relaxation_timescale = 86400.0,
-        architecture         = :auto,
-        parameters           = ["temperature", "salinity", "u_eastward", "v_northward"],
-        years                = [2020],
-        rivers               = OF800RiversConfig(
-            data_root   = data_root,
-            output_file = "forcing_rivers_boundary_fixed.nc",
-        ),
-    ),
+    forcing_config = nothing,
+    # forcing_config = NorKystConfig(
+    #     data_root            = data_root,
+    #     output_directory     = "norkyst",
+    #     # Regridded fresh against the fixed bathymetry above rather than sharing `oslofjorden()`'s
+    #     # `forcing.nc`: `prepare_forcing`'s land/water mask is built from the bathymetry at
+    #     # regrid time (`water_mask`, via `peripheral_node`), so a copy regridded against the
+    #     # original shallow depths would still carry `NaN` at the vertical levels the floor newly
+    #     # made active — exactly the mismatch this variant's boundary instability was traced to.
+    #     output_file          = "forcing_boundary_fixed.nc",
+    #     plot_file            = "forcing_boundary_fixed.png",
+    #     relaxation_edge      = relaxation_edge,
+    #     relaxation_cells     = relaxation_cells,
+    #     relaxation_timescale = 86400.0,
+    #     architecture         = :auto,
+    #     parameters           = ["temperature", "salinity", "u_eastward", "v_northward"],
+    #     years                = [2020],
+    #     rivers               = OF800RiversConfig(
+    #         data_root   = data_root,
+    #         output_file = "forcing_rivers_boundary_fixed.nc",
+    #     ),
+    # ),
     atmosphere_config = NORA3Config(
         data_root        = data_root,
         output_directory = "nora3",

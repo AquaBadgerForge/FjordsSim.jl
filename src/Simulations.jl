@@ -519,10 +519,14 @@ end
 
 Which prepared forcing file the simulation reads: the rivers-augmented copy `add_rivers` wrote
 when the setup names rivers, so they are never silently dropped, and the file `prepare_forcing`
-wrote when it does not. Dispatched on `config.rivers` exactly like `add_rivers`.
+wrote when it does not. Dispatched on `config.rivers` exactly like `add_rivers` — or `nothing`,
+for a setup naming no forcing at all.
 """
-simulation_forcing_path(config::FjordConfig) =
-    simulation_forcing_path(config.forcing_config, config.forcing_config.rivers)
+simulation_forcing_path(config::FjordConfig) = simulation_forcing_path(config.forcing_config)
+
+simulation_forcing_path(::Nothing) = nothing
+simulation_forcing_path(config::AbstractForcingConfig) =
+    simulation_forcing_path(config, config.rivers)
 
 simulation_forcing_path(config::AbstractForcingConfig, ::Nothing) = forcing_path(config)
 simulation_forcing_path(::AbstractForcingConfig, rivers::AbstractRiverConfig) =
@@ -535,6 +539,26 @@ The subcommand that writes the file `simulation_forcing_path` picked, for its er
 """
 forcing_prerequisite(::Nothing) = "prepare_forcing"
 forcing_prerequisite(::AbstractRiverConfig) = "add_rivers"
+
+"""
+    resolve_forcing_file(config::FjordConfig)
+
+The prepared forcing file `build_simulation` reads: `simulation_forcing_path(config)`, checked to
+exist and reported by the step that writes it if it does not — or `nothing`, for a setup naming
+no forcing at all, which is not a prerequisite to check.
+"""
+resolve_forcing_file(config::FjordConfig) = resolve_forcing_file(config.forcing_config)
+
+resolve_forcing_file(::Nothing) = nothing
+
+function resolve_forcing_file(forcing_config::AbstractForcingConfig)
+    forcing_file = simulation_forcing_path(forcing_config)
+    isfile(forcing_file) || error(
+        "Prepared forcing $forcing_file does not exist. Run `julia --project -m FjordSim " *
+        "$(forcing_prerequisite(forcing_config.rivers))` for this setup first.",
+    )
+    return forcing_file
+end
 
 """
     validate_time_coverage(label, range, start_date, stop_time, remedy)
@@ -573,6 +597,8 @@ forcing_date_range(filepath) = NCDataset(filepath) do ds
     dates = ds["time"][:]
     (first(dates), last(dates))
 end
+
+forcing_date_range(::Nothing) = nothing
 
 """
     loop_output_path(writer, config, loop)
@@ -966,11 +992,7 @@ function build_simulation(config::FjordConfig)
         "Run `julia --project -m FjordSim prepare_bathymetry` for this setup first.",
     )
 
-    forcing_file = simulation_forcing_path(config)
-    isfile(forcing_file) || error(
-        "Prepared forcing $forcing_file does not exist. Run `julia --project -m FjordSim " *
-        "$(forcing_prerequisite(config.forcing_config.rivers))` for this setup first.",
-    )
+    forcing_file = resolve_forcing_file(config)
 
     simulation_config.loops >= 1 ||
         throw(ArgumentError("loops must be at least 1, got $(simulation_config.loops)"))

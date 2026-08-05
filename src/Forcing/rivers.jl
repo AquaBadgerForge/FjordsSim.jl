@@ -172,7 +172,8 @@ end
     add_rivers(target_grid, config::AbstractForcingConfig)
 
 Write river relaxation on top of the forcing file prepared by `prepare_forcing`, into the copy
-at `river_forcing_path(config.rivers)`. Returns `nothing` when the setup has no rivers.
+at `river_forcing_path(config.rivers)`. Returns `nothing` when the setup has no rivers, or no
+forcing at all.
 
 Rivers enter as relaxation, not as a mass flux: each river cell gets its value and a lambda of
 `1 / relaxation_timescale` at the surface level, for every time step. That lambda is well
@@ -186,6 +187,7 @@ with, and downloads the river data first. The original forcing file is never mod
 step can be re-run without redoing `prepare_forcing`.
 """
 function add_rivers(config::FjordConfig)
+    isnothing(config.forcing_config) && return nothing
     rivers = config.forcing_config.rivers
     isnothing(rivers) && return nothing
 

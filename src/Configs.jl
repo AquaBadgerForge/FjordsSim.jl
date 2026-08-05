@@ -461,7 +461,8 @@ functions taking it are untouched. Each instantiation still has concrete field t
 # Fields
 - `grid_config`: any `AbstractGridConfig`.
 - `bathymetry_config`: any `AbstractBathymetryConfig`.
-- `forcing_config`: any `AbstractForcingConfig`.
+- `forcing_config`: any `AbstractForcingConfig`, or `nothing` for a setup that runs with no
+  forcing at all. Defaults to `nothing`, so a setup opts in by naming one.
 - `atmosphere_config`: any `AbstractAtmosphereConfig`, or `nothing` for a setup that prepares no
   atmosphere. Defaults to `nothing`, so a setup opts in by naming one.
 - `simulation_config`: any `AbstractSimulationConfig`, or `nothing` for a setup that is only
@@ -480,13 +481,13 @@ Oceananigans.LatitudeLongitudeGrid(architecture, config::SingleColumn) = ...  # 
 Base.@kwdef mutable struct FjordConfig{
     G<:AbstractGridConfig,
     B<:AbstractBathymetryConfig,
-    F<:AbstractForcingConfig,
+    F,
     A,
     S,
 }
     grid_config::G
     bathymetry_config::B
-    forcing_config::F
+    forcing_config::F = nothing
     atmosphere_config::A = nothing
     simulation_config::S = nothing
 end

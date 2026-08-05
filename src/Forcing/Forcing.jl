@@ -341,6 +341,15 @@ contract fixed by the read side, not a per-source detail — see `AbstractForcin
 simulation_forcing(config::AbstractForcingConfig, grid, filepath, tracers, reference_date) =
     forcing_from_file(; grid, filepath, tracers, reference_date)
 
+"""
+    simulation_forcing(::Nothing, grid, filepath, tracers, reference_date)
+
+No forcing term at all, for a setup whose `forcing_config` is `nothing`: `coupled_simulation`
+still receives a splattable `forcing` keyword, just an empty one, which is exactly
+`HydrostaticFreeSurfaceModel`'s own default.
+"""
+simulation_forcing(::Nothing, grid, filepath, tracers, reference_date) = NamedTuple()
+
 # --- Forcing preparation ---
 
 const FORCING_DEFLATE_LEVEL = 5
@@ -430,6 +439,8 @@ grid is passed rather than the grid config because a dataset needs the domain bo
 """
 download_forcing(config::FjordConfig) =
     download_forcing(LatitudeLongitudeGrid(CPU(), config.grid_config), config.forcing_config)
+
+download_forcing(target_grid, ::Nothing) = nothing
 
 """
     validate_relaxation_edge(edge)
@@ -628,10 +639,13 @@ function prepare_forcing(target_grid, config::AbstractForcingConfig; coverage = 
     return (; output_file, times = [step.date for step in steps], variables = [variable.name for variable in variables])
 end
 
+prepare_forcing(target_grid, ::Nothing; coverage = nothing) = nothing
+
 """
     prepare_forcing(config::FjordConfig)
 
 Regrid the forcing a whole setup names onto its simulation grid, and write the diagnostic plot.
+Returns `nothing` when the setup names no forcing.
 
 This is the setup-level driver, the same shape as `download_forcing(config::FjordConfig)`. The
 grid comes from the processed bathymetry rather than the grid config, so the output's land mask
@@ -646,6 +660,8 @@ the setup describes; a setup naming no simulation config gets `nothing` and the 
 The `prepare_forcing(target_grid, config)` named tuple with `plot_file` added.
 """
 function prepare_forcing(config::FjordConfig)
+    isnothing(config.forcing_config) && return nothing
+
     bathymetry_file = bathymetry_path(config.bathymetry_config)
     isfile(bathymetry_file) || error(
         "Processed bathymetry $bathymetry_file does not exist. " *
