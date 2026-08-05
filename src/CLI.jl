@@ -232,12 +232,19 @@ because that is a property of the setup and not a failure.
 A failure is caught rather than propagated: under `tee_output` an exception left to `Base._start`
 would be printed after the redirect had already been torn down, so the error — the one thing worth
 having in the log — would be the only thing missing from it.
+
+`driver` runs through `Base.invokelatest` because `config` may carry types and methods that did not
+exist until `fjord_config` loaded them: an out-of-tree `--config path.jl` file is `Base.include`d
+from within this same `main` call, and any new struct or method it defines is invisible to code
+already running in the world active when `main` started — a plain `driver(config)` would throw
+"method too new" the first time a config file adds a new dispatch, e.g. a new
+`AbstractBoundaryConditionConfig` subtype, rather than only new field values.
 """
 function run_step(driver, config, subcommand, setup)
     @info "Setup: $setup, step: $subcommand"
 
     try
-        isnothing(driver(config)) &&
+        isnothing(Base.invokelatest(driver, config)) &&
             @info "$subcommand is a no-op for $setup: the setup does not configure it"
         return 0
     catch exception
