@@ -9,9 +9,13 @@ export AbstractGridConfig,
     AbstractCoupledSimulationConfig,
     AbstractFreeSurfaceConfig,
     AbstractBoundaryConditionConfig,
+    AbstractBoundaryConditionSetConfig,
     AbstractWriterConfig,
+    AbstractCallbackConfig,
     AbstractTimeSteppingConfig,
     FjordConfig,
+    domain_grid,
+    simulation_grid,
     bathymetry_path,
     forcing_path,
     forcing_directory,
@@ -42,11 +46,53 @@ Supertype for grid configurations. A concrete subtype describes how to build the
 grid.
 
 # Methods a subtype provides
-- `LatitudeLongitudeGrid(architecture, config)`: build the grid. Required.
+- `domain_grid(config, architecture)`: the bare grid, with no bathymetry. Required. Every
+  `prepare_*` pipeline builds its target geometry with this.
+- `simulation_grid(config, bathymetry_file, architecture)`: the grid the simulation runs on, with
+  the processed bathymetry immersed into it. Required. `build_simulation` and
+  `prepare_forcing(config::FjordConfig)` both read the model grid back through this.
 
-`FjordSim.Grids.EvenGrid` is the built-in implementation.
+Both are FjordSim generics rather than methods on `Oceananigans.LatitudeLongitudeGrid` and
+`Oceananigans.ImmersedBoundaries.ImmersedBoundaryGrid`, which is what the grid hook used to be.
+Those names state a *result* type, so a config describing a rectilinear, single-column or
+curvilinear grid could not implement the hook under either name without lying about what it
+returns. These two name the *role* instead, leaving the return type to the subtype.
+
+`FjordSim.Grids.EvenGrid` is the built-in implementation, and returns a `LatitudeLongitudeGrid`
+and an `ImmersedBoundaryGrid` wrapping one.
 """
 abstract type AbstractGridConfig end
+
+"""
+    domain_grid(config::AbstractGridConfig, architecture)
+
+The bare grid a config describes, with no bathymetry immersed into it.
+
+The geometry every `prepare_*` pipeline regrids onto, and the underlying grid `simulation_grid`
+wraps. Declared with no method, so a subtype that does not implement it fails as a `MethodError`
+naming the hook rather than silently inheriting some other config's idea of a grid.
+
+Named for the role rather than for a result type — it replaced a method on
+`Oceananigans.LatitudeLongitudeGrid`, under which a config describing a rectilinear, single-column
+or curvilinear grid could not have implemented the hook without lying about what it returns.
+
+Declared here rather than in `Grids`, which is where its `EvenGrid` method lives: `Bathymetry`,
+`Atmospheres` and `Forcing` all call it and are all included *before* `Grids`, so the generic has to
+exist in a module they can already see.
+"""
+function domain_grid end
+
+"""
+    simulation_grid(config::AbstractGridConfig, bathymetry_file, architecture)
+
+The grid the simulation runs on: `domain_grid`'s geometry with the processed bathymetry immersed
+into it.
+
+Separate from `domain_grid` because the two are needed at different moments and from different
+inputs — the prepare steps have no bathymetry file yet, while `build_simulation` must read back the
+very grid the bathymetry was written on. Declared here for the same include-order reason.
+"""
+function simulation_grid end
 
 """
     AbstractBathymetryConfig
@@ -97,6 +143,11 @@ how to download and subset it.
   rather than resolving it. Optional; defaults to `forcing_from_file`, the FjordSim NetCDF layout
   every built-in source already writes. A source whose prepared files are not that contract
   overrides it.
+- `forcing_date_range(config, filepath)`: first and last date the prepared file covers, as a
+  `(first, last)` tuple, or `nothing` to skip the check. Optional; defaults to reading `ds["time"]`
+  from the prepared NetCDF. The mirror of `atmosphere_date_range`, and a source that overrode
+  `simulation_forcing` to read a different layout overrides this too — otherwise
+  `validate_time_coverage` would check its coverage with a reader it does not use.
 
 `FjordSim.Forcing.NorKystConfig` is the built-in implementation, for NorKyst-800m;
 `src/Forcing/norkyst.jl` is the template to copy for a new dataset.
@@ -184,7 +235,7 @@ the grid, and the knobs for the ones that do.
 Unlike the other supertypes this one declares **fields only, no hooks**. `build_simulation` is
 generic over the whole `FjordConfig` rather than over a simulation source, because everything
 dataset-specific — which forcing file, which atmosphere reader — already comes from the other
-configs. What *is* dispatched on lives one level down, in the four nested configs below, each of
+configs. What *is* dispatched on lives one level down, in the five nested configs below, each of
 which has its own supertype and its own hook.
 
 # Fields a subtype provides
@@ -194,16 +245,16 @@ which has its own supertype and its own hook.
 - `architecture`: `:auto`, `:cpu` or `:gpu`, resolved by `simulation_architecture`.
 - `model`: an `AbstractCoupledSimulationConfig` — what the model *is*, assembled by
   `coupled_simulation`.
-- `boundary_conditions`: a tuple of `AbstractBoundaryConditionConfig`s, merged by
-  `FjordSim.BoundaryConditions.field_boundary_conditions`. Tuple order is merge precedence.
+- `boundary_conditions`: an `AbstractBoundaryConditionSetConfig`, materialized by
+  `FjordSim.BoundaryConditions.field_boundary_conditions`.
 - `writers`: a tuple of `AbstractWriterConfig`s, attached by `attach_writer!`.
+- `callbacks`: a tuple of `AbstractCallbackConfig`s, attached by `attach_callback!`.
 - `time_stepping`: an `AbstractTimeSteppingConfig`, attached by `attach_time_stepping!`.
 - `initial_conditions`: where the ocean state starts from, resolved by
   `FjordSim.Simulations.resolve_initial_conditions` before it reaches `coupled_simulation`.
 - `start_date`: the calendar instant model time zero stands for. Read by `coverage_window` as well
   as by `build_simulation`.
-- `stop_time`, `loops`, `progress_interval`, `pickup`: run control, read by `build_simulation` and
-  `run_simulation`.
+- `stop_time`, `loops`, `pickup`: run control, read by `build_simulation` and `run_simulation`.
 
 `results_root`, `start_date` and `stop_time` are the supertype-level minimum: the first is what
 `FjordSim.CLI.log_path` and `results_path` root against, and the other two are what
@@ -259,21 +310,44 @@ abstract type AbstractFreeSurfaceConfig end
 Supertype for boundary-condition configurations. A concrete subtype describes one *contribution* to
 the model's boundary conditions, and its `boundary_conditions` method builds that contribution.
 
-A simulation config names a **tuple** of these rather than one, so a setup composes its boundaries
-out of independent pieces — surface fluxes and bottom drag are one statement, an open lateral edge
-another — and opts out of a piece by leaving it out. `field_boundary_conditions` merges the tuple
-with `FjordSim.Utils.recursive_merge` and materializes the result, so each method returns the
-*nested named tuple* shape (`(u = (top = …, bottom = …), T = (top = …,))`), not
+A setup composes its boundaries out of several of these — air-sea fluxes, bottom drag and an open
+lateral edge are three independent statements — and opts out of a piece by leaving it out. They are
+collected by an `AbstractBoundaryConditionSetConfig`, whose built-in `MergedBoundaryConditions`
+merges them with `FjordSim.Utils.recursive_merge` and materializes the result. So each method here
+returns the *nested named tuple* shape (`(u = (top = …, bottom = …), T = (top = …,))`), not
 `FieldBoundaryConditions`.
 
 # Methods a subtype provides
-- `boundary_conditions(config, grid, forcing, forcing_config, tracers)`: the nested named tuple this
-  piece contributes. Required.
+- `boundary_condition_sides(config, grid, forcing, forcing_config, tracers)`: the nested named tuple
+  this piece contributes, keyed by field and then by side. Required.
 
-`FjordSim.BoundaryConditions.TopBottomFluxes` and `FjordSim.BoundaryConditions.OpenLateralBoundary`
-are the built-in implementations.
+`FjordSim.BoundaryConditions.AirSeaFluxes`, `FjordSim.BoundaryConditions.QuadraticBottomDrag` and
+`FjordSim.BoundaryConditions.OpenLateralBoundary` are the built-in implementations.
 """
 abstract type AbstractBoundaryConditionConfig end
+
+"""
+    AbstractBoundaryConditionSetConfig
+
+Supertype for boundary-condition *set* configurations. A concrete subtype collects the individual
+`AbstractBoundaryConditionConfig` contributions and materializes them into the object the model
+consumes.
+
+Two supertypes rather than one because the two answer different questions, and only the second was
+previously dispatched on anything: a contribution says *what* one piece of the boundary is, while a
+set says *how* the pieces combine and *what shape* the result takes. That second question used to be
+answered by `field_boundary_conditions(configs::Tuple, …)` — dispatch on a bare `Tuple`, which no
+subtype can specialize and which states nothing about what the tuple means. A model whose boundary
+objects are not Oceananigans `FieldBoundaryConditions`, or that wants something other than
+last-wins merging, is now a new subtype here rather than an edit to that function.
+
+# Methods a subtype provides
+- `field_boundary_conditions(config, grid, forcing, forcing_config, tracers)`: the materialized
+  boundary conditions, as the `NamedTuple` the model constructor consumes. Required.
+
+`FjordSim.BoundaryConditions.MergedBoundaryConditions` is the built-in implementation.
+"""
+abstract type AbstractBoundaryConditionSetConfig end
 
 """
     AbstractWriterConfig
@@ -305,6 +379,32 @@ the method's business, not the caller's.
 implementations.
 """
 abstract type AbstractWriterConfig end
+
+"""
+    AbstractCallbackConfig
+
+Supertype for callback configurations. A concrete subtype describes one thing a run does *while* it
+runs — report progress, accumulate a diagnostic, watch for a stopping condition — and its
+`attach_callback!` method installs it on the simulation.
+
+The same shape as `AbstractWriterConfig`, and for the same reason: what a run reports used to be a
+single hardcoded `Callback(progress, TimeInterval(config.progress_interval))` under the fixed key
+`:progress`, so changing the report, the schedule type, or adding a second diagnostic all meant
+rewriting `build_simulation`. A tuple of these makes each of those a config choice, and a setup that
+wants a silent run names an empty tuple.
+
+# Fields a subtype provides
+- `name`: the key it occupies in `simulation.callbacks`. Two callbacks under one name replace each
+  other, which `FjordSim.Simulations.validate_callbacks` rejects.
+
+# Methods a subtype provides
+- `attach_callback!(simulation, callback, config)`: attach this callback. Required. Which simulation
+  it attaches to — the coupled one or the ocean sub-simulation — is the method's business, exactly
+  as it is for a writer.
+
+`FjordSim.Simulations.ProgressCallback` is the built-in implementation.
+"""
+abstract type AbstractCallbackConfig end
 
 """
     AbstractTimeSteppingConfig
@@ -475,7 +575,8 @@ struct SingleColumn <: AbstractGridConfig
     depth::Float64
 end
 
-Oceananigans.LatitudeLongitudeGrid(architecture, config::SingleColumn) = ...  # new behavior
+FjordSim.domain_grid(config::SingleColumn, architecture) = ...      # new behavior
+FjordSim.simulation_grid(config::SingleColumn, file, architecture) = ...
 ```
 """
 Base.@kwdef mutable struct FjordConfig{

@@ -100,10 +100,17 @@ function drammensfjorden()
                 # Overloads free_surface(config, grid) — its own hook, called from inside
                 # coupled_simulation once the grid exists.
                 free_surface       = SplitExplicitFreeSurfaceConfig(cfl = 0.7),
+                # Anything else the four constructors coupled_simulation calls accept, one slot
+                # each: :ocean_model, :ocean_simulation, :coupled_model, :coupled_simulation.
+                # Nothing extra here, but stated rather than defaulted like every other field.
+                extra_kwargs       = (;),
             ),
-            # Both overload boundary_conditions — the hook field_boundary_conditions merges.
-            boundary_conditions = (
-                TopBottomFluxes(bottom_drag_coefficient = 0.003),
+            # MergedBoundaryConditions overloads field_boundary_conditions; each piece inside it
+            # overloads boundary_condition_sides. Air-sea fluxes and quadratic bottom drag are
+            # separate pieces, so either can be swapped alone.
+            boundary_conditions = MergedBoundaryConditions(
+                AirSeaFluxes(),
+                QuadraticBottomDrag(coefficient = 0.003),
                 OpenLateralBoundary(),
             ),
             # Overloads attach_writer!. Snapshots only: a 30-day trial run has nothing worth
@@ -118,6 +125,10 @@ function drammensfjorden()
                     overwrite_existing = true,
                 ),
             ),
+            # Overloads attach_callback! — what the run reports while it runs. `report` is the
+            # function itself, so a model whose tracers omit :T (which `progress` reads) names its
+            # own here instead. An empty tuple runs silently.
+            callbacks = (ProgressCallback(name = :progress, interval = 1hour, report = progress),),
             # Overloads attach_time_stepping! and initial_time_step.
             time_stepping = AdaptiveTimeStep(
                 initial_time_step    = 1second,
@@ -134,7 +145,6 @@ function drammensfjorden()
             start_date         = DateTime(2020, 1, 1),
             stop_time          = 30days,
             loops              = 1,
-            progress_interval  = 1hour,
             pickup             = false,
         ),
     )

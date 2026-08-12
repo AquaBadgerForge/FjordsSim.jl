@@ -16,17 +16,20 @@ using SeawaterPolynomials.TEOS10: TEOS10EquationOfState
 using NumericalEarth: FreezingLimitedOceanTemperature
 
 using ..Configs: FjordConfig
+using ..Utils: progress
 using ..Grids: EvenGrid
 using ..Bathymetry: DybdedataConfig
 using ..Atmospheres: NORA3Config
 using ..Forcing: NorKystConfig, OF800RiversConfig
-using ..BoundaryConditions: TopBottomFluxes, OpenLateralBoundary
+using ..BoundaryConditions:
+    AirSeaFluxes, QuadraticBottomDrag, OpenLateralBoundary, MergedBoundaryConditions
 using ..Simulations:
     SimulationConfig,
     CoupledHydrostaticSimulation,
     SplitExplicitFreeSurfaceConfig,
     SnapshotWriter,
     CheckpointWriter,
+    ProgressCallback,
     AdaptiveTimeStep,
     FromForcing,
     FromResults

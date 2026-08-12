@@ -84,18 +84,26 @@ modules, in `include` order from `src/FjordSim.jl`:
 
 1. **Configs** (`src/Configs.jl`) — the abstract supertypes `AbstractGridConfig`,
    `AbstractBathymetryConfig`, `AbstractForcingConfig`, `AbstractRiverConfig`,
-   `AbstractAtmosphereConfig` and `AbstractSimulationConfig`, plus the four the simulation config
-   nests — `AbstractCoupledSimulationConfig`, `AbstractBoundaryConditionConfig`,
-   `AbstractWriterConfig` and `AbstractTimeSteppingConfig` — plus `FjordConfig`, which holds a
+   `AbstractAtmosphereConfig` and `AbstractSimulationConfig`, plus the five the simulation config
+   nests — `AbstractCoupledSimulationConfig`, `AbstractBoundaryConditionSetConfig`,
+   `AbstractWriterConfig`, `AbstractCallbackConfig` and `AbstractTimeSteppingConfig` — plus
+   `AbstractBoundaryConditionConfig`, one level further down inside the boundary-condition set, and
+   `FjordConfig`, which holds a
    grid, bathymetry, forcing, atmosphere and simulation config (parametrically, so every
    instantiation stays concretely typed). `atmosphere_config` and `simulation_config` default to
    `nothing`, so a setup opts in by naming one. A river config hangs off the forcing config's
-   `rivers` field instead, where `nothing` means the setup has no rivers, and the four
+   `rivers` field instead, where `nothing` means the setup has no rivers, and the five
    simulation-level supertypes likewise hang off `SimulationConfig`'s `model`,
-   `boundary_conditions`, `writers` and `time_stepping`. A new grid, bathymetry
+   `boundary_conditions`, `writers`, `callbacks` and `time_stepping`. A new grid, bathymetry
    source, forcing dataset, river dataset or atmosphere dataset is
    added by subtyping the matching supertype and overloading methods on it — `FjordConfig` and its
-   callers are untouched. The path helpers defined on the supertypes live here too, so a new
+   callers are untouched.
+
+   The two grid hooks, `domain_grid` and `simulation_grid`, are also declared here rather than in
+   `Grids`, because `Bathymetry`, `Atmospheres` and `Forcing` all call `domain_grid` and are all
+   included before `Grids`.
+
+   The path helpers defined on the supertypes live here too, so a new
    source inherits them without loading the built-in source's module: `bathymetry_path`,
    `forcing_path`, `forcing_directory`, `river_forcing_path`, `atmosphere_path`,
    `atmosphere_directory`, `results_path`, and `plot_path` (one method per supertype). Each
@@ -378,25 +386,39 @@ modules, in `include` order from `src/FjordSim.jl`:
    `validate_river_download` rejects and deletes a downloaded file that starts with `<` instead
    of letting an HTML page masquerade as the data.
 
-8. **Boundary conditions** (`src/BoundaryConditions.jl`) — the `boundary_conditions` hook on
-   `AbstractBoundaryConditionConfig`, its two built-in configs, and the functions they wrap.
+8. **Boundary conditions** (`src/BoundaryConditions.jl`) — the `boundary_condition_sides` hook on
+   `AbstractBoundaryConditionConfig`, the `field_boundary_conditions` hook on
+   `AbstractBoundaryConditionSetConfig`, their built-in configs, and the functions they wrap.
 
-   A setup names a **tuple** of boundary-condition configs, so its boundaries are composed out of
-   independent pieces it can drop one at a time. `TopBottomFluxes(bottom_drag_coefficient)` wraps
-   `top_bottom_boundary_conditions`, which creates wind/heat/salt flux fields at the top and
-   quadratic bottom drag, returning a named tuple `(u, v, T, S)`. `OpenLateralBoundary()` carries no
-   fields at all and merges `open_boundary_conditions(Val(edge))` — the closed wall on the velocity
-   normal to the forcing config's `relaxation_edge` — with
+   **Two levels, two hooks.** A piece says *what* one part of the boundary is; a set says *how* the
+   pieces combine and *what shape* the result takes. `MergedBoundaryConditions(pieces...)` is the
+   built-in set: it merges every piece's `boundary_condition_sides` with `recursive_merge` (last
+   wins, so argument order is precedence; naming no pieces yields `(;)`) and materializes the result
+   into `FieldBoundaryConditions`. That second level used to be
+   `field_boundary_conditions(configs::Tuple, …)` — dispatch on a bare `Tuple`, which no subtype can
+   specialize, so the merge strategy and the `FieldBoundaryConditions` result shape were fixed for
+   every model FjordSim could assemble.
+
+   Three built-in pieces, so a setup composes its boundaries out of parts it can drop or swap one at
+   a time. `AirSeaFluxes()` creates the wind/heat/salt flux fields at the top;
+   `QuadraticBottomDrag(coefficient)` creates the bottom drag. Those two were one config,
+   `TopBottomFluxes`, fused behind `top_bottom_boundary_conditions` — but they share no computation,
+   and swapping a drag law should not mean restating the surface. `top_bottom_boundary_conditions`
+   remains as the one-line merge of both, which is the shape the tests assert against.
+   `OpenLateralBoundary()` carries no fields at all and merges `open_boundary_conditions(Val(edge))`
+   — the closed wall on the velocity normal to the forcing config's `relaxation_edge` — with
    `lateral_tracer_open_boundary_conditions`; both derive everything from the forcing config, so a
    second copy could only disagree with the interior relaxation band reading the same two fields.
 
-   `field_boundary_conditions(configs, grid, forcing, forcing_config, tracers)` merges the tuple with
-   `recursive_merge` (last wins, so tuple order is precedence; `()` yields `(;)`) and materializes it
-   into `FieldBoundaryConditions`. It has a **different name from the hook on purpose**: one name
-   returning a nested named tuple for a config and a materialized one for a tuple of them would be
-   two shapes behind one name, and a caller binding a local named `boundary_conditions` — which
-   `build_simulation` used to do — would shadow the hook. `boundary_conditions` is also the one hook
-   `FjordSim` does not re-export, since `Oceananigans.Fields.boundary_conditions` exists.
+   The two hooks have **different names on purpose**: one name returning a nested named tuple for a
+   piece and a materialized one for a set would be two shapes behind one name. The per-piece hook is
+   `boundary_condition_sides` — named for what it returns, the per-field *sides*
+   `field_boundary_conditions` binds as `sides` in its `map`. It was called `boundary_conditions`,
+   which collided with `Oceananigans.Fields.boundary_conditions`: that made it the one hook FjordSim
+   could not re-export, so an out-of-tree config had to reach it as
+   `FjordSim.BoundaryConditions.boundary_conditions`, and any caller binding a local of that name —
+   which `build_simulation` used to do — shadowed the hook. Renamed, it is exported like every other
+   hook, and the old name is gone rather than deprecated.
 
    `open_boundary_conditions` lives here rather than in `Simulations` because `Simulations` no longer
    composes boundary conditions at all. `BoundaryConditions` is included after `Forcing` and before
@@ -418,42 +440,88 @@ modules, in `include` order from `src/FjordSim.jl`:
    exactly the flux fields the interface writes.
 
 9. **Grids** (`src/Grids.jl`) — `EvenGrid <: AbstractGridConfig` (size, halo, longitude, latitude,
-   `z_faces`) with `LatitudeLongitudeGrid(architecture, config::EvenGrid)`, and a constructor
-   `ImmersedBoundaryGrid(filepath, architecture, halo)` that reads the processed bathymetry NetCDF and
-   returns an `ImmersedBoundaryGrid` wrapping a `LatitudeLongitudeGrid` with `PartialCellBottom`.
+   `z_faces`) and its two grid hooks, plus the constructors they wrap:
+   `LatitudeLongitudeGrid(architecture, config::EvenGrid)`, and
+   `ImmersedBoundaryGrid(filepath, architecture, halo)`, which reads the processed bathymetry NetCDF
+   and returns an `ImmersedBoundaryGrid` wrapping a `LatitudeLongitudeGrid` with `PartialCellBottom`.
    The loader still accepts legacy files with positive depths or swapped `lon`/`lat` axes.
 
+   The grid contract is **two hooks**, `domain_grid(config, architecture)` (the bare geometry every
+   `prepare_*` pipeline regrids onto) and `simulation_grid(config, bathymetry_file, architecture)`
+   (that geometry with the bathymetry immersed, which `build_simulation` and
+   `prepare_forcing(config::FjordConfig)` read the model grid back through). Two rather than one
+   because they are needed at different moments from different inputs: the prepare steps have no
+   bathymetry file yet.
+
+   Both are declared in **`Configs`**, not here, even though their `EvenGrid` methods live here:
+   `Bathymetry`, `Atmospheres` and `Forcing` all call `domain_grid` and are all included *before*
+   `Grids`, so the generic has to exist in a module they can already see.
+
+   They are FjordSim generics rather than methods on `Oceananigans.LatitudeLongitudeGrid` and
+   `ImmersedBoundaryGrid`, which is what the grid hook used to be. Those names state a *result*
+   type, so a config describing a rectilinear, single-column or curvilinear grid could not implement
+   the hook without lying about what it returns. The immersed half was worse: it was not a hook at
+   all — `build_simulation` reached into `config.grid_config.halo` and called
+   `ImmersedBoundaryGrid(file, arch, halo)` itself, so the grid config's only say in the grid the
+   simulation ran on was one field. Note the hook is **not** named `target_grid`: that is a
+   parameter name in ~112 places across the pipelines, and a function of the same name would shadow
+   every one of them.
+
 10. **Simulations** (`src/Simulations.jl`) — `SimulationConfig <: AbstractSimulationConfig`, the
-    `build_simulation`/`run_simulation` drivers, and the three of the four nested config
+    `build_simulation`/`run_simulation` drivers, and the four of the five nested config
     supertypes' built-in implementations that are not boundary conditions:
     `CoupledHydrostaticSimulation` with `coupled_simulation`, which assembles a
     `HydrostaticFreeSurfaceModel` inside an `OceanSeaIceModel` (NumericalEarth) and returns a
-    `Simulation`; `SnapshotWriter`/`CheckpointWriter` with `attach_writer!`; and `AdaptiveTimeStep`
-    with `attach_time_stepping!`. Included after `Grids`, which it reads the grid back through, and
-    before `Setups`, which constructs all of them.
+    `Simulation`; `SnapshotWriter`/`CheckpointWriter` with `attach_writer!`; `ProgressCallback` with
+    `attach_callback!`; and `AdaptiveTimeStep` with `attach_time_stepping!`. Included after `Grids`,
+    whose `simulation_grid` hook it reads the grid back through, and before `Setups`, which
+    constructs all of them.
 
     `coupled_simulation` lives here rather than in `src/FjordSim.jl` for that ordering reason: a
     function defined after the `include` block cannot be imported by a module included inside it.
 
-    `SimulationConfig` has 12 fields and 5 type parameters, one per nested config, and the split
+    `SimulationConfig` has 12 fields and 6 type parameters, one per nested config, and the split
     between it and them is by *what dispatches on what* rather than by convenience. Everything
     grid-independent about the model — `buoyancy`, `closure`, `tracer_advection`,
     `momentum_advection`, `tracers`, `coriolis`, `sea_ice`, `biogeochemistry`, `free_surface` — is
     stored on `CoupledHydrostaticSimulation` as the objects (or, for `free_surface`, the nested
     config) `coupled_simulation` consumes, one type parameter each, nine in total, which is the cost
-    of the no-abstract-fields rule. A **tenth** is the signal to collapse them into one `NamedTuple`
-    field instead of adding another; the "config" testset guards that count, and it is the count
-    under pressure — `SimulationConfig`'s five are structural and do not grow, since a new kind of
-    nested config is a new subtype of an existing supertype.
+    of the no-abstract-fields rule. The **tenth** is `extra_kwargs`, and it *is* the collapse the
+    ninth was headed for: rather than a field per remaining constructor keyword — of which
+    `HydrostaticFreeSurfaceModel` alone has eight — one `NamedTuple` carries all of them. Ten is the
+    ceiling; anything further goes inside `extra_kwargs`. The "config" testset guards that count,
+    and `SimulationConfig`'s six are the structural ones, growing only when a genuinely new *kind*
+    of nested config appears — `callbacks` was the sixth. A new subtype of an existing supertype is
+    never a new field.
+
+    ### `extra_kwargs`
+
+    Up to four slots, one per constructor `coupled_simulation` calls, each a `NamedTuple` splatted
+    into that call: `ocean_model` → `HydrostaticFreeSurfaceModel` (`clock`, `timestepper`,
+    `particles`, `velocities`, `pressure`, `closure_fields`, `auxiliary_fields`,
+    `vertical_coordinate`), `ocean_simulation` and `coupled_simulation` → the two `Simulation`s
+    (`verbose`, `stop_iteration`, `wall_time_limit`, `align_time_step`, `minimum_relative_step`),
+    and `coupled_model` → `OceanSeaIceModel` (`land`, `interfaces`, the reference densities and heat
+    capacities, and its `interface_kw…`). An omitted slot is empty, so all four splat
+    unconditionally. Before this, needing any one of those meant reimplementing `coupled_simulation`
+    wholesale for a model that differed from the built-in one by a single keyword.
+
+    The escape hatch can only **add**. `validate_extra_kwargs` rejects a slot that reaches no
+    constructor, a slot holding something that is not a `NamedTuple`, and — the load-bearing one — a
+    key duplicating a keyword `coupled_simulation` already passes. `extra_kwargs` splats *after* the
+    explicit keywords, so a duplicate wins silently; a stray `tracers` in `ocean_model` would then
+    disagree with `model_tracers`, which `build_simulation` already used to pick the forcing terms
+    and the open tracer boundaries before the model existed. The lists live in `EXTRA_KWARG_SLOTS`
+    rather than inside `coupled_simulation`, so the check runs at construction, where the setup file
+    that made the mistake is still what the error is about.
 
     `free_surface` is itself an `AbstractFreeSurfaceConfig` rather than a bare `Float64` CFL, with
     its own `free_surface(config, grid)` hook — the same reason the model as a whole is a config
     rather than a built object: `SplitExplicitFreeSurface` needs the grid, which does not exist
-    until `coupled_simulation` calls the hook. `bottom_drag_coefficient` stays a plain scalar on
-    `TopBottomFluxes` rather than following the same pattern, because
-    `top_bottom_boundary_conditions` is already the dispatched hook that needs the grid — there is
-    no second function for it to delegate to the way `coupled_simulation` delegates to
-    `free_surface`.
+    until `coupled_simulation` calls the hook. `coefficient` stays a plain scalar on
+    `QuadraticBottomDrag` rather than following the same pattern, because
+    `boundary_condition_sides` is already the dispatched hook — there is no second function for it
+    to delegate to the way `coupled_simulation` delegates to `free_surface`.
     `architecture` is a `Symbol` for the same reason as the forcing config's, and
     `simulation_architecture` resolves it by reusing `interpolation_architecture`'s `Val` methods.
 
@@ -485,8 +553,13 @@ modules, in `include` order from `src/FjordSim.jl`:
     not fail outside the data it was given — it wraps — so a run that outlasts its forcing would
     otherwise quietly replay the beginning, and one starting early would read the end. The check is
     what makes the wrap unreachable rather than merely unlikely, which is why neither reader's
-    `time_indexing` had to change. The atmosphere half goes through the optional
-    `atmosphere_date_range` hook, so the module still names no dataset.
+    `time_indexing` had to change. **Both** halves now go through an optional hook on their own
+    config — `atmosphere_date_range(config)` and `forcing_date_range(config, filepath)` — so the
+    module names no dataset and no file layout. The forcing half used to be a bare
+    `forcing_date_range(filepath)` living here, dispatched on nothing, hardcoding an `NCDataset` read
+    of `ds["time"]`: a source that overrode `simulation_forcing` to read a different layout still had
+    its coverage validated by a reader it did not use. The supertype default is that same NetCDF
+    read, so no built-in source changed.
 
     The window checked is **one** `stop_time`, not `loops` of them: every repetition replays the same
     interval, so what the prepared files must span does not grow with the loop count. Multiplying by
@@ -590,12 +663,32 @@ modules, in `include` order from `src/FjordSim.jl`:
     through `forcing_from_file` *and* through the `prescribed_atmosphere`/`prescribed_radiation` hook
     signatures, which are a documented extension contract. Clock-reset leaves both readers untouched.
 
+    ### Callbacks
+
+    `callbacks` is a tuple of `AbstractCallbackConfig`s, and `attach_callbacks!` loops over it
+    calling `attach_callback!` — the same shape as `writers`, and `validate_callbacks` rejects two
+    under one name for the same reason `validate_writers` does: the second replaces the first in
+    `simulation.callbacks`, so only the last would ever fire.
+
+    `ProgressCallback(; name, interval, report)` is the built-in one. All three fields matter: what a
+    run reported used to be a hardcoded `Callback(progress, TimeInterval(config.progress_interval))`
+    under the fixed key `:progress`, so a setup could change how *often* it reported and nothing
+    else — not the report, not the schedule, and not by adding a second diagnostic.
+    `progress_interval` is gone from `SimulationConfig` as a result.
+
+    `report` is the field that matters most, because `Utils.progress` reaches
+    `sim.model.ocean.model.tracers.T`. A model whose `tracers` omits `:T` — perfectly legal, since
+    `model_tracers` exists precisely so tracers are a free choice — crashes at the first fire, after
+    the whole coupled model has compiled and the run has started. Naming its own `report` is the way
+    out. `Utils.progress` itself is unchanged, and so is `Utils.WALL_TIME`, a module-global `Ref` two
+    simulations in one session still interleave.
+
     ### Writers
 
     `writers` is a tuple of `AbstractWriterConfig`s, and `attach_writers!` just loops over it calling
     `attach_writer!`. Which simulation a writer attaches to is the method's business, not the
     caller's: a `SnapshotWriter` goes on `simulation.model.ocean`, a `CheckpointWriter` on the coupled
-    simulation.
+    simulation, and a `ProgressCallback` on the coupled one too.
 
     A `SnapshotWriter`'s `variables` are `Symbol`s resolved by `snapshot_outputs` through
     `Oceananigans.fields(ocean_model)` — velocities, free surface, tracers, auxiliaries — so naming
@@ -750,7 +843,12 @@ Grid — `AbstractGridConfig`:
 
 | Hook | Required |
 |---|---|
-| `LatitudeLongitudeGrid(architecture, config)` | yes |
+| `domain_grid(config, architecture)` → the bare grid, no bathymetry | yes |
+| `simulation_grid(config, bathymetry_file, architecture)` → the grid the simulation runs on | yes |
+
+Both are declared in `Configs`, since `Bathymetry`, `Atmospheres` and `Forcing` all call
+`domain_grid` and are included before `Grids`. Neither names a result type, so a grid that is not a
+`LatitudeLongitudeGrid` can implement them.
 
 Bathymetry — `AbstractBathymetryConfig`, consumed by `prepare_bathymetry`:
 
@@ -769,6 +867,7 @@ Forcing — `AbstractForcingConfig`, consumed by `prepare_forcing`:
 | `forcing_variable_names(config)` → `Dict` source name => FjordSim name | yes |
 | `download_forcing(target_grid, config)` | only if it downloads |
 | `simulation_forcing(config, grid, filepath, tracers, reference_date)` → the forcing term object `coupled_simulation` consumes | no; defaults to `forcing_from_file`, the FjordSim NetCDF contract |
+| `forcing_date_range(config, filepath)` → `(first, last)` `DateTime`s | no; defaults to reading `ds["time"]` from the prepared NetCDF. A source that overrides `simulation_forcing` overrides this too |
 | `source_field_grid(source, architecture)`, `projected_target_nodes(longitude, latitude, source)` | only for a source grid that is not a regular projected grid; dispatch on the source-grid type, not the config |
 
 Rivers — `AbstractRiverConfig`, consumed by `add_rivers`:
@@ -819,12 +918,16 @@ Simulation — `AbstractSimulationConfig`, consumed by `build_simulation`: **no 
 only, read field by field, so an alternative simulation config is a subtype supplying the field
 set its docstring lists. It inherits `results_path`, `run_tag` and `coverage_window` — the last reads
 `start_date`, so a subtype omitting that field inherits only the first two. Everything that *is*
-dispatched on comes from the four supertypes it nests, one hook table each:
+dispatched on comes from the supertypes it nests, one hook table each. `AbstractCallbackConfig` is
+the newest row: it replaced a bare `progress_interval::Float64`, which could only change how often
+the one hardcoded `Callback(progress, TimeInterval(...))` fired.
 
 | Supertype | Field | Required hooks |
 |---|---|---|
 | `AbstractCoupledSimulationConfig` | `model` | `coupled_simulation(model, grid; forcing, boundary_conditions, initial_conditions, atmosphere, radiation, stop_time, initial_time_step)`, `model_tracers(model)` |
-| `AbstractBoundaryConditionConfig` | `boundary_conditions` (a tuple) | `boundary_conditions(config, grid, forcing, forcing_config, tracers)` |
+| `AbstractBoundaryConditionSetConfig` | `boundary_conditions` | `field_boundary_conditions(config, grid, forcing, forcing_config, tracers)` |
+| `AbstractBoundaryConditionConfig` | the pieces inside the set | `boundary_condition_sides(config, grid, forcing, forcing_config, tracers)` |
+| `AbstractCallbackConfig` | `callbacks` (a tuple) | `attach_callback!(simulation, callback, config)` |
 | `AbstractWriterConfig` | `writers` (a tuple) | `attach_writer!(simulation, writer, config, loop)`; optionally `checkpoint_trait`, `output_path_trait`, both defaulting to the negative |
 | `AbstractTimeSteppingConfig` | `time_stepping` | `attach_time_stepping!(simulation, config)`, `initial_time_step(config)` |
 
@@ -834,10 +937,17 @@ other, `results_path` raises a stated `ArgumentError` rather than failing on a m
 `CoupledHydrostaticSimulation`, the built-in `AbstractCoupledSimulationConfig`, nests one further
 supertype of its own: `free_surface` is an `AbstractFreeSurfaceConfig`, required hook
 `free_surface(config, grid)` → the free-surface object `coupled_simulation` passes to
-`HydrostaticFreeSurfaceModel`. It is not one of the four rows above — those are what
-`SimulationConfig` itself nests — but the same reasoning applies one level down: a different free
-surface is a new subtype and a new method, not an edit to `coupled_simulation`.
+`HydrostaticFreeSurfaceModel`. It is not one of the rows above — those are what `SimulationConfig`
+itself nests — but the same reasoning applies one level down: a different free surface is a new
+subtype and a new method, not an edit to `coupled_simulation`.
 `FjordSim.Simulations.SplitExplicitFreeSurfaceConfig` is the built-in implementation.
+
+`CoupledHydrostaticSimulation` also carries `extra_kwargs`, which is not a hook but the reason a
+setup rarely needs a *new* `AbstractCoupledSimulationConfig` subtype: it splats one `NamedTuple` per
+slot into each of the four constructors `coupled_simulation` calls, so a model differing from the
+built-in one by a keyword is a config value rather than a new type and a new method. See the
+`Simulations` section for the slot names and for why the constructor rejects keys that would shadow
+the fields.
 
 The `coverage` keyword `prepare_forcing` and `prepare_atmosphere` now take is a pipeline *argument*,
 not a hook: the `FjordConfig` drivers derive it with `coverage_window` and every source inherits the
@@ -873,8 +983,9 @@ atmosphere steps and `run_simulation` no-ops — though both built-in setups nam
 
 The simulation config is rooted separately, at `~/FjordSim_results/<fjord>/` rather than under
 `data_root`, since it writes rather than reads. Unlike every other config, `SimulationConfig` has
-**no defaults at all**, and neither do the four configs it nests: `oslofjorden()` names every field
-of all five, because each is a scientific choice about that fjord and a default would let the next
+**no defaults at all**, and neither do the configs it nests: `oslofjorden()` names every field
+of all of them — `extra_kwargs = (;)` included — because each is a scientific choice about that
+fjord and a default would let the next
 setup silently inherit it. Adding a field to any of them therefore breaks every setup until each
 names it, which is the intent.
 
@@ -955,10 +1066,12 @@ forcings.
   so `SimulationConfig(stop_time = 3600, ...)` is a `MethodError` where `stop_time = 1hour` is
   fine. Every `Oceananigans.Units` constant is already a `Float64`, so writing durations with them —
   `365days`, `1hour`, `3minutes` — sidesteps this. `loops` is the one field this does *not* apply to,
-  being an `Int` already. `SimulationConfig` and `CoupledHydrostaticSimulation` are the only two
-  configs the rule reaches: every other one is non-parametric, and `SnapshotWriter` — which *is*
-  parametric — has a hand-written keyword constructor that converts, precisely so a reader who learned
-  the rule from `SimulationConfig` is not misled about the types they write far more often.
+  being an `Int` already. `SimulationConfig` is now the **only** config the rule reaches: every other
+  one is either non-parametric, or — like `SnapshotWriter`, `ProgressCallback` and
+  `CoupledHydrostaticSimulation`, all of which *are* parametric — has a hand-written keyword
+  constructor that converts, precisely so a reader who learned the rule from `SimulationConfig` is
+  not misled about the types they write far more often. `CoupledHydrostaticSimulation` gained one
+  when `extra_kwargs` arrived, since that field needs validating at construction anyway.
 
 ## Key conventions
 

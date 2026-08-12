@@ -29,7 +29,8 @@ using ..Configs:
     FjordConfig,
     atmosphere_path,
     atmosphere_directory,
-    coverage_window
+    coverage_window,
+    domain_grid
 using ..Plotting: plot_atmosphere
 
 include("NORA3.jl")
@@ -167,7 +168,7 @@ domain alone would leave the outer prepared cells with nothing to interpolate fr
 A setup naming no atmosphere config is a no-op.
 """
 download_atmosphere(config::FjordConfig) =
-    download_atmosphere(LatitudeLongitudeGrid(CPU(), config.grid_config), config.atmosphere_config)
+    download_atmosphere(domain_grid(config.grid_config, CPU()), config.atmosphere_config)
 
 download_atmosphere(target_grid, ::Nothing) = nothing
 
@@ -494,7 +495,7 @@ function prepare_atmosphere(config::FjordConfig)
         "Run `julia --project -m FjordSim download_atmosphere` for this setup first.",
     )
 
-    grid = LatitudeLongitudeGrid(CPU(), config.grid_config)
+    grid = domain_grid(config.grid_config, CPU())
     result = prepare_atmosphere(
         grid,
         atmosphere_config;

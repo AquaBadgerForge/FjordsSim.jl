@@ -1,6 +1,6 @@
 module Grids
 
-export ImmersedBoundaryGrid, EvenGrid
+export ImmersedBoundaryGrid, EvenGrid, domain_grid, simulation_grid
 
 using Oceananigans
 using Oceananigans.BoundaryConditions: fill_halo_regions!
@@ -9,7 +9,8 @@ using NCDatasets
 import Oceananigans.ImmersedBoundaries: ImmersedBoundaryGrid
 import Oceananigans: LatitudeLongitudeGrid
 using ..Utils: compute_faces
-using ..Configs: AbstractGridConfig
+using ..Configs
+using ..Configs: AbstractGridConfig, domain_grid, simulation_grid
 
 """
     EvenGrid
@@ -31,6 +32,21 @@ Base.@kwdef mutable struct EvenGrid <: AbstractGridConfig
     latitude::NTuple{2,Float64}
     z_faces::Vector{Float64}
 end
+
+"""
+    domain_grid(config::EvenGrid, architecture)
+
+The `LatitudeLongitudeGrid` an `EvenGrid` describes. See `Configs.domain_grid`.
+"""
+Configs.domain_grid(config::EvenGrid, architecture) = LatitudeLongitudeGrid(architecture, config)
+
+"""
+    simulation_grid(config::EvenGrid, bathymetry_file, architecture)
+
+The `ImmersedBoundaryGrid` an `EvenGrid` runs on. See `Configs.simulation_grid`.
+"""
+Configs.simulation_grid(config::EvenGrid, bathymetry_file, architecture) =
+    ImmersedBoundaryGrid(bathymetry_file, architecture, config.halo)
 
 function LatitudeLongitudeGrid(architecture, config::EvenGrid)
     return LatitudeLongitudeGrid(

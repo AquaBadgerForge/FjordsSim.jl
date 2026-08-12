@@ -69,12 +69,15 @@ struct MinimalSimulation <: AbstractSimulationConfig
     stop_time::Float64
 end
 
-# The four supertypes `SimulationConfig` nests, each with no hook overloaded, so the "Config
-# extensibility" testset can assert that a missing hook surfaces as a `MethodError` naming it.
+# The supertypes `SimulationConfig` nests, plus the free surface one level further down, each with
+# no hook overloaded, so the "Config extensibility" testset can assert that a missing hook surfaces
+# as a `MethodError` naming it.
 struct MinimalModel <: AbstractCoupledSimulationConfig end
 struct MinimalFreeSurface <: AbstractFreeSurfaceConfig end
 struct MinimalBoundary <: AbstractBoundaryConditionConfig end
+struct MinimalBoundarySet <: AbstractBoundaryConditionSetConfig end
 struct MinimalWriter <: AbstractWriterConfig end
+struct MinimalCallback <: AbstractCallbackConfig end
 struct MinimalTimeStepping <: AbstractTimeSteppingConfig end
 
 # A stand-in for a coupled-model component that does have a clock, so `rewind_clock!`'s
@@ -97,8 +100,11 @@ end
 FjordSim.Forcing.river_locations(config::StubRivers) = config.locations
 FjordSim.Forcing.river_series(config::StubRivers, times) = config.series
 
-# New behavior for a new grid config, added without touching Grids.jl.
-Oceananigans.LatitudeLongitudeGrid(architecture, config::SingleColumnGrid) = LatitudeLongitudeGrid(
+# New behavior for a new grid config, added without touching Grids.jl. `domain_grid` is overloaded
+# and `simulation_grid` deliberately is not, so the extensibility testset can assert both halves of
+# the grid contract: one hook picked up at every existing call site, the other missing as a
+# `MethodError` naming what the subtype still owes.
+FjordSim.domain_grid(config::SingleColumnGrid, architecture) = LatitudeLongitudeGrid(
     architecture;
     size = (1, 1, 2),
     halo = (1, 1, 1),
@@ -219,7 +225,7 @@ end
 
 Every one of `CoupledHydrostaticSimulation`'s fields, and the config built from them.
 
-Three values are not free: `tracers` must name `T` and `S` (`TopBottomFluxes` builds a top condition
+Three values are not free: `tracers` must name `T` and `S` (`AirSeaFluxes` builds a top condition
 for each by name); `buoyancy` must be a `SeawaterBuoyancy` over a `TEOS10EquationOfState`, the only
 pair NumericalEarth's `reference_density`/`heat_capacity` have methods for; and `sea_ice` must not be
 `nothing`. Everything else is a neutral value chosen here.
@@ -238,6 +244,9 @@ function test_model_fields(; kwargs...)
         :sea_ice => FreezingLimitedOceanTemperature(),
         :biogeochemistry => nothing,
         :free_surface => SplitExplicitFreeSurfaceConfig(cfl = 0.7),
+        # The pass-through slots, empty. Stated rather than defaulted, like every other field here —
+        # the "no field has a default" sweep covers this one too.
+        :extra_kwargs => (;),
     )
 
     return override_fields(fields, "test_model_fields", kwargs)
@@ -275,8 +284,14 @@ test_time_stepping(;
     max_time_step_change = 1.01,
 ) = AdaptiveTimeStep(; initial_time_step, cfl, max_time_step, max_time_step_change)
 
-test_boundary_conditions() =
-    (TopBottomFluxes(bottom_drag_coefficient = 0.003), OpenLateralBoundary())
+test_boundary_conditions() = MergedBoundaryConditions(
+    AirSeaFluxes(),
+    QuadraticBottomDrag(coefficient = 0.003),
+    OpenLateralBoundary(),
+)
+
+test_progress_callback(; name = :progress, interval = 1hour, report = progress) =
+    ProgressCallback(; name, interval, report)
 
 """
     test_simulation_fields(; kwargs...)
@@ -286,7 +301,7 @@ Every one of `SimulationConfig`'s fields, as a `Dict` the constructor can be spl
 A `Dict` rather than a `NamedTuple` because the "no field has a default" sweep needs to *remove* one
 field at a time, which `delete!(copy(fields), name)` does and a `NamedTuple` cannot.
 
-The five nested-config fields come from the factories above, so a test that cares about one of them
+The six nested-config fields come from the factories above, so a test that cares about one of them
 overrides just that one.
 """
 function test_simulation_fields(; kwargs...)
@@ -296,6 +311,7 @@ function test_simulation_fields(; kwargs...)
         :model => test_model_config(),
         :boundary_conditions => test_boundary_conditions(),
         :writers => (test_snapshot_writer(), test_checkpoint_writer()),
+        :callbacks => (test_progress_callback(),),
         :time_stepping => test_time_stepping(),
         # A literal NamedTuple, so `resolve_initial_conditions` passes it through by identity and
         # nothing built from this fixture also depends on a forcing file having a record at
@@ -306,7 +322,6 @@ function test_simulation_fields(; kwargs...)
         :start_date => DateTime(2020, 1, 1, 12),
         :stop_time => 1minute,
         :loops => 1,
-        :progress_interval => 1hour,
         :pickup => false,
     )
 

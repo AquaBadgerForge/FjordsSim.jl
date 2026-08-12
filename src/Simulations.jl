@@ -6,6 +6,7 @@ export SimulationConfig,
     free_surface,
     SnapshotWriter,
     CheckpointWriter,
+    ProgressCallback,
     AdaptiveTimeStep,
     FromForcing,
     FromResults,
@@ -13,6 +14,7 @@ export SimulationConfig,
     model_tracers,
     coupled_simulation,
     attach_writer!,
+    attach_callback!,
     attach_time_stepping!,
     initial_time_step,
     build_simulation,
@@ -31,6 +33,7 @@ using ..Configs:
     AbstractCoupledSimulationConfig,
     AbstractFreeSurfaceConfig,
     AbstractWriterConfig,
+    AbstractCallbackConfig,
     AbstractTimeSteppingConfig,
     AbstractForcingConfig,
     AbstractRiverConfig,
@@ -39,12 +42,12 @@ using ..Configs:
     forcing_path,
     river_forcing_path,
     results_path,
-    run_tag
+    run_tag,
+    simulation_grid
 using ..Utils: progress, cell_advection_timescale_coupled_model
 using ..Atmospheres: prescribed_atmosphere, prescribed_radiation, atmosphere_date_range
-using ..Forcing: simulation_forcing, interpolation_architecture
+using ..Forcing: simulation_forcing, forcing_date_range, interpolation_architecture
 using ..BoundaryConditions: field_boundary_conditions
-using ..Grids: ImmersedBoundaryGrid
 
 """
     SplitExplicitFreeSurfaceConfig(; cfl)
@@ -84,18 +87,40 @@ once `coupled_simulation` is called.
 
 **No field has a default**, deliberately. Every one is a scientific choice about a particular fjord,
 and a default would let the next setup silently inherit it, so a setup that forgets one gets an
-`UndefKeywordError` naming it rather than a plausible-looking run.
+`UndefKeywordError` naming it rather than a plausible-looking run. `extra_kwargs` is no exception: a
+setup that passes nothing extra still writes `extra_kwargs = (;)`.
 
-Nine type parameters, one per component. A tenth is the signal to collapse them into a single
-`NamedTuple` field instead of adding another; the "config" testset guards the count.
+Ten type parameters. Nine are components, and the tenth is the collapse the count was always headed
+for: rather than one field per remaining constructor keyword — `HydrostaticFreeSurfaceModel` alone
+has eight this does not name — `extra_kwargs` carries all of them in one `NamedTuple`. **Do not add
+an eleventh**; anything new goes inside `extra_kwargs`, which is exactly what it is for. The "config"
+testset guards the count.
 
-Note that `Base.@kwdef` on a *parametric* struct generates a constructor that does not convert, so
-`free_surface = SplitExplicitFreeSurfaceConfig(cfl = 1)` is a `MethodError` where `cfl = 1.0` is
-fine — though `SplitExplicitFreeSurfaceConfig`'s own keyword constructor converts, the same
-exception every nested config gets.
+# `extra_kwargs`
+
+A `NamedTuple` with up to four slots, one per constructor `coupled_simulation` calls, each itself a
+`NamedTuple` splatted into that call:
+
+| Slot | Reaches | Keywords it is for |
+|---|---|---|
+| `ocean_model` | `HydrostaticFreeSurfaceModel` | `clock`, `timestepper`, `particles`, `velocities`, `pressure`, `closure_fields`, `auxiliary_fields`, `vertical_coordinate` |
+| `ocean_simulation` | `Simulation(ocean_model; …)` | `verbose`, `stop_iteration`, `wall_time_limit`, `align_time_step`, `minimum_relative_step` |
+| `coupled_model` | `OceanSeaIceModel` | `land`, `interfaces`, `ocean_reference_density`, `ocean_heat_capacity`, `sea_ice_reference_density`, `sea_ice_heat_capacity`, and its `interface_kw…` |
+| `coupled_simulation` | `Simulation(coupled_model; …)` | as `ocean_simulation` |
+
+An omitted slot is empty. The escape hatch can only **add**: the constructor rejects a slot key that
+duplicates a keyword `coupled_simulation` already passes, because a splat wins over an explicit
+keyword, so a stray `tracers` in `ocean_model` would silently disagree with `model_tracers` — which
+`build_simulation` already used to build the forcing and the boundary conditions before the model
+existed.
+
+The keyword constructor is hand-written rather than `Base.@kwdef`, because `extra_kwargs` needs
+validating at construction. That also puts this type in the same category as `SnapshotWriter` and
+`ProgressCallback` rather than `SimulationConfig`'s: the `Base.@kwdef`-on-a-parametric-struct rule
+that makes `stop_time = 3600` a `MethodError` there does not apply here.
 """
-Base.@kwdef struct CoupledHydrostaticSimulation{B,C,TA,MA,TR,CO,SI,BG,FS} <:
-                   AbstractCoupledSimulationConfig
+struct CoupledHydrostaticSimulation{B,C,TA,MA,TR,CO,SI,BG,FS,EK<:NamedTuple} <:
+       AbstractCoupledSimulationConfig
     buoyancy::B
     closure::C
     tracer_advection::TA
@@ -105,7 +130,107 @@ Base.@kwdef struct CoupledHydrostaticSimulation{B,C,TA,MA,TR,CO,SI,BG,FS} <:
     sea_ice::SI
     biogeochemistry::BG
     free_surface::FS
+    extra_kwargs::EK
 end
+
+"""
+The `extra_kwargs` slots, and the keywords `coupled_simulation` already passes to each slot's
+constructor.
+
+A slot may not carry any of its own listed keywords: `extra_kwargs` splats *after* the explicit ones,
+so a duplicate would win silently. Keeping the lists here rather than inside `coupled_simulation`
+means the check runs at construction, where the setup file that made the mistake is still what the
+error is about.
+"""
+const EXTRA_KWARG_SLOTS = (
+    ocean_model = (
+        :buoyancy,
+        :closure,
+        :tracer_advection,
+        :momentum_advection,
+        :tracers,
+        :free_surface,
+        :coriolis,
+        :forcing,
+        :boundary_conditions,
+        :biogeochemistry,
+    ),
+    ocean_simulation = (:Δt, :stop_time),
+    coupled_model = (:atmosphere, :radiation),
+    coupled_simulation = (:Δt, :stop_time),
+)
+
+"""
+    validate_extra_kwargs(extra_kwargs)
+
+Reject an `extra_kwargs` naming a slot that reaches nothing, or a keyword that would silently
+override one `coupled_simulation` already passes. Returns it unchanged.
+"""
+function validate_extra_kwargs(extra_kwargs::NamedTuple)
+    slots = keys(EXTRA_KWARG_SLOTS)
+
+    for slot in keys(extra_kwargs)
+        slot in slots || throw(
+            ArgumentError(
+                "`extra_kwargs` names slot :$slot, which reaches no constructor. " *
+                "Valid slots: $(join(slots, ", ")).",
+            ),
+        )
+
+        values = getproperty(extra_kwargs, slot)
+        values isa NamedTuple || throw(
+            ArgumentError(
+                "`extra_kwargs.$slot` must be a NamedTuple of keyword arguments, got a " *
+                "$(typeof(values)).",
+            ),
+        )
+
+        reserved = intersect(keys(values), getproperty(EXTRA_KWARG_SLOTS, slot))
+        isempty(reserved) || throw(
+            ArgumentError(
+                "`extra_kwargs.$slot` names $(join(reserved, ", ")), which `coupled_simulation` " *
+                "already passes. It would silently override the config field of the same name, so " *
+                "set the field instead.",
+            ),
+        )
+    end
+
+    return extra_kwargs
+end
+
+function CoupledHydrostaticSimulation(;
+    buoyancy,
+    closure,
+    tracer_advection,
+    momentum_advection,
+    tracers,
+    coriolis,
+    sea_ice,
+    biogeochemistry,
+    free_surface,
+    extra_kwargs,
+)
+    return CoupledHydrostaticSimulation(
+        buoyancy,
+        closure,
+        tracer_advection,
+        momentum_advection,
+        tracers,
+        coriolis,
+        sea_ice,
+        biogeochemistry,
+        free_surface,
+        validate_extra_kwargs(extra_kwargs),
+    )
+end
+
+"""
+    extra_kwargs(model, slot)
+
+One `extra_kwargs` slot's keywords, or an empty `NamedTuple` for a slot the config omitted.
+"""
+extra_kwargs(model::CoupledHydrostaticSimulation, slot::Symbol) =
+    get(model.extra_kwargs, slot, (;))
 
 """
     model_tracers(model)
@@ -192,6 +317,86 @@ function CheckpointWriter(; interval, overwrite_existing, cleanup)
 end
 
 """
+    ProgressCallback(; name, interval, report)
+
+A callback that reports on the run at a `TimeInterval`.
+
+# Fields
+- `name`: the key it occupies in `simulation.callbacks`, so a setup can attach several diagnostics
+  without one silently replacing another.
+- `interval`: seconds of model time between reports.
+- `report`: the callback function itself, taking the simulation. `FjordSim.Utils.progress` is what
+  every setup uses, and naming it here is what makes it swappable at all.
+
+That last field is the whole point of the type. What a run reported used to be a hardcoded
+`Callback(progress, TimeInterval(config.progress_interval))` under the fixed key `:progress`, so a
+setup could change how *often* it reported and nothing else. Note that `progress` itself reaches
+`sim.model.ocean.model.tracers.T`, so a model whose `tracers` omits `:T` needs its own `report` —
+otherwise it crashes at the first fire, after the whole model has compiled.
+"""
+struct ProgressCallback{R} <: AbstractCallbackConfig
+    name::Symbol
+    interval::Float64
+    report::R
+end
+
+function ProgressCallback(; name, interval, report)
+    interval > 0 || throw(
+        ArgumentError("A progress callback's `interval` must be positive, got $interval."),
+    )
+
+    return ProgressCallback(Symbol(name), Float64(interval), report)
+end
+
+"""
+    attach_callback!(simulation, callback::ProgressCallback, config)
+
+Attach the progress report to the *coupled* simulation, under `callback.name`.
+
+The coupled one, because that is the clock the run advances and the object `progress` reaches the
+ocean through.
+"""
+function attach_callback!(simulation, callback::ProgressCallback, config::AbstractSimulationConfig)
+    simulation.callbacks[callback.name] =
+        Callback(callback.report, TimeInterval(callback.interval))
+
+    return simulation
+end
+
+"""
+    attach_callbacks!(simulation, config)
+
+Attach every callback the config names. The mirror of `attach_writers!`, and like it, which
+simulation each callback goes on is the method's business.
+"""
+function attach_callbacks!(simulation, config::AbstractSimulationConfig)
+    for callback in config.callbacks
+        attach_callback!(simulation, callback, config)
+    end
+
+    return simulation
+end
+
+"""
+    validate_callbacks(config)
+
+Reject two callbacks under one name, before anything is read or allocated: the second simply
+replaces the first in the `callbacks` dictionary, so one of the diagnostics the setup asked for
+never fires. The same failure `validate_writers` rejects for writers.
+"""
+function validate_callbacks(config::AbstractSimulationConfig)
+    names = [callback.name for callback in config.callbacks]
+    allunique(names) || throw(
+        ArgumentError(
+            "Callback names must be unique, got $(join(names, ", ")). Two callbacks under one " *
+            "name replace each other and only the last one fires.",
+        ),
+    )
+
+    return nothing
+end
+
+"""
     AdaptiveTimeStep(; initial_time_step, cfl, max_time_step, max_time_step_change)
 
 An Oceananigans time-step wizard: the step is chosen each iteration from the advective CFL, starting
@@ -234,11 +439,12 @@ choice about a particular fjord, and a default would let one setup silently inhe
 setup that forgets one gets an `UndefKeywordError` naming it rather than a plausible-looking run.
 The setup file is the complete statement of what the simulation is; nothing about it is hidden here.
 
-The fields split into four nested configs and the run control that ties them together, and the split
+The fields split into five nested configs and the run control that ties them together, and the split
 is by *what dispatches on what*. `model` is assembled by `coupled_simulation`, `boundary_conditions`
-by `field_boundary_conditions`, each writer by `attach_writer!`, and `time_stepping` by
-`attach_time_stepping!` — four generic functions, so a different model, a new boundary-condition
-piece or another kind of output is a new subtype rather than an edit to `build_simulation`.
+by `field_boundary_conditions`, each writer by `attach_writer!`, each callback by
+`attach_callback!`, and `time_stepping` by `attach_time_stepping!` — five generic functions, so a
+different model, a new boundary-condition piece, another kind of output or a different diagnostic is
+a new subtype rather than an edit to `build_simulation`.
 
 # Fields
 - `results_root`: the directory every writer, and the run log, resolves against.
@@ -246,9 +452,10 @@ piece or another kind of output is a new subtype rather than an edit to `build_s
   rather than a live `CPU()`/`GPU()` so this config's field types stay concrete and a setup file
   loads on a machine with no GPU.
 - `model`: an `AbstractCoupledSimulationConfig`.
-- `boundary_conditions`: a tuple of `AbstractBoundaryConditionConfig`s. Tuple order is merge
-  precedence; `()` means the model's defaults everywhere.
+- `boundary_conditions`: an `AbstractBoundaryConditionSetConfig`, usually a
+  `MergedBoundaryConditions` naming the pieces in precedence order.
 - `writers`: a tuple of `AbstractWriterConfig`s. `()` writes nothing.
+- `callbacks`: a tuple of `AbstractCallbackConfig`s. `()` reports nothing.
 - `time_stepping`: an `AbstractTimeSteppingConfig`.
 - `initial_conditions`: where the ocean state starts from — a `NamedTuple` of constants, fields or
   functions, a `FromForcing`, or a `FromResults`. `build_simulation` puts it through
@@ -258,7 +465,6 @@ piece or another kind of output is a new subtype rather than an edit to `build_s
 - `stop_time`: seconds of simulated time one pass through the run window lasts.
 - `loops`: how many times to run that window, carrying the ocean state across each restart. `1`
   runs it once. See `run_simulation`.
-- `progress_interval`: how often the `progress` callback reports.
 - `pickup`: resume from the newest checkpoint under `results_root` instead of starting fresh.
   Requires a `CheckpointWriter`.
 
@@ -278,18 +484,18 @@ durations with `Oceananigans.Units`, whose constants are already `Float64`. `loo
 being an `Int` already, and the nested configs are the other one: each has a hand-written keyword
 constructor that converts, so an integer duration is fine in a writer or a time-stepping config.
 """
-Base.@kwdef mutable struct SimulationConfig{M,BC,W,TS,I} <: AbstractSimulationConfig
+Base.@kwdef mutable struct SimulationConfig{M,BC,W,CB,TS,I} <: AbstractSimulationConfig
     results_root::String
     architecture::Symbol
     model::M
     boundary_conditions::BC
     writers::W
+    callbacks::CB
     time_stepping::TS
     initial_conditions::I
     start_date::DateTime
     stop_time::Float64
     loops::Int
-    progress_interval::Float64
     pickup::Bool
 end
 
@@ -587,18 +793,6 @@ function validate_time_coverage(label, range, start_date, stop_time, remedy)
 
     return nothing
 end
-
-"""
-    forcing_date_range(filepath)
-
-First and last date on a prepared forcing file's time axis.
-"""
-forcing_date_range(filepath) = NCDataset(filepath) do ds
-    dates = ds["time"][:]
-    (first(dates), last(dates))
-end
-
-forcing_date_range(::Nothing) = nothing
 
 """
     loop_output_path(writer, config, loop)
@@ -997,6 +1191,7 @@ function build_simulation(config::FjordConfig)
     simulation_config.loops >= 1 ||
         throw(ArgumentError("loops must be at least 1, got $(simulation_config.loops)"))
     validate_writers(simulation_config)
+    validate_callbacks(simulation_config)
 
     start_date = simulation_config.start_date
     stop_time = simulation_config.stop_time
@@ -1004,7 +1199,7 @@ function build_simulation(config::FjordConfig)
     # prepared files have to span does not grow with the loop count.
     validate_time_coverage(
         "forcing $forcing_file",
-        forcing_date_range(forcing_file),
+        forcing_date_range(config.forcing_config, forcing_file),
         start_date,
         stop_time,
         "prepare more years of forcing",
@@ -1018,7 +1213,7 @@ function build_simulation(config::FjordConfig)
     )
 
     architecture = simulation_architecture(simulation_config)
-    grid = ImmersedBoundaryGrid(bathymetry_file, architecture, config.grid_config.halo)
+    grid = simulation_grid(config.grid_config, bathymetry_file, architecture)
     tracers = model_tracers(simulation_config.model)
 
     # The one place a results directory is created. `coupled_simulation` is about assembling a
@@ -1068,8 +1263,7 @@ function build_simulation(config::FjordConfig)
         initial_time_step = initial_time_step(simulation_config.time_stepping),
     )
 
-    simulation.callbacks[:progress] =
-        Callback(progress, TimeInterval(simulation_config.progress_interval))
+    attach_callbacks!(simulation, simulation_config)
 
     # For the loop `run_simulation` will start at, not unconditionally the first: a resumed run has
     # to write into the loop it left off in, and to checkpoint under that loop's prefix.
@@ -1203,6 +1397,9 @@ function coupled_simulation(
     initial_time_step,
 )
     @info "Compiling HydrostaticFreeSurfaceModel"
+    # Each `extra_kwargs` slot is splatted last, so it reads as "everything the config states, plus
+    # whatever else this setup needs". It cannot shadow the explicit keywords despite winning the
+    # splat, because `validate_extra_kwargs` rejected those keys at construction.
     ocean_model = HydrostaticFreeSurfaceModel(
         grid;
         buoyancy = model.buoyancy,
@@ -1215,17 +1412,24 @@ function coupled_simulation(
         forcing = forcing,
         boundary_conditions = boundary_conditions,
         biogeochemistry = model.biogeochemistry,
+        extra_kwargs(model, :ocean_model)...,
     )
     @info "Compiled HydrostaticFreeSurfaceModel"
 
     set!(ocean_model; initial_conditions...)
 
     Δt = initial_time_step
-    ocean_sim = Simulation(ocean_model; Δt, stop_time)
-    coupled_model = OceanSeaIceModel(ocean_sim, model.sea_ice; atmosphere, radiation)
+    ocean_sim = Simulation(ocean_model; Δt, stop_time, extra_kwargs(model, :ocean_simulation)...)
+    coupled_model = OceanSeaIceModel(
+        ocean_sim,
+        model.sea_ice;
+        atmosphere,
+        radiation,
+        extra_kwargs(model, :coupled_model)...,
+    )
     @info "Initialized coupled model"
 
-    return Simulation(coupled_model; Δt, stop_time)
+    return Simulation(coupled_model; Δt, stop_time, extra_kwargs(model, :coupled_simulation)...)
 end
 
 end  # module Simulations

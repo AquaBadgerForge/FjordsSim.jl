@@ -107,13 +107,19 @@ function oslofjorden()
                 # Overloads free_surface(config, grid) — its own hook, called from inside
                 # coupled_simulation once the grid exists.
                 free_surface       = SplitExplicitFreeSurfaceConfig(cfl = 0.7),
+                # Anything else the four constructors coupled_simulation calls accept, one slot
+                # each: :ocean_model, :ocean_simulation, :coupled_model, :coupled_simulation.
+                # Nothing extra here, but stated rather than defaulted like every other field.
+                extra_kwargs       = (;),
             ),
-            # Both overload boundary_conditions — the hook field_boundary_conditions merges.
-            # Surface fluxes with quadratic bottom drag, plus the open southern edge — which edge
-            # and how fast come from the forcing config, so `OpenLateralBoundary` carries no
-            # fields. Dropping it would close the domain; the tuple order is merge precedence.
-            boundary_conditions = (
-                TopBottomFluxes(bottom_drag_coefficient = 0.003),
+            # MergedBoundaryConditions overloads field_boundary_conditions; each piece inside it
+            # overloads boundary_condition_sides. Air-sea fluxes and quadratic bottom drag are
+            # separate pieces, so either can be swapped alone, plus the open southern edge — which
+            # edge and how fast come from the forcing config, so `OpenLateralBoundary` carries no
+            # fields. Dropping it would close the domain; argument order is merge precedence.
+            boundary_conditions = MergedBoundaryConditions(
+                AirSeaFluxes(),
+                QuadraticBottomDrag(coefficient = 0.003),
                 OpenLateralBoundary(),
             ),
             # Both overload attach_writer! — what the run writes. `variables` may name anything
@@ -130,6 +136,10 @@ function oslofjorden()
                 ),
                 CheckpointWriter(interval = 30days, overwrite_existing = true, cleanup = true),
             ),
+            # Overloads attach_callback! — what the run reports while it runs. `report` is the
+            # function itself, so a model whose tracers omit :T (which `progress` reads) names its
+            # own here instead. An empty tuple runs silently.
+            callbacks = (ProgressCallback(name = :progress, interval = 1hour, report = progress),),
             # Overloads attach_time_stepping! and initial_time_step.
             time_stepping = AdaptiveTimeStep(
                 initial_time_step    = 1second,
@@ -154,7 +164,6 @@ function oslofjorden()
             # One pass. Raise it to spin the deep basins up on the same forcing year, carrying the
             # state over; each repetition writes its own `_loopNN` file.
             loops              = 1,
-            progress_interval  = 1hour,
             pickup             = false,
         ),
     )

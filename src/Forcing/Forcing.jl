@@ -28,11 +28,14 @@ using ..Configs:
     forcing_path,
     forcing_directory,
     river_forcing_path,
-    coverage_window
+    coverage_window,
+    domain_grid,
+    simulation_grid
 using ..Plotting: plot_forcing
 
 export forcing_from_file,
     simulation_forcing,
+    forcing_date_range,
     prepare_forcing,
     download_forcing,
     interpolation_architecture,
@@ -350,6 +353,34 @@ still receives a splattable `forcing` keyword, just an empty one, which is exact
 """
 simulation_forcing(::Nothing, grid, filepath, tracers, reference_date) = NamedTuple()
 
+"""
+    forcing_date_range(config::AbstractForcingConfig, filepath)
+
+First and last date the prepared forcing file at `filepath` covers, as a `(first, last)` tuple, or
+`nothing` for a source that cannot report its dates.
+
+What `FjordSim.Simulations.validate_time_coverage` checks the run's window against. Both readers use
+`Cyclical()` time indexing, which wraps rather than failing outside its data, so this is what keeps
+a run that outlasts its forcing from quietly replaying the beginning.
+
+The supertype default reads `ds["time"]` from the prepared NetCDF, which is the layout every
+built-in source writes. A source that overrode `simulation_forcing` to read something else overrides
+this too — otherwise its coverage would be validated by a reader it does not use. The exact mirror of
+`atmosphere_date_range`, which the forcing side previously had no counterpart to: this was a bare
+`forcing_date_range(filepath)` in `Simulations`, dispatched on nothing at all.
+"""
+forcing_date_range(config::AbstractForcingConfig, filepath) = NCDataset(filepath) do ds
+    dates = ds["time"][:]
+    (first(dates), last(dates))
+end
+
+"""
+    forcing_date_range(::Nothing, filepath)
+
+No dates to check, for a setup whose `forcing_config` is `nothing`.
+"""
+forcing_date_range(::Nothing, filepath) = nothing
+
 # --- Forcing preparation ---
 
 const FORCING_DEFLATE_LEVEL = 5
@@ -438,7 +469,7 @@ grid is passed rather than the grid config because a dataset needs the domain bo
 `x_domain`/`y_domain` provide for any `AbstractGridConfig`.
 """
 download_forcing(config::FjordConfig) =
-    download_forcing(LatitudeLongitudeGrid(CPU(), config.grid_config), config.forcing_config)
+    download_forcing(domain_grid(config.grid_config, CPU()), config.forcing_config)
 
 download_forcing(target_grid, ::Nothing) = nothing
 
@@ -668,7 +699,7 @@ function prepare_forcing(config::FjordConfig)
         "Run `julia --project -m FjordSim prepare_bathymetry` for this setup first.",
     )
 
-    grid = ImmersedBoundaryGrid(bathymetry_file, CPU(), config.grid_config.halo)
+    grid = simulation_grid(config.grid_config, bathymetry_file, CPU())
     result = prepare_forcing(
         grid,
         config.forcing_config;

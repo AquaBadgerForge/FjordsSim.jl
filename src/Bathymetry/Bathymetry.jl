@@ -18,7 +18,7 @@ using Statistics: mean, median
 
 using NumericalEarth.DataWrangling: Metadatum, metadata_path
 
-using ..Configs: AbstractBathymetryConfig, FjordConfig, bathymetry_path
+using ..Configs: AbstractBathymetryConfig, FjordConfig, bathymetry_path, domain_grid
 using ..Plotting: plot_bathymetry
 
 # Matches the fixed loop count and neighbor threshold used in the Oslofjord notebook's
@@ -117,7 +117,7 @@ has written into `data_root` yet.
 The `prepare_bathymetry(target_grid, config)` named tuple with `plot_file` added.
 """
 function prepare_bathymetry(config::FjordConfig)
-    grid = LatitudeLongitudeGrid(CPU(), config.grid_config)
+    grid = domain_grid(config.grid_config, CPU())
     mkpath(dirname(bathymetry_path(config.bathymetry_config)))
     print_grid_extents(grid)
 

@@ -206,15 +206,15 @@ open_tracer_boundary_conditions(::Val{edge}, config::RadiatingLateralBoundary, t
         for name in tracer_names
     )
 
-# Extends FjordSim's `boundary_conditions` hook, which is deliberately not re-exported (it would
-# shadow `Oceananigans.Fields.boundary_conditions`) — reached the way `CLAUDE.md`'s Import
-# Conventions section prescribes for extending a function you don't own: qualify the module, never
-# `import Mod: foo`. `field_boundary_conditions`'s internal call to `boundary_conditions(config, ...)`
-# dispatches to this method exactly as it does to the built-in ones, since a generic function has one
-# global method table regardless of which module adds a method to it. `forcing`/`forcing_config` are
-# unused — this variant runs with `forcing_config = nothing`, the same pattern `TopBottomFluxes`
-# already uses for the parameters it doesn't need.
-FjordSim.BoundaryConditions.boundary_conditions(config::RadiatingLateralBoundary, grid, forcing, forcing_config, tracers) =
+# Extends FjordSim's exported `boundary_condition_sides` hook — reached the way `CLAUDE.md`'s
+# Import Conventions section prescribes for extending a function you don't own: qualify the module,
+# never `import Mod: foo`. `MergedBoundaryConditions`'s internal call to
+# `boundary_condition_sides(piece, ...)` dispatches to this method exactly as it does to the
+# built-in ones, since a generic function has one global method table regardless of which module
+# adds a method to it. `forcing`/`forcing_config` are unused — this variant runs with
+# `forcing_config = nothing`, the same pattern `AirSeaFluxes` already uses for the parameters it
+# doesn't need.
+FjordSim.boundary_condition_sides(config::RadiatingLateralBoundary, grid, forcing, forcing_config, tracers) =
     recursive_merge(
         open_velocity_boundary_conditions(Val(config.edge), config),
         open_tracer_boundary_conditions(Val(config.edge), config, tracers),
@@ -284,7 +284,7 @@ function implicit_free_surface_grid(arch, grid_config::EvenGrid, static_grid, re
     return ImmersedBoundaryGrid(underlying_grid, PartialCellBottom(bottom_height); active_cells_map = false)
 end
 
-# Same nine fields as `CoupledHydrostaticSimulation`, plus `grid_config`, `relaxation_edge` and
+# The same component fields as `CoupledHydrostaticSimulation`, plus `grid_config`, `relaxation_edge` and
 # `boundary_band_cells`: `coupled_simulation` receives only the already-built static `grid`, and
 # needs these to rebuild the mutable-vertical-coordinate one described above, including the
 # flattened bathymetry's forced-water band at the open edge.
@@ -480,8 +480,9 @@ FjordConfig(
         # bottom drag, but the open southern edge now radiates velocity instead of holding it at a
         # closed wall — towards a quiescent exterior (`exterior_velocity = 0`) and the same T/S the
         # run starts at, rather than real forcing data.
-        boundary_conditions = (
-            TopBottomFluxes(bottom_drag_coefficient = 0.003),
+        boundary_conditions = MergedBoundaryConditions(
+            AirSeaFluxes(),
+            QuadraticBottomDrag(coefficient = 0.003),
             RadiatingLateralBoundary(
                 edge                 = relaxation_edge,
                 relaxation_timescale = relaxation_timescale,
@@ -509,7 +510,7 @@ FjordConfig(
         start_date         = DateTime(2020, 1, 1),
         stop_time          = 366days,
         loops              = 1,
-        progress_interval  = 1hour,
+        callbacks          = (ProgressCallback(name = :progress, interval = 1hour, report = progress),),
         pickup             = false,
     ),
 )

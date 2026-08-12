@@ -1,11 +1,15 @@
 module BoundaryConditions
 
-export top_bottom_boundary_conditions,
+export air_sea_flux_boundary_conditions,
+    quadratic_bottom_drag_boundary_conditions,
+    top_bottom_boundary_conditions,
     lateral_tracer_open_boundary_conditions,
-    boundary_conditions,
+    boundary_condition_sides,
     field_boundary_conditions,
-    TopBottomFluxes,
-    OpenLateralBoundary
+    AirSeaFluxes,
+    QuadraticBottomDrag,
+    OpenLateralBoundary,
+    MergedBoundaryConditions
 
 using Oceananigans
 using Oceananigans.BoundaryConditions:
@@ -16,12 +20,22 @@ using Oceananigans.BoundaryConditions:
 using Oceananigans.Units: Time
 using Oceananigans.Fields: ZeroField
 using NumericalEarth.Oceans: u_quadratic_bottom_drag, v_quadratic_bottom_drag, build_tracer_top_bc
-using ..Configs: AbstractBoundaryConditionConfig, AbstractForcingConfig
+using ..Configs:
+    AbstractBoundaryConditionConfig, AbstractBoundaryConditionSetConfig, AbstractForcingConfig
 using ..Forcing: boundary_value_time_series
 using ..Utils: recursive_merge
 
-""" Return a named tuple with boundary conditions """
-function top_bottom_boundary_conditions(; grid, bottom_drag_coefficient)
+"""
+    air_sea_flux_boundary_conditions(grid)
+
+The air-sea exchange surface: wind stress on `u` and `v`, and heat and salt flux on `T` and `S`,
+each as a fresh flux field the coupled model writes into.
+
+Only `T` and `S` get a top condition, deliberately: NumericalEarth assembles air-sea fluxes for heat
+and salt specifically, so a third tracer has no exchange to write into and no `build_tracer_top_bc`
+method to build one with.
+"""
+function air_sea_flux_boundary_conditions(grid)
     top_zonal_momentum_flux = τx = Field{Face,Center,Nothing}(grid)
     top_meridional_momentum_flux = τy = Field{Center,Face,Nothing}(grid)
     top_ocean_heat_flux = Jᵀ = Field{Center,Center,Nothing}(grid)
@@ -39,18 +53,55 @@ function top_bottom_boundary_conditions(; grid, bottom_drag_coefficient)
     freshwater_heat_content = Field{Center,Center,Nothing}(grid)
     freshwater_salt_content = ZeroField()
 
-    u_bot_bc =
-        FluxBoundaryCondition(u_quadratic_bottom_drag, discrete_form = true, parameters = bottom_drag_coefficient)
-    v_bot_bc =
-        FluxBoundaryCondition(v_quadratic_bottom_drag, discrete_form = true, parameters = bottom_drag_coefficient)
-
     return (
-        u = (top = FluxBoundaryCondition(τx), bottom = u_bot_bc),
-        v = (top = FluxBoundaryCondition(τy), bottom = v_bot_bc),
+        u = (top = FluxBoundaryCondition(τx),),
+        v = (top = FluxBoundaryCondition(τy),),
         T = (top = build_tracer_top_bc(Jᵀ, Jʷ, freshwater_heat_content, nothing, :T),),
         S = (top = build_tracer_top_bc(Jˢ, Jʷ, freshwater_salt_content, nothing, :S),),
     )
 end
+
+"""
+    quadratic_bottom_drag_boundary_conditions(coefficient)
+
+Quadratic drag on `u` and `v` at the bottom, at the given dimensionless drag `coefficient`.
+
+Needs neither the grid nor the forcing — `u_quadratic_bottom_drag` and `v_quadratic_bottom_drag` are
+discrete-form functions taking the coefficient as their parameter — which is exactly why it is
+separable from the surface half.
+"""
+quadratic_bottom_drag_boundary_conditions(coefficient) = (
+    u = (
+        bottom = FluxBoundaryCondition(
+            u_quadratic_bottom_drag,
+            discrete_form = true,
+            parameters = coefficient,
+        ),
+    ),
+    v = (
+        bottom = FluxBoundaryCondition(
+            v_quadratic_bottom_drag,
+            discrete_form = true,
+            parameters = coefficient,
+        ),
+    ),
+)
+
+"""
+    top_bottom_boundary_conditions(; grid, bottom_drag_coefficient)
+
+The air-sea surface and the drag bottom together, as one nested named tuple.
+
+Kept as the merge of `air_sea_flux_boundary_conditions` and
+`quadratic_bottom_drag_boundary_conditions` rather than as their common ancestor: the two halves
+share no computation, and a setup usually wants them as two independent configs it can swap one at a
+time. This remains the one place the whole `(u, v, T, S)` top-and-bottom shape is stated in a single
+expression, which is what the tests assert against.
+"""
+top_bottom_boundary_conditions(; grid, bottom_drag_coefficient) = recursive_merge(
+    air_sea_flux_boundary_conditions(grid),
+    quadratic_bottom_drag_boundary_conditions(bottom_drag_coefficient),
+)
 
 const LATERAL_EDGES = (:south, :north, :west, :east)
 
@@ -158,28 +209,59 @@ open_boundary_conditions(::Val{edge}) where {edge} = throw(
 )
 
 """
-    TopBottomFluxes(; bottom_drag_coefficient)
+    boundary_condition_sides(config, grid, forcing, forcing_config, tracers)
 
-The air-sea flux surface and the drag bottom: the boundary-condition piece every setup wants.
+One `AbstractBoundaryConditionConfig`'s contribution, as a nested named tuple keyed by field and
+then by side: `(u = (top = …, bottom = …), T = (top = …,))`.
 
-Contributes wind stress and heat/salt flux fields at the top and quadratic drag at the bottom, by
-way of `top_bottom_boundary_conditions` — see that function for why the tracer top conditions carry
-a `FreshwaterExchange` rather than being bare flux conditions.
+The per-piece hook. Named for what it returns — the per-field *sides* that
+`field_boundary_conditions` materializes — rather than `boundary_conditions`, which is what it used
+to be called. That name shadowed `Oceananigans.Fields.boundary_conditions`, so it was the one
+FjordSim hook that could not be re-exported and had to be reached as
+`FjordSim.BoundaryConditions.boundary_conditions`; and any caller binding a local of that name
+shadowed the hook it was trying to call.
 
-Only `T` and `S` get a top condition, and that is deliberate rather than an oversight: NumericalEarth
-assembles air-sea fluxes for heat and salt specifically, so a third tracer has no exchange to write
-into and no `build_tracer_top_bc` method to build one with. A biogeochemical tracer's surface
-condition belongs in its own `AbstractBoundaryConditionConfig`.
+Declared with no method, so a subtype that does not implement it fails as a `MethodError` naming the
+hook.
 """
-Base.@kwdef struct TopBottomFluxes <: AbstractBoundaryConditionConfig
-    bottom_drag_coefficient::Float64
+function boundary_condition_sides end
+
+"""
+    AirSeaFluxes()
+
+The air-sea exchange surface: wind stress on `u` and `v`, heat flux on `T` and salt flux on `S`.
+
+Carries no fields — the flux fields are allocated per grid, and everything that writes into them is
+NumericalEarth's business. See `air_sea_flux_boundary_conditions` for why the tracer top conditions
+carry a `FreshwaterExchange` rather than being bare flux conditions, and why a third tracer gets no
+top condition here. A biogeochemical tracer's surface condition belongs in its own
+`AbstractBoundaryConditionConfig`.
+
+Split from the bottom drag it used to be fused with, because the two are independent scientific
+statements sharing no computation: a setup can change its drag law, or drop drag entirely, without
+restating the surface.
+"""
+struct AirSeaFluxes <: AbstractBoundaryConditionConfig end
+
+boundary_condition_sides(::AirSeaFluxes, grid, forcing, forcing_config, tracers) =
+    air_sea_flux_boundary_conditions(grid)
+
+"""
+    QuadraticBottomDrag(; coefficient)
+
+Quadratic drag on `u` and `v` at the bottom.
+
+`coefficient` is the dimensionless drag coefficient the discrete-form drag functions take as their
+parameter.
+"""
+Base.@kwdef struct QuadraticBottomDrag <: AbstractBoundaryConditionConfig
+    coefficient::Float64
 end
 
-boundary_conditions(config::TopBottomFluxes, grid, forcing, forcing_config, tracers) =
-    top_bottom_boundary_conditions(;
-        grid = grid,
-        bottom_drag_coefficient = config.bottom_drag_coefficient,
-    )
+QuadraticBottomDrag(coefficient::Real) = QuadraticBottomDrag(Float64(coefficient))
+
+boundary_condition_sides(config::QuadraticBottomDrag, grid, forcing, forcing_config, tracers) =
+    quadratic_bottom_drag_boundary_conditions(config.coefficient)
 
 """
     OpenLateralBoundary()
@@ -190,34 +272,64 @@ The domain's open edge: a closed wall on the velocity normal to the forcing conf
 Carries no fields, because everything it needs is already stated in the forcing config — which edge
 (`relaxation_edge`) and how fast (`relaxation_timescale`) — and a second copy could only disagree
 with the interior relaxation band that reads the same two. A setup with no open edge leaves this out
-of its `boundary_conditions` tuple.
+of its `MergedBoundaryConditions`.
 """
 struct OpenLateralBoundary <: AbstractBoundaryConditionConfig end
 
-boundary_conditions(::OpenLateralBoundary, grid, forcing, forcing_config, tracers) =
+boundary_condition_sides(::OpenLateralBoundary, grid, forcing, forcing_config, tracers) =
     recursive_merge(
         open_boundary_conditions(Val(forcing_config.relaxation_edge)),
         lateral_tracer_open_boundary_conditions(grid, forcing, forcing_config, tracers),
     )
 
 """
-    field_boundary_conditions(configs, grid, forcing, forcing_config, tracers)
+    field_boundary_conditions(config, grid, forcing, forcing_config, tracers)
 
-Every boundary-condition config's contribution, merged and materialized into the `NamedTuple` of
-`FieldBoundaryConditions` a `HydrostaticFreeSurfaceModel` consumes.
+The boundary conditions a whole `AbstractBoundaryConditionSetConfig` describes, materialized into
+the `NamedTuple` a model constructor consumes.
 
-A separate name from `boundary_conditions` on purpose: one function returning a nested named tuple
-for a config and a materialized one for a tuple of configs would be two shapes behind one name, and
-a caller binding a local named `boundary_conditions` would shadow the hook it is trying to call.
+The set-level hook, and a separate name from `boundary_condition_sides` on purpose: one function
+returning a nested named tuple for one piece and a materialized one for a set of them would be two
+shapes behind a single name.
 
-Merging is last-wins, so the tuple's order is its precedence order. An empty tuple is a valid
-statement — a model with default boundary conditions everywhere — and yields `(;)`.
+Declared with no method, so a set config that does not implement it fails as a `MethodError` naming
+the hook.
 """
-function field_boundary_conditions(configs::Tuple, grid, forcing, forcing_config, tracers)
+function field_boundary_conditions end
+
+"""
+    MergedBoundaryConditions(pieces...)
+
+The built-in `AbstractBoundaryConditionSetConfig`: merge every piece's contribution with
+`recursive_merge`, then materialize each field's sides into `FieldBoundaryConditions`.
+
+Merging is last-wins per leaf, so argument order is precedence order. Naming no pieces at all is a
+valid statement — a model with default boundary conditions everywhere — and yields `(;)`.
+
+A struct rather than the bare `Tuple` this used to dispatch on. A `Tuple` is not a type any subtype
+can specialize, so the merge strategy and the `FieldBoundaryConditions` result shape were fixed for
+every model FjordSim could ever assemble; and it said nothing about what the tuple *was*. A model
+whose boundary objects are something else, or that wants precedence resolved another way, is now a
+sibling of this type.
+"""
+struct MergedBoundaryConditions{P<:Tuple} <: AbstractBoundaryConditionSetConfig
+    pieces::P
+end
+
+MergedBoundaryConditions(pieces::AbstractBoundaryConditionConfig...) =
+    MergedBoundaryConditions(pieces)
+
+function field_boundary_conditions(
+    config::MergedBoundaryConditions,
+    grid,
+    forcing,
+    forcing_config,
+    tracers,
+)
     merged = mapreduce(
-        config -> boundary_conditions(config, grid, forcing, forcing_config, tracers),
+        piece -> boundary_condition_sides(piece, grid, forcing, forcing_config, tracers),
         recursive_merge,
-        configs;
+        config.pieces;
         init = (;),
     )
 
