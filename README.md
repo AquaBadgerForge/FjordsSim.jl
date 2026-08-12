@@ -9,7 +9,7 @@ It contains both the simulation parameters and all the logic of a simulation.
 It is done using Julia main feature/paradigm - multiple dispatch.
 Providing new structs and overloading existing/new methods on them, a user can change anything.
 The same time, since the entire simulation is a config type file, all the parts are in one place, compact, and readable.
-For example, ['oslofjord'](examples/oslofjord.jl) is a modified version of the original oslofjorden.jl but with implicit sea surface and open velocity boundary conditions (in the original setup has free explicit sea surface and velocity boundary conditions are closed waiting for open bc fro explicit free surface to appear in oceananigans).
+For example, [`examples/oslofjorden.jl`](examples/oslofjorden.jl) is a modified version of the original `src/Setups/oslofjorden.jl` but with implicit sea surface and open velocity boundary conditions (in the original setup has free explicit sea surface and velocity boundary conditions are closed waiting for open bc fro explicit free surface to appear in oceananigans).
 
 ## Installation
 
@@ -98,5 +98,5 @@ A fjord does not have to live in FjordSim. Put the `FjordConfig` in a standalone
 expression is the config, and pass its path to `--config`:
 
 ```bash
-julia --project -m FjordSim run_simulation --config examples/oslofjord.jl
+julia --project -m FjordSim run_simulation --config examples/oslofjorden.jl
 ```

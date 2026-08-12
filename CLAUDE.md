@@ -6,8 +6,8 @@
 # Run all tests
 julia --project test/runtests.jl
 
-# Run the Oslofjord example simulation (requires GPU + data files); same as run_simulation below
-julia --project examples/oslofjord.jl
+# Run the out-of-tree Oslofjord example config (requires GPU + data files)
+julia --project -m FjordSim run_simulation --config examples/oslofjorden.jl
 
 # Prepare bathymetry for a configured fjord (downloads the Geonorge GDB on first use)
 julia --project -m FjordSim prepare_bathymetry --config drammensfjorden
@@ -827,10 +827,10 @@ modules, in `include` order from `src/FjordSim.jl`:
 
     Two non-obvious things about the entry point. `main` is **not exported**: Julia's startup runs
     `Main.main` after a script's body whenever that binding resolves to an entry point, so
-    exporting it would make every `using FjordSim` in a script — `test/runtests.jl`,
-    `examples/oslofjord.jl` — run the CLI on the way out. And the `@main` is bare, *after* the
-    definition: `@main function main(args) ... end` expands to a **call**, which would run the CLI
-    while the package precompiles.
+    exporting it would make every `using FjordSim` in a script — `test/runtests.jl`, or a config
+    file run directly rather than through `--config` — run the CLI on the way out. And the `@main` is
+    bare, *after* the definition: `@main function main(args) ... end` expands to a **call**, which
+    would run the CLI while the package precompiles.
 
 ## Adding a new source
 
@@ -1001,9 +1001,12 @@ output went. A step the setup opts out of returns `nothing` rather than raising,
 `::Nothing` methods of the lower arities; "you asked for a step this setup does not configure" is
 reported by `CLI.main`, because that is user input rather than a pipeline condition.
 
-`examples/oslofjord.jl` is the end-to-end simulation script and is now just
-`run_simulation(oslofjorden())` — everything it used to wire by hand is the setup's
-`SimulationConfig`.
+`examples/oslofjorden.jl` is the worked example of an out-of-tree config: a variant of
+`src/Setups/oslofjorden.jl` running an implicit free surface and a radiating open lateral boundary,
+which it gets by subtyping `AbstractFreeSurfaceConfig`, `AbstractBoundaryConditionConfig` and
+`AbstractGridConfig` in the file itself. It is not a runner — it is passed as
+`--config examples/oslofjorden.jl`, and it shares `oslofjorden()`'s `data_root` so the atmosphere
+prepare steps do not have to run twice.
 
 ## GPU & Kernel Compatibility
 

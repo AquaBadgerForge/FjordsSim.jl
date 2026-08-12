@@ -168,7 +168,8 @@ code; see `FjordSim.CLI.USAGE` for the subcommands.
 
 Deliberately *not* exported. Julia's startup runs `Main.main` after a script's body whenever that
 binding resolves to an entry point, so exporting this would make every `using FjordSim` in a
-script — `test/runtests.jl`, `examples/oslofjord.jl` — run the CLI on the way out.
+script — `test/runtests.jl`, or a config file run directly rather than through `--config` — run the
+CLI on the way out.
 """
 function main(args)
     return CLI.main(args)
