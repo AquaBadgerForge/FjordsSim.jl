@@ -21,6 +21,19 @@
                 "-O0"
             ]
         },
+        {
+            // `examples/oslofjord.jl` only constructs a `FjordConfig`; this runs
+            // `examples/debug_oslofjord.jl` instead, which builds and runs the simulation, so
+            // breakpoints inside `build_simulation`/`coupled_simulation`/etc. are reachable.
+            "type": "julia",
+            "request": "launch",
+            "name": "Debug Oslofjord",
+            "program": "${workspaceFolder}/examples/debug_oslofjord.jl",
+            "stopOnEntry": false,
+            "juliaAdditionalArgs": [
+                "-O0"
+            ]
+        },
         // The preparation steps have no launch config: the Julia debugger's `launch` request needs
         // a program file, and they are package functions now. Debug them from the Julia REPL:
         //   using FjordSim, Debugger
