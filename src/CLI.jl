@@ -6,7 +6,8 @@ using ..Configs: AbstractSimulationConfig, run_tag
 using ..Setups: fjord_config, setup_names
 using ..Bathymetry: prepare_bathymetry
 using ..Atmospheres: prepare_atmosphere, download_atmosphere
-using ..Forcing: prepare_forcing, download_forcing, add_rivers
+using ..Forcing:
+    prepare_forcing, download_forcing, add_rivers, download_boundaries, prepare_boundaries
 using ..Simulations: run_simulation
 
 """
@@ -20,6 +21,8 @@ const SUBCOMMANDS = [
     "download_forcing" => download_forcing,
     "prepare_forcing" => prepare_forcing,
     "add_rivers" => add_rivers,
+    "download_boundaries" => download_boundaries,
+    "prepare_boundaries" => prepare_boundaries,
     "download_atmosphere" => download_atmosphere,
     "prepare_atmosphere" => prepare_atmosphere,
     "run_simulation" => run_simulation,
@@ -61,6 +64,12 @@ Subcommands, in the order a setup is prepared and run:
                         not a command-line option.
   add_rivers            Write river relaxation into a copy of the prepared forcing, leaving the
                         original untouched. A setup with no rivers does nothing.
+  download_boundaries   Download and subset hourly source data along the open lateral boundary. A
+                        thin band rather than the whole domain, since the exterior state an open
+                        boundary needs has to resolve the tide and daily means do not. A setup
+                        whose forcing config names no `boundaries` does nothing.
+  prepare_boundaries    Regrid the download onto the open edge of the simulation grid. Needs
+                        prepare_bathymetry and download_boundaries.
   download_atmosphere   Download and subset the atmosphere dataset. By far the slowest step: NORA3
                         is served one file per forecast lead hour, so a year is close to 10000
                         OPeNDAP reads. A month already downloaded is skipped, so an interrupted run
@@ -71,7 +80,8 @@ Subcommands, in the order a setup is prepared and run:
   run_simulation        Build and run the coupled simulation, writing NetCDF snapshots into the
                         setup's results directory. Needs every step above that the setup
                         configures: prepare_bathymetry, prepare_forcing, add_rivers if it names
-                        rivers, and prepare_atmosphere if it names an atmosphere. Where it runs
+                        rivers, prepare_boundaries if it names open-boundary data, and
+                        prepare_atmosphere if it names an atmosphere. Where it runs
                         is the simulation config's `architecture` field. A setup with no
                         simulation config does nothing.
 

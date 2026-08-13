@@ -4,6 +4,7 @@ export AbstractGridConfig,
     AbstractBathymetryConfig,
     AbstractForcingConfig,
     AbstractRiverConfig,
+    AbstractBoundaryDataConfig,
     AbstractAtmosphereConfig,
     AbstractSimulationConfig,
     AbstractCoupledSimulationConfig,
@@ -20,6 +21,8 @@ export AbstractGridConfig,
     forcing_path,
     forcing_directory,
     river_forcing_path,
+    boundary_data_path,
+    boundary_data_directory,
     atmosphere_path,
     atmosphere_directory,
     results_path,
@@ -123,13 +126,19 @@ how to download and subset it.
 # Fields a subtype provides
 - `data_root`, `output_file`, `plot_file`: resolved by `forcing_path` and `plot_path`.
 - `output_directory`: resolved by `forcing_directory`; only needed by a dataset that downloads.
-- `relaxation_edge`, `relaxation_cells`, `relaxation_timescale`: read by the generic
-  `water_mask` and `relaxation_lambda`.
+- `open_edge`: which lateral boundary the domain is open on, one of `:south`, `:north`, `:west` or
+  `:east`. Read by `water_mask`, which unmasks that edge's velocity face row, and by the
+  boundary-condition configs, which put the open conditions there. Named `relaxation_edge` while the
+  edge carried an interior relaxation band; that band is gone — `prepare_forcing` writes zero
+  lambdas — so the edge is now only ever the open one.
 - `parameters`: source variable names to prepare.
 - `architecture`: `:auto`, `:cpu` or `:gpu`, resolved by `interpolation_architecture` to decide
   where `prepare_forcing` runs its interpolation kernel.
 - `rivers`: an `AbstractRiverConfig` read by `add_rivers`, or `nothing` for no rivers. Only
   needed by a setup that adds rivers.
+- `boundaries`: an `AbstractBoundaryDataConfig` read by `prepare_boundaries` and by the open
+  lateral boundary condition, or `nothing` for a setup with no open-boundary data. Only needed by a
+  setup whose lateral boundary is driven by data.
 
 # Methods a subtype provides
 - `forcing_time_steps(config)`: the downloaded time records, as `SourceRecord`s. Required.
@@ -181,6 +190,50 @@ entirely.
 river dataset; `src/Forcing/of800_rivers.jl` is the template to copy for a new dataset.
 """
 abstract type AbstractRiverConfig end
+
+"""
+    AbstractBoundaryDataConfig
+
+Supertype for open-boundary *data* configurations. A concrete subtype describes one dataset of
+exterior state along a lateral boundary, and how to download and regrid it into the boundary NetCDF
+the open lateral boundary condition reads.
+
+Not to be confused with `AbstractBoundaryConditionConfig`, one word away: that one describes the
+boundary *condition* — which scheme acts where, and how fast it nudges — while this one describes
+the exterior *values* the condition relaxes towards. One is physics, the other is data.
+
+Open-boundary data is optional, like rivers: a forcing config whose `boundaries` field is `nothing`
+skips both boundary steps entirely, and a closed domain names none.
+
+The boundary file is separate from the prepared forcing file rather than a part of it, because the
+exterior state a Flather/Orlanski boundary needs is **hourly** — a daily mean has the tide averaged
+out of it, and elevation with no tide is not worth prescribing. Only the boundary row needs that
+cadence, so it is a few hundred MB rather than the hundreds of GB an hourly interior forcing would
+be. Every variable in the file is named for its side (`south_T`, `south_eta`, …), so a second open
+edge is a set of new variables in the same file rather than a new file or a format change.
+
+# Fields a subtype provides
+- `data_root`, `output_file`, `plot_file`: resolved by `boundary_data_path` and `plot_path`.
+- `output_directory`: resolved by `boundary_data_directory`; the directory the download writes its
+  intermediate files into.
+- `parameters`: source variable names to prepare.
+- `architecture`: `:auto`, `:cpu` or `:gpu`, resolved by `interpolation_architecture`.
+
+# Methods a subtype provides
+- `boundary_time_steps(config)`: the downloaded time records, as `SourceRecord`s. Required.
+- `boundary_source_grid(config, filepath)`: geometry of the source data, e.g. a
+  `ProjectedSourceGrid`. Required.
+- `boundary_variable_names(config)`: source variable name => FjordSim boundary name. Required.
+- `download_boundaries(target_grid, edge, config)`: fetch the source data. Only if it downloads.
+- `boundary_date_range(config)`: first and last date the prepared file covers, as a
+  `(first, last)` tuple, or `nothing` to skip the check. Optional; defaults to reading `ds["time"]`
+  from the prepared NetCDF, so `validate_time_coverage` also guards the `Cyclical()` wrap here.
+
+`FjordSim.Forcing.NorKystBoundariesConfig` is the built-in implementation, for MET Norway's hourly
+NorKyst-800m collection; `src/Forcing/norkyst_boundaries.jl` is the template to copy for a new
+dataset.
+"""
+abstract type AbstractBoundaryDataConfig end
 
 """
     AbstractAtmosphereConfig
@@ -318,11 +371,15 @@ returns the *nested named tuple* shape (`(u = (top = …, bottom = …), T = (to
 `FieldBoundaryConditions`.
 
 # Methods a subtype provides
-- `boundary_condition_sides(config, grid, forcing, forcing_config, tracers)`: the nested named tuple
-  this piece contributes, keyed by field and then by side. Required.
+- `boundary_condition_sides(config, grid, forcing, forcing_config, tracers[, boundaries])`: the
+  nested named tuple this piece contributes, keyed by field and then by side. Required. Implement the
+  six-argument form only if the piece reads the prepared open-boundary state (`boundaries`, from
+  `FjordSim.Forcing.boundary_series`, or `nothing`); the five-argument form is reached through a
+  forwarding fallback, which is what lets a piece that carries its own exterior state ignore it.
 
 `FjordSim.BoundaryConditions.AirSeaFluxes`, `FjordSim.BoundaryConditions.QuadraticBottomDrag` and
-`FjordSim.BoundaryConditions.OpenLateralBoundary` are the built-in implementations.
+`FjordSim.BoundaryConditions.OpenLateralBoundaryFromForcing` are the built-in implementations. Not to
+be confused with `AbstractBoundaryDataConfig`, which is the exterior *data* rather than the scheme.
 """
 abstract type AbstractBoundaryConditionConfig end
 
@@ -342,7 +399,7 @@ objects are not Oceananigans `FieldBoundaryConditions`, or that wants something 
 last-wins merging, is now a new subtype here rather than an edit to that function.
 
 # Methods a subtype provides
-- `field_boundary_conditions(config, grid, forcing, forcing_config, tracers)`: the materialized
+- `field_boundary_conditions(config, grid, forcing, forcing_config, tracers, boundaries)`: the materialized
   boundary conditions, as the `NamedTuple` the model constructor consumes. Required.
 
 `FjordSim.BoundaryConditions.MergedBoundaryConditions` is the built-in implementation.
@@ -439,6 +496,7 @@ forcing_path(config::AbstractForcingConfig) = joinpath(config.data_root, config.
 atmosphere_path(config::AbstractAtmosphereConfig) = joinpath(config.data_root, config.output_file)
 plot_path(config::AbstractBathymetryConfig) = joinpath(config.data_root, config.plot_file)
 plot_path(config::AbstractForcingConfig) = joinpath(config.data_root, config.plot_file)
+plot_path(config::AbstractBoundaryDataConfig) = joinpath(config.data_root, config.plot_file)
 plot_path(config::AbstractAtmosphereConfig) = joinpath(config.data_root, config.plot_file)
 
 """
@@ -458,6 +516,22 @@ forcing file written by `add_rivers`. Defined for every `AbstractRiverConfig`, s
 dataset inherits path resolution. An absolute `output_file` is returned unchanged.
 """
 river_forcing_path(config::AbstractRiverConfig) = joinpath(config.data_root, config.output_file)
+
+"""
+    boundary_data_path(config)
+    boundary_data_directory(config)
+
+Resolve `config.output_file` and `config.output_directory` against `config.data_root`: the prepared
+open-boundary NetCDF written by `prepare_boundaries`, and the directory `download_boundaries` writes
+its intermediate files into. Defined for every `AbstractBoundaryDataConfig`, so a new dataset
+inherits path resolution. An absolute field is returned unchanged.
+
+The edge is *not* in the filename: every variable in the file is prefixed with its side, so one file
+holds however many boundaries a setup opens.
+"""
+boundary_data_path(config::AbstractBoundaryDataConfig) = joinpath(config.data_root, config.output_file)
+boundary_data_directory(config::AbstractBoundaryDataConfig) =
+    joinpath(config.data_root, config.output_directory)
 
 """
     atmosphere_directory(config)

@@ -46,7 +46,8 @@ using ..Configs:
     simulation_grid
 using ..Utils: progress, cell_advection_timescale_coupled_model
 using ..Atmospheres: prescribed_atmosphere, prescribed_radiation, atmosphere_date_range
-using ..Forcing: simulation_forcing, forcing_date_range, interpolation_architecture
+using ..Forcing:
+    simulation_forcing, forcing_date_range, interpolation_architecture, boundary_series, boundary_date_range
 using ..BoundaryConditions: field_boundary_conditions
 
 """
@@ -238,8 +239,8 @@ extra_kwargs(model::CoupledHydrostaticSimulation, slot::Symbol) =
 The tracer names a coupled-model config carries.
 
 A hook rather than a field read, because `build_simulation` needs them long before the model exists:
-`simulation_forcing` builds one term per tracer, `OpenLateralBoundary` opens one lateral condition per
-tracer, and `resolve_initial_conditions` reads one state variable per tracer. All three ask the model
+`simulation_forcing` builds one term per tracer, `OpenLateralBoundaryFromForcing` opens one lateral
+condition per tracer, and `resolve_initial_conditions` reads one state variable per tracer. All three ask the model
 config what it simulates rather than being told a second time.
 """
 model_tracers(model::CoupledHydrostaticSimulation) = model.tracers
@@ -767,6 +768,23 @@ function resolve_forcing_file(forcing_config::AbstractForcingConfig)
 end
 
 """
+    boundary_data_config(forcing_config)
+    open_edge(forcing_config)
+
+The open-boundary dataset a forcing config names and the edge it sits on, or `nothing` and `nothing`
+for a setup naming no forcing at all.
+
+Two one-liners rather than reaching into `config.forcing_config.boundaries` at the call site, because
+`build_simulation` has to work for a `forcing_config` of `nothing` and every other field read there
+already goes through a `::Nothing` method.
+"""
+boundary_data_config(::Nothing) = nothing
+boundary_data_config(forcing_config::AbstractForcingConfig) = forcing_config.boundaries
+
+open_edge(::Nothing) = nothing
+open_edge(forcing_config::AbstractForcingConfig) = forcing_config.open_edge
+
+"""
     validate_time_coverage(label, range, start_date, stop_time, remedy)
 
 Check a prepared file's date `range` contains the run's whole interval.
@@ -1211,6 +1229,13 @@ function build_simulation(config::FjordConfig)
         stop_time,
         "prepare more years of atmosphere",
     )
+    validate_time_coverage(
+        "open-boundary data",
+        boundary_date_range(boundary_data_config(config.forcing_config)),
+        start_date,
+        stop_time,
+        "prepare more years of open-boundary data",
+    )
 
     architecture = simulation_architecture(simulation_config)
     grid = simulation_grid(config.grid_config, bathymetry_file, architecture)
@@ -1225,6 +1250,16 @@ function build_simulation(config::FjordConfig)
     # Dispatched on the forcing config rather than a hardcoded `forcing_from_file` call, so a
     # source whose prepared files are not that NetCDF contract could read a different way.
     forcing = simulation_forcing(config.forcing_config, grid, forcing_file, tracers, start_date)
+    # The exterior state along the open edge, on the same `start_date`-zeroed time axis as the
+    # forcing and the atmosphere. Read here rather than inside the boundary config for exactly that
+    # reason: this is the one place `start_date` is known, and a config that opened the file itself
+    # would need telling that instant a second time.
+    boundaries = boundary_series(
+        boundary_data_config(config.forcing_config),
+        grid,
+        open_edge(config.forcing_config),
+        start_date,
+    )
     # Named `model_boundary_conditions` rather than `boundary_conditions`, which is the hook each
     # piece of it was built by: assigning to that name here would make it a local and shadow the
     # function for the rest of this body.
@@ -1234,6 +1269,7 @@ function build_simulation(config::FjordConfig)
         forcing,
         config.forcing_config,
         tracers,
+        boundaries,
     )
 
     initial_conditions = resolve_initial_conditions(

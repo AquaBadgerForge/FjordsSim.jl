@@ -14,7 +14,7 @@ using Oceananigans:
     WENO,
     WENOVectorInvariant
 using Oceananigans.TurbulenceClosures: HorizontalScalarBiharmonicDiffusivity
-using Oceananigans.Units: days, hour, minute, minutes, second
+using Oceananigans.Units: day, days, hour, minute, minutes, second
 using SeawaterPolynomials.TEOS10: TEOS10EquationOfState
 using NumericalEarth: FreezingLimitedOceanTemperature
 
@@ -179,6 +179,14 @@ test_forcing_config(; data_root = tempdir(), kwargs...) = NorKystConfig(;
     kwargs...,
 )
 
+test_boundaries_config(; data_root = tempdir(), kwargs...) = NorKystBoundariesConfig(;
+    data_root,
+    output_directory = "norkyst_hourly",
+    parameters = ["temperature", "salinity", "u_eastward", "v_northward", "zeta", "ubar", "vbar"],
+    years = [2020],
+    kwargs...,
+)
+
 test_atmosphere_config(; data_root = tempdir(), kwargs...) = NORA3Config(;
     data_root,
     output_directory = "nora3",
@@ -287,7 +295,7 @@ test_time_stepping(;
 test_boundary_conditions() = MergedBoundaryConditions(
     AirSeaFluxes(),
     QuadraticBottomDrag(coefficient = 0.003),
-    OpenLateralBoundary(),
+    OpenLateralBoundaryFromForcing(inflow_timescale = 1day, outflow_timescale = 360days),
 )
 
 test_progress_callback(; name = :progress, interval = 1hour, report = progress) =
@@ -455,6 +463,139 @@ function write_prepared_forcing(
                 isnothing(land) || (slab[land...] = NaN32)
                 values[:, :, :, index] = slab
                 lambdas[:, :, :, index] = fill(Float32(lambda), shape)
+            end
+        end
+    end
+
+    return filepath
+end
+
+"""
+    write_prepared_boundaries(filepath; size, edge = :south,
+                              names = ("T", "S", "u", "v", "eta", "ubar", "vbar"),
+                              dates = ..., value = (name, index) -> 1.0f0, land = nothing)
+
+A NetCDF file in exactly the layout `prepare_boundaries` writes: the same six spatial dimensions the
+forcing file defines, one `Float32` variable per name *prefixed with its edge*, no `_lambda` twins, a
+CF-encoded `time`, and the `open_edge` global attribute.
+
+The staggering and rank come from `Forcing.boundary_dimension_names`, the same function
+`prepare_boundaries` writes with, so a change to the layout earns a failing read rather than a
+passing test against a file the model cannot use.
+
+- `value(name, index)`: what fills variable `name` (unprefixed) at record `index`.
+- `land`: an along-boundary index set to `NaN32` in every variable, the way `prepare_boundaries`
+  marks a dry boundary cell — what `fill_boundary_gaps!` then fills on read.
+"""
+function write_prepared_boundaries(
+    filepath;
+    size,
+    edge = :south,
+    names = ("T", "S", "u", "v", "eta", "ubar", "vbar"),
+    dates = [DateTime(2020, 1, 1), DateTime(2020, 1, 1, 1)],
+    value = (name, index) -> 1.0f0,
+    land = nothing,
+)
+    Nx, Ny, Nz = size
+
+    NCDataset(filepath, "c") do ds
+        for (name, length) in (
+            "Nx" => Nx, "Ny" => Ny, "Nz" => Nz,
+            "Nx_faces" => Nx + 1, "Ny_faces" => Ny + 1, "Nz_faces" => Nz + 1,
+        )
+            defDim(ds, name, length)
+        end
+        defDim(ds, "time", Base.length(dates))
+        defVar(ds, "time", dates, ("time",))
+        ds.attrib["open_edge"] = String(edge)
+
+        for name in names
+            dimensions = FjordSim.Forcing.boundary_dimension_names(Val(edge), name)
+            shape = ntuple(index -> ds.dim[dimensions[index]], Base.length(dimensions) - 1)
+            variable = defVar(ds, FjordSim.Forcing.boundary_variable_name(edge, name), Float32,
+                              dimensions; attrib = ["_FillValue" => NaN32])
+
+            for index in eachindex(dates)
+                slab = fill(Float32(value(name, index)), shape)
+                isnothing(land) || (selectdim(slab, 1, land) .= NaN32)
+                variable[ntuple(_ -> Colon(), Base.length(shape))..., index] = slab
+            end
+        end
+    end
+
+    return filepath
+end
+
+"""
+    write_hourly_source_stub(filepath; dates, longitude, latitude, depths = [0.0, 5.0, 20.0],
+                             value = (name, level, index) -> ...)
+
+One downloaded hourly-NorKyst month, as `download_boundaries` writes it: `X`/`Y`/`depth`/`time`
+dimensions, 2D `lon`/`lat`, the `projection_stere.proj4` attribute `boundary_source_grid` reads, four
+full-depth variables and three surface ones.
+
+The projected `X`/`Y` box is derived from the target `longitude`/`latitude` through
+`projected_target_nodes`, so it actually contains the projected target nodes — a box in arbitrary
+metres would put every node outside the source and make `interpolate` extrapolate to `±Inf`.
+
+This is the only fixture that drives the real `prepare_boundaries` write path; `write_prepared_forcing`
+and `write_prepared_boundaries` hand-roll the *output* layout instead.
+"""
+const NORKYST_STUB_PROJ4 = "+proj=stere +lat_0=90 +lat_ts=60 +lon_0=70 +x_0=3192800 +y_0=1784000 " *
+                           "+a=6371000 +b=6371000 +units=m +no_defs"
+
+function write_hourly_source_stub(
+    filepath;
+    dates,
+    longitude,
+    latitude,
+    depths = [0.0, 5.0, 20.0],
+    value = (name, level, index) -> Float32(level + index),
+    source_size = (6, 5),
+)
+    NX, NY = source_size
+
+    NCDataset(filepath, "c") do ds
+        defDim(ds, "X", NX)
+        defDim(ds, "Y", NY)
+        defDim(ds, "depth", length(depths))
+        defDim(ds, "time", length(dates))
+
+        probe = FjordSim.Forcing.ProjectedSourceGrid([0.0], [0.0], [0.0], NORKYST_STUB_PROJ4)
+        x, y = FjordSim.Forcing.projected_target_nodes(
+            collect(longitude), collect(latitude), probe,
+        )
+        defVar(ds, "X", Float64, ("X",))[:] =
+            collect(range(minimum(x) - 800.0, maximum(x) + 800.0, length = NX))
+        defVar(ds, "Y", Float64, ("Y",))[:] =
+            collect(range(minimum(y) - 800.0, maximum(y) + 800.0, length = NY))
+        defVar(ds, "depth", Float64, ("depth",))[:] = depths
+        defVar(ds, "time", collect(dates), ("time",))
+
+        defVar(ds, "lon", Float64, ("X", "Y"))[:, :] = [
+            longitude[1] + (longitude[2] - longitude[1]) * (i - 1) / (NX - 1) for i = 1:NX, j = 1:NY
+        ]
+        defVar(ds, "lat", Float64, ("X", "Y"))[:, :] = [
+            latitude[1] + (latitude[2] - latitude[1]) * (j - 1) / (NY - 1) for i = 1:NX, j = 1:NY
+        ]
+
+        projection = defVar(ds, "projection_stere", Int32, ())
+        projection.attrib["proj4"] = NORKYST_STUB_PROJ4
+        projection[] = Int32(0)
+
+        for name in ("temperature", "salinity", "u_eastward", "v_northward")
+            variable = defVar(ds, name, Float32, ("X", "Y", "depth", "time");
+                              attrib = ["_FillValue" => NaN32])
+            for index in eachindex(dates), level in eachindex(depths)
+                variable[:, :, level, index] = fill(value(name, level, index), NX, NY)
+            end
+        end
+
+        for name in ("zeta", "ubar", "vbar")
+            variable = defVar(ds, name, Float32, ("X", "Y", "time");
+                              attrib = ["_FillValue" => NaN32])
+            for index in eachindex(dates)
+                variable[:, :, index] = fill(value(name, 1, index), NX, NY)
             end
         end
     end

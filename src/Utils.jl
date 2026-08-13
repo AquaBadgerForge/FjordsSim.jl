@@ -133,4 +133,14 @@ function recursive_merge(a::NamedTuple, b::NamedTuple)
     return (; result_pairs...)
 end
 
+"""
+    recursive_merge(a, b, rest...)
+
+Fold `recursive_merge` left to right over any number of named tuples, so later arguments win per
+leaf exactly as they do for two. A boundary config contributing several independent groups — an open
+edge contributes one per part of the state — merges them in one call rather than nesting pairs.
+"""
+recursive_merge(a::NamedTuple, b::NamedTuple, rest::NamedTuple...) =
+    foldl(recursive_merge, rest; init = recursive_merge(a, b))
+
 end # module

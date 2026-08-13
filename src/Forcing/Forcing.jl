@@ -9,7 +9,7 @@ using Oceananigans.Grids: active_cell, peripheral_node, x_domain, y_domain
 using Oceananigans.Fields: interpolate
 using Oceananigans.Utils: launch!
 using KernelAbstractions: @kernel, @index, @Const
-using Dates: DateTime, Day, Millisecond, Second
+using Dates: DateTime, Day, Hour, Millisecond, Second
 import Dates
 using Adapt
 using ArchGDAL
@@ -23,15 +23,18 @@ import Oceananigans.OutputReaders: new_backend
 using ..Configs:
     AbstractForcingConfig,
     AbstractRiverConfig,
+    AbstractBoundaryDataConfig,
     FjordConfig,
     bathymetry_path,
     forcing_path,
     forcing_directory,
     river_forcing_path,
+    boundary_data_path,
+    boundary_data_directory,
     coverage_window,
     domain_grid,
     simulation_grid
-using ..Plotting: plot_forcing
+using ..Plotting: plot_forcing, plot_boundaries
 
 export forcing_from_file,
     simulation_forcing,
@@ -52,7 +55,17 @@ export forcing_from_file,
     river_search_radius,
     RiverLocation,
     OF800RiversConfig,
-    boundary_value_time_series
+    LATERAL_EDGES,
+    validate_open_edge,
+    download_boundaries,
+    prepare_boundaries,
+    boundary_series,
+    boundary_time_steps,
+    boundary_source_grid,
+    boundary_variable_names,
+    boundary_date_range,
+    boundary_variable_name,
+    NorKystBoundariesConfig
 
 """ Custom backend for FieldTimeSeries """
 struct NetCDFBackend <: AbstractInMemoryBackend{Int}
@@ -119,8 +132,8 @@ Only dimensionally valid for a tracer-like field: a velocity tendency needs acce
 which nothing here supplies. `ForcingFromFile` is generic in `field_name`, so this is reachable for
 any field whose `λ` happens to fall in `λ > 1` — it is the caller's responsibility to only route a
 field here when `flux` really is a flux density for that field. There is currently no producer of
-this `λ` regime at all (`relaxation_lambda` and the river forcing both always write
-`|λ| = 1/relaxation_timescale < 1`), so this function is unreachable in practice; it is kept, named
+this `λ` regime at all — `prepared_variable` writes zeros and the river forcing writes
+`|λ| = 1/relaxation_timescale < 1` — so this function is unreachable in practice; it is kept, named
 honestly, for the day a producer of `λ > 1` exists.
 """
 function forcing_term_x_flux(λ, flux, i, j, k, grid, args...)
@@ -267,21 +280,6 @@ function forcing_get_tuple(
 end
 
 """
-    boundary_value_time_series(forcing, name)
-
-The `FieldTimeSeries` of prescribed exterior values `forcing_from_file` built for `name` — the same
-series `ForcingFromFile` already relaxes the interior band towards. Reused unchanged as the exterior
-value a lateral tracer open boundary condition relaxes towards at the domain edge itself:
-`prepare_forcing` already writes valid (non-`NaN`) data there for every field it prepares, since a
-Center-located tracer cell at the true edge is an ordinary active cell, not a halo — no masking
-special-case is needed the way the velocity face row needed `open_boundary_water!`.
-
-`forcing` is the named tuple `forcing_from_file` returns; `name` one of its keys — typically `:T`
-or `:S`.
-"""
-boundary_value_time_series(forcing, name::Symbol) = getproperty(forcing, name).fts_value
-
-"""
 Return a named tuple of forcing functions for all available variables in a NetCDF file.
 
 `reference_date` is the instant the time axis is zeroed at, `nothing` meaning the file's own
@@ -384,11 +382,21 @@ forcing_date_range(::Nothing, filepath) = nothing
 # --- Forcing preparation ---
 
 const FORCING_DEFLATE_LEVEL = 5
-const RELAXATION_EDGES = (:south, :north, :west, :east)
+
+"""
+The four lateral boundaries a regional domain can be open on, in the order every error message
+lists them.
+
+Defined here rather than in `BoundaryConditions` because that module is included after this one and
+both need it: `validate_open_edge` checks a forcing config's `open_edge` before any regridding, and
+every `Val{edge}` dispatch in the boundary conditions falls back to an `ArgumentError` naming this
+tuple. There used to be one copy per module, with identical contents, an identical membership test
+and an identical error string.
+"""
+const LATERAL_EDGES = (:south, :north, :west, :east)
 # Longest run of missing days interpolated without a separate warning, matching the default of
 # `NumericalEarth.DataWrangling.fill_gaps!`.
 const FORCING_MAX_GAP = 6
-const MILLISECONDS_PER_DAY = 86_400_000
 
 """
     interpolation_architecture(config)
@@ -402,8 +410,15 @@ Where `prepare_forcing` runs its interpolation kernel, from `config.architecture
 
 Only the kernel moves; `target_grid` and the masks stay on the CPU because building them walks
 `peripheral_node` cell by cell.
+
+Defined for a boundary-data config too, which reads its `architecture` field the same way and runs
+the same kernel. `Simulations.simulation_architecture` also reuses the `Val` methods below, which is
+why the resolution and the field read are separate methods rather than one function.
 """
 interpolation_architecture(config::AbstractForcingConfig) =
+    interpolation_architecture(Val(config.architecture))
+
+interpolation_architecture(config::AbstractBoundaryDataConfig) =
     interpolation_architecture(Val(config.architecture))
 
 interpolation_architecture(::Val{:cpu}) = CPU()
@@ -474,14 +489,18 @@ download_forcing(config::FjordConfig) =
 download_forcing(target_grid, ::Nothing) = nothing
 
 """
-    validate_relaxation_edge(edge)
+    validate_open_edge(edge)
 
 Return `edge` if it names a lateral boundary, else throw. Checked up front so a typo fails
 before any regridding rather than deep inside the variable loop.
+
+`LATERAL_EDGES` lives in `BoundaryConditions`, which is included after this module, so the tuple is
+stated here and that module imports it — previously each held its own copy under a different name,
+with an identical membership test and an identical error string.
 """
-function validate_relaxation_edge(edge)
-    edge in RELAXATION_EDGES ||
-        throw(ArgumentError("relaxation_edge must be one of $RELAXATION_EDGES, got :$edge"))
+function validate_open_edge(edge)
+    edge in LATERAL_EDGES ||
+        throw(ArgumentError("open_edge must be one of $LATERAL_EDGES, got :$edge"))
     return edge
 end
 
@@ -580,11 +599,18 @@ nodes of its Oceananigans location, how to fill its source mask, and its relaxat
 
 `x` and `y` are the target nodes projected into the source coordinate system, held as 2D arrays
 so the interpolation kernel only indexes them.
+
+Parametric in the number of NetCDF dimension names, which is the one thing an interior forcing
+variable and an open-boundary one disagree about: four for the forcing file's
+`(along, across, Nz, time)`, three or two for the boundary file, whose across-edge dimension is one
+cell and whose surface variables have no depth axis. Everything else — the three-dimensional mask
+with its one-cell slab, the projected nodes, the source fill — is shared, which is why
+`prepare_boundaries` reuses this type rather than defining its own.
 """
-struct PreparedVariable
+struct PreparedVariable{N}
     source_name::String
     name::String
-    dimensions::NTuple{4,String}
+    dimensions::NTuple{N,String}
     mask::Array{Bool,3}
     x::Matrix{Float64}
     y::Matrix{Float64}
@@ -592,6 +618,22 @@ struct PreparedVariable
     mask_fill::SourceFill
     lambda::Array{Float32,3}
 end
+
+# A hand-written constructor because `Base.@kwdef`-style automatic conversion does not happen for a
+# *parametric* struct: the generated constructor keeps the declared field types in its signature, so
+# the `BitArray` `water_mask` returns would not match `Array{Bool,3}`.
+PreparedVariable(source_name, name, dimensions::NTuple{N,String}, mask, x, y, z, mask_fill, lambda) where {N} =
+    PreparedVariable{N}(
+        String(source_name),
+        String(name),
+        dimensions,
+        Array{Bool,3}(mask),
+        Matrix{Float64}(x),
+        Matrix{Float64}(y),
+        Vector{Float64}(z),
+        mask_fill,
+        Array{Float32,3}(lambda),
+    )
 
 """
     prepare_forcing(target_grid, config::AbstractForcingConfig)
@@ -618,10 +660,13 @@ bathymetry. Only the target nodes, mask and output buffer are moved to the inter
 and only the finished slab comes back for each write, so a GPU run keeps the same streaming
 memory profile.
 
-Relaxation lambdas taper linearly from `1 / config.relaxation_timescale` at the true edge to `0` at
-the inner edge of the `config.relaxation_cells`-wide band along `config.relaxation_edge`, and are
-zero elsewhere, so only that band relaxes towards the source data, most strongly right at the
-boundary.
+Relaxation lambdas are written as **zero everywhere**. The interior sponge band this file used to
+carry along `open_edge` is gone: the open lateral boundary now nudges towards hourly exterior data at
+the boundary itself (`NormalRadiation`, `GravityWaveRadiation`), and a band relaxing the same
+variables a few cells inside would fight it. `add_rivers` writes the only nonzero lambdas the file
+ever carries, so the `*_lambda` variables exist for that step and for
+`forcing_from_file`'s own contract, and the prepared values are otherwise read only as initial
+conditions (`FromForcing`).
 
 # Why the interpolation is not `NumericalEarth`'s
 
@@ -652,7 +697,7 @@ function prepare_forcing(target_grid, config::AbstractForcingConfig; coverage = 
         "Known $(nameof(typeof(config))) variables: $(sort(collect(keys(variable_names)))).",
     )
 
-    validate_relaxation_edge(config.relaxation_edge)
+    validate_open_edge(config.open_edge)
 
     steps = pad_time_steps(daily_time_steps(forcing_time_steps(config)), coverage)
     reference_file = first(steps).lower.filepath
@@ -716,51 +761,64 @@ function prepare_forcing(config::FjordConfig)
 end
 
 """
-    daily_time_steps(records; max_gap = FORCING_MAX_GAP)
+    uniform_time_steps(records, spacing; max_gap, unit)
 
-Complete `records` to a gap-free daily axis, linearly interpolating any missing day between the
-records bracketing it. Downloaded months are occasionally short a day, which would otherwise
+Complete `records` to a gap-free axis at `spacing`, linearly interpolating any missing step between
+the records bracketing it. Downloaded months are occasionally short a record, which would otherwise
 leave a hole in the cyclical forcing period.
 
-A gap longer than `max_gap` days is still interpolated, but warned about separately: MET's
+A gap longer than `max_gap` steps is still interpolated, but warned about separately: MET's
 NorKyst archive is missing whole weeks in 2017 and 2018, and papering over those silently would
-misrepresent the forcing. Returned as single-record steps if the times are not on a whole-day
+misrepresent the forcing. Returned as single-record steps if the times are not on a whole-`spacing`
 cadence.
+
+`unit` only names the spacing in the warnings. Written generically because the interior forcing is
+daily and the open-boundary data is hourly, and the gap-filling argument is identical for both.
 """
-function daily_time_steps(records; max_gap = FORCING_MAX_GAP)
+function uniform_time_steps(records, spacing::Dates.Period; max_gap, unit)
     single(record) = ForcingTimeStep(record.date, record, record, 0)
 
     differences = diff([record.date for record in records])
-    if !all(difference -> difference % Day(1) == Millisecond(0), differences)
-        @warn "Source times are not on a whole-day cadence; using them as downloaded."
+    if !all(difference -> difference % spacing == Millisecond(0), differences)
+        @warn "Source times are not on a whole-$unit cadence; using them as downloaded."
         return map(single, records)
     end
 
     steps = ForcingTimeStep[]
     interpolated = DateTime[]
+    step_milliseconds = Dates.value(Millisecond(spacing))
 
     for n = 1:length(records)-1
         lower = records[n]
         upper = records[n+1]
         push!(steps, single(lower))
 
-        span = Dates.value(upper.date - lower.date) ÷ MILLISECONDS_PER_DAY
-        span > max_gap + 1 && @warn "Source gap of $(span - 1) day(s) after $(lower.date) " *
+        span = Dates.value(upper.date - lower.date) ÷ step_milliseconds
+        span > max_gap + 1 && @warn "Source gap of $(span - 1) $unit(s) after $(lower.date) " *
                                     "exceeds max_gap = $max_gap; interpolating anyway"
 
-        for missing_day = 1:span-1
-            date = lower.date + Day(missing_day)
+        for missing_step = 1:span-1
+            date = lower.date + missing_step * spacing
             push!(interpolated, date)
-            push!(steps, ForcingTimeStep(date, lower, upper, missing_day / span))
+            push!(steps, ForcingTimeStep(date, lower, upper, missing_step / span))
         end
     end
     push!(steps, single(last(records)))
 
     isempty(interpolated) ||
-        @warn "Interpolated $(length(interpolated)) missing day(s): $(join(interpolated, ", "))"
+        @warn "Interpolated $(length(interpolated)) missing $unit(s): $(join(interpolated, ", "))"
 
     return steps
 end
+
+"""
+    daily_time_steps(records; max_gap = FORCING_MAX_GAP)
+
+`uniform_time_steps` at a one-day spacing: the cadence of the NorKyst daily-average interior
+forcing.
+"""
+daily_time_steps(records; max_gap = FORCING_MAX_GAP) =
+    uniform_time_steps(records, Day(1); max_gap, unit = "day")
 
 """
     pad_time_steps(steps, coverage)
@@ -862,42 +920,58 @@ function water_mask(target_grid, LX, LY, edge)
         mask[i, j, k] = !peripheral_node(i, j, k, target_grid, LX(), LY(), Center())
     end
 
-    return open_boundary_water!(mask, target_grid, LX, LY, edge)
+    return open_boundary_water!(mask, target_grid, LX, LY, Val(validate_open_edge(edge)))
 end
 
 """
-    open_boundary_water!(mask, target_grid, LX, LY, edge)
+    open_boundary_water!(mask, target_grid, LX, LY, ::Val{edge})
 
 Mark the velocity faces lying on the open lateral boundary `edge` as water wherever the tracer
 cell just inside them is active.
 
 `peripheral_node` treats those faces as peripheral because the tracer cell outside the domain is
 a halo cell, and halo cells are inactive in `Bounded` directions. For a closed wall that is
-right, but `edge` is where the setup relaxes towards the source data and carries a
-`NormalFlowBoundaryCondition`, so leaving that row masked would drop the forcing exactly where it is
-needed. Only the component staggered across `edge` is affected.
+right, but `edge` is where the domain is open and the normal velocity carries a
+`NormalFlowBoundaryCondition`, so leaving that row masked would drop the data exactly where it is
+needed — both for the prepared forcing's initial conditions and for the boundary file. Only the
+component staggered across `edge` is affected, which is why each method tests one location.
+
+One method per edge rather than a four-branch `if`: the edge is a `Val` everywhere it decides
+anything in this package.
 """
-function open_boundary_water!(mask, target_grid, LX, LY, edge)
-    Nx, Ny, Nz = size(target_grid)
+open_boundary_water!(mask, target_grid, LX, LY, ::Val{edge}) where {edge} = mask
 
-    if LY === Face && edge === :south
-        for k = 1:Nz, i in axes(mask, 1)
-            mask[i, 1, k] = active_cell(i, 1, k, target_grid)
-        end
-    elseif LY === Face && edge === :north
-        for k = 1:Nz, i in axes(mask, 1)
-            mask[i, Ny+1, k] = active_cell(i, Ny, k, target_grid)
-        end
-    elseif LX === Face && edge === :west
-        for k = 1:Nz, j in axes(mask, 2)
-            mask[1, j, k] = active_cell(1, j, k, target_grid)
-        end
-    elseif LX === Face && edge === :east
-        for k = 1:Nz, j in axes(mask, 2)
-            mask[Nx+1, j, k] = active_cell(Nx, j, k, target_grid)
-        end
+function open_boundary_water!(mask, target_grid, LX, LY, ::Val{:south})
+    LY === Face || return mask
+    for k = 1:size(target_grid, 3), i in axes(mask, 1)
+        mask[i, 1, k] = active_cell(i, 1, k, target_grid)
     end
+    return mask
+end
 
+function open_boundary_water!(mask, target_grid, LX, LY, ::Val{:north})
+    LY === Face || return mask
+    Ny = size(target_grid, 2)
+    for k = 1:size(target_grid, 3), i in axes(mask, 1)
+        mask[i, Ny+1, k] = active_cell(i, Ny, k, target_grid)
+    end
+    return mask
+end
+
+function open_boundary_water!(mask, target_grid, LX, LY, ::Val{:west})
+    LX === Face || return mask
+    for k = 1:size(target_grid, 3), j in axes(mask, 2)
+        mask[1, j, k] = active_cell(1, j, k, target_grid)
+    end
+    return mask
+end
+
+function open_boundary_water!(mask, target_grid, LX, LY, ::Val{:east})
+    LX === Face || return mask
+    Nx = size(target_grid, 1)
+    for k = 1:size(target_grid, 3), j in axes(mask, 2)
+        mask[Nx+1, j, k] = active_cell(Nx, j, k, target_grid)
+    end
     return mask
 end
 
@@ -924,7 +998,7 @@ function prepared_variable(source_name, target_grid, source, filepath, config::A
     LX, LY, LZ = data_location(Symbol(name))
     @info "Preparing target nodes and source fill for $source_name -> $name"
 
-    mask = water_mask(target_grid, LX, LY, config.relaxation_edge)
+    mask = water_mask(target_grid, LX, LY, config.open_edge)
     longitude = Array(λnodes(target_grid, LX()))
     latitude = Array(φnodes(target_grid, LY()))
     size(mask)[1:2] == (length(longitude), length(latitude)) || error(
@@ -935,7 +1009,9 @@ function prepared_variable(source_name, target_grid, source, filepath, config::A
     x, y = projected_target_nodes(longitude, latitude, source)
     shape = (length(longitude), length(latitude))
     mask_fill = source_fill(source_validity(filepath, source_name))
-    lambda = relaxation_lambda(mask, config)
+    # Zero everywhere: the interior relaxation band is gone, and `add_rivers` writes the only
+    # nonzero lambdas this file ever carries. See `prepare_forcing`.
+    lambda = zeros(Float32, size(mask))
 
     return PreparedVariable(
         source_name,
@@ -987,12 +1063,37 @@ Whether each source cell holds data, taken from the first time step. Source land
 the points the download masked out as being outside the requested box are `NaN`, and that
 pattern is a property of the dataset rather than of the time step, so one read serves every
 step.
+
+Always `(NX, NY, levels)`: a surface variable with no depth axis (`zeta`, `ubar`, `vbar`, which the
+boundary pipeline prepares) reads as a plane and is reshaped to one level, so `SourceFill`,
+`fill_source!` and `set_source_field!` stay three-dimensional for every source variable.
 """
 function source_validity(filepath, source_name)
     return NCDataset(filepath) do ds
-        return isfinite.(coalesce.(ds[source_name][:, :, :, 1], NaN32))
+        return isfinite.(as_source_slab(coalesce.(read_last_dimension(ds[source_name], 1), NaN32)))
     end
 end
+
+"""
+    read_last_dimension(variable, index)
+
+`variable` at `index` along its last (time) dimension, with `:` for every dimension before it —
+`(X, Y, depth)` for a 3D source variable, `(X, Y)` for a surface one. The trailing index cannot be
+written literally because the two ranks differ.
+"""
+read_last_dimension(variable, index) =
+    variable[ntuple(_ -> Colon(), ndims(variable) - 1)..., index]
+
+"""
+    as_source_slab(data)
+
+`data` as a `(NX, NY, levels)` array: a 3D slab unchanged, a 2D surface plane reshaped to a single
+level. Everything downstream of the source read — `SourceFill`, `fill_source!`,
+`set_source_field!`, the interpolation kernel — is written for three dimensions, and one reshape
+here is cheaper than a rank parameter threaded through all of them.
+"""
+as_source_slab(data::AbstractArray{<:Any,3}) = data
+as_source_slab(data::AbstractArray{<:Any,2}) = reshape(data, size(data, 1), size(data, 2), 1)
 
 """
     source_fill(valid)
@@ -1236,63 +1337,6 @@ function interpolate_to_target!(output, source_field, x, y, z, mask, architectur
 end
 
 """
-    edge_distance(edge, i, j, Nx, Ny)
-
-Distance, in cells, of `(i, j)` from the true domain edge named by `edge` — `0` at the
-boundary-most row/column, increasing inward. Used to taper `relaxation_lambda`.
-"""
-function edge_distance(edge, i, j, Nx, Ny)
-    if edge === :south
-        return j - 1
-    elseif edge === :north
-        return Ny - j
-    elseif edge === :west
-        return i - 1
-    else
-        return Nx - i
-    end
-end
-
-"""
-    relaxation_lambda(mask, config::AbstractForcingConfig)
-
-Relaxation rates for one variable, in the water cells of the `config.relaxation_cells`-wide band
-along `config.relaxation_edge`, zero everywhere else. `config.relaxation_timescale` is the rate at
-the boundary-most cell (`1 / config.relaxation_timescale`), tapering linearly to `0` at the inner
-edge of the band — standard sponge/flow-relaxation-zone practice, rather than one uniform rate
-across the whole band, so the true edge relaxes strongly and the interior only weakly. `|λ| < 1`
-routes the forcing through `forcing_term_relax`.
-"""
-function relaxation_lambda(mask, config::AbstractForcingConfig)
-    config.relaxation_cells >= 0 || throw(ArgumentError("relaxation_cells must be >= 0"))
-    config.relaxation_timescale > 0 || throw(ArgumentError("relaxation_timescale must be > 0"))
-    edge = validate_relaxation_edge(config.relaxation_edge)
-
-    Nx, Ny, Nz = size(mask)
-    cells = config.relaxation_cells
-
-    x_range, y_range = if edge === :south
-        1:Nx, 1:min(cells, Ny)
-    elseif edge === :north
-        1:Nx, max(1, Ny - cells + 1):Ny
-    elseif edge === :west
-        1:min(cells, Nx), 1:Ny
-    else
-        max(1, Nx - cells + 1):Nx, 1:Ny
-    end
-
-    lambda = zeros(Float32, Nx, Ny, Nz)
-    rate_max = Float32(1 / config.relaxation_timescale)
-    for k = 1:Nz, j in y_range, i in x_range
-        distance = edge_distance(edge, i, j, Nx, Ny)
-        rate = rate_max * (cells - distance) / cells
-        mask[i, j, k] && (lambda[i, j, k] = rate)
-    end
-
-    return lambda
-end
-
-"""
     SourceReader(filepath)
 
 Holds the one source file currently open, reopening on demand. Output steps are written
@@ -1311,7 +1355,8 @@ Base.close(reader::SourceReader) = close(reader.dataset)
 """
     source_slab(reader::SourceReader, record::SourceRecord, source_name)
 
-One `(X, Y, depth)` slab of `source_name`, with masked points as `NaN`.
+One `(X, Y, depth)` slab of `source_name`, with masked points as `NaN`. A surface variable with no
+depth axis comes back as a single level, per `as_source_slab`.
 """
 function source_slab(reader::SourceReader, record::SourceRecord, source_name)
     if reader.filepath != record.filepath
@@ -1320,7 +1365,8 @@ function source_slab(reader::SourceReader, record::SourceRecord, source_name)
         reader.filepath = record.filepath
     end
 
-    return Float32.(coalesce.(reader.dataset[source_name][:, :, :, record.index], NaN32))
+    plane = read_last_dimension(reader.dataset[source_name], record.index)
+    return as_source_slab(Float32.(coalesce.(plane, NaN32)))
 end
 
 """
@@ -1440,7 +1486,9 @@ function define_forcing_dimensions!(ds, target_grid, steps)
 end
 
 include("rivers.jl")
+include("boundaries.jl")
 include("norkyst.jl")
+include("norkyst_boundaries.jl")
 include("of800_rivers.jl")
 
 end # module

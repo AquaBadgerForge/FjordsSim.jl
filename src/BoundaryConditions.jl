@@ -3,26 +3,27 @@ module BoundaryConditions
 export air_sea_flux_boundary_conditions,
     quadratic_bottom_drag_boundary_conditions,
     top_bottom_boundary_conditions,
-    lateral_tracer_open_boundary_conditions,
     boundary_condition_sides,
     field_boundary_conditions,
     AirSeaFluxes,
     QuadraticBottomDrag,
-    OpenLateralBoundary,
+    OpenLateralBoundaryFromForcing,
     MergedBoundaryConditions
 
 using Oceananigans
 using Oceananigans.BoundaryConditions:
     FluxBoundaryCondition,
+    GravityWaveRadiationBoundaryCondition,
     NormalFlowBoundaryCondition,
-    PerturbationAdvection,
+    NormalRadiation,
     ValueBoundaryCondition
 using Oceananigans.Units: Time
 using Oceananigans.Fields: ZeroField
+using Oceananigans.Grids: column_depthᶜᶠᵃ, column_depthᶠᶜᵃ
 using NumericalEarth.Oceans: u_quadratic_bottom_drag, v_quadratic_bottom_drag, build_tracer_top_bc
 using ..Configs:
     AbstractBoundaryConditionConfig, AbstractBoundaryConditionSetConfig, AbstractForcingConfig
-using ..Forcing: boundary_value_time_series
+using ..Forcing: LATERAL_EDGES
 using ..Utils: recursive_merge
 
 """
@@ -103,112 +104,272 @@ top_bottom_boundary_conditions(; grid, bottom_drag_coefficient) = recursive_merg
     quadratic_bottom_drag_boundary_conditions(bottom_drag_coefficient),
 )
 
-const LATERAL_EDGES = (:south, :north, :west, :east)
+#####
+##### The open lateral boundary
+#####
+##### Three schemes, one per part of the state, matching what the parent model itself does at its
+##### own lateral boundaries (NorKyst names them `zeta: Che`, `ubar/vbar: Shc`, `u/v/temp/salt:
+##### RadNud` in its output attributes):
+#####
+##### - `GravityWaveRadiation` (Flather 1976) on the barotropic transport, given the exterior
+#####   transport and elevation. This is the part that actually opens the boundary: it is what lets
+#####   the tide and the subtidal barotropic exchange cross it.
+##### - `SurfaceWaveRadiation` (Chapman 1985) on `η`. Not stated here at all — Oceananigans pairs it
+#####   onto every side where `U` or `V` carries a gravity-wave condition
+#####   (`default_free_surface_boundary_conditions`), so a second statement could only disagree.
+##### - `NormalRadiation` (Orlanski 1976 with Marchesiello et al. 2001 nudging) on the 3D velocity
+#####   and on the tracers: radiate outgoing signals, nudge towards the exterior state on inflow.
+#####
+##### Naming a `U`/`V` condition also switches the split-explicit solver to `LocalHaloFilling`
+##### (`substep_halo_filling`), so the barotropic halo is filled every substep. That is what makes
+##### the Flather condition act at all, and it needs no free-surface config change.
 
 """
-    x_boundary_tracer_value(j, k, grid, clock, model_fields, parameters)
+    boundary_radiation_scheme(config)
 
-Discrete-form boundary condition function for a west or east (x-normal) lateral boundary: the value
-`parameters.fts` holds at `clock.time`, at the fixed x-index `parameters.boundary_index` and the
-boundary's own tangential indices `j`, `k`. `parameters.fts` is the `FieldTimeSeries`
-`boundary_value_time_series` returns; `parameters.boundary_index` is `1` for west or `grid.Nx` for
-east — a Center-located tracer field has no `Nx + 1` index, unlike the velocity face row
-`open_boundary_water!` unmasks.
+The Orlanski-with-nudging scheme the 3D velocity and the tracers share, from the config's two
+timescales.
+
+One scheme object for both because the inflow/outflow distinction is the same physical statement
+wherever it is applied: on outflow radiate at the locally diagnosed phase speed and barely nudge, on
+inflow abandon radiation and nudge hard towards the data.
 """
-@inline function x_boundary_tracer_value(j, k, grid, clock, model_fields, parameters)
-    return @inbounds parameters.fts[parameters.boundary_index, j, k, Time(clock.time)]
-end
+boundary_radiation_scheme(config) = NormalRadiation(;
+    inflow_timescale = config.inflow_timescale,
+    outflow_timescale = config.outflow_timescale,
+)
 
-"""
-    y_boundary_tracer_value(i, k, grid, clock, model_fields, parameters)
+#####
+##### Exterior barotropic transport
+#####
+##### `GravityWaveRadiation` wants a 2-tuple `(transport, elevation)` per boundary node. The
+##### prepared boundary file holds a depth-averaged velocity, so the transport is that velocity times
+##### the model's *own* column depth — the same `column_depth` operator the scheme's kernel uses, so
+##### the boundary transport is expressed in the model's bathymetry rather than the source's.
+#####
+##### One function per edge rather than one function branching on an index: the boundary node is a
+##### different index of a different operator on each side.
+#####
+##### No land guard: `FjordSim.Forcing.fill_boundary_gaps!` has already filled every dry boundary
+##### cell from its nearest wet neighbour, so a boundary series is finite everywhere. That is the
+##### one place the fill can live — see that function for why a sentinel reaching a scheme is not
+##### hypothetical.
 
-As `x_boundary_tracer_value`, for a south or north (y-normal) lateral boundary.
-"""
-@inline function y_boundary_tracer_value(i, k, grid, clock, model_fields, parameters)
-    return @inbounds parameters.fts[i, parameters.boundary_index, k, Time(clock.time)]
-end
+@inline boundary_value(series, i, k, time) = @inbounds series[i, 1, k, time]
 
-"""
-    tracer_open_boundary_condition(boundary_function, boundary_index, forcing, name, config)
-
-One tracer's lateral open boundary condition at the exact domain edge: a `ValueBoundaryCondition`
-wrapping `boundary_function` as a discrete-form condition, with a `PerturbationAdvection` scheme
-relaxing towards `name`'s own exterior `FieldTimeSeries` — the same series the interior relaxation
-band (`relaxation_lambda`) already reads, reused via `boundary_value_time_series` rather than
-rebuilt.
-
-The velocity component normal to this edge is a closed wall (`open_boundary_conditions`), so the
-advecting velocity `PerturbationAdvection` reads at this boundary is always
-exactly zero, which its own convention classifies as outflow — `inflow_timescale` therefore never
-fires here. Both timescales are set to `config.relaxation_timescale` (the boundary-most, untapered
-rate from `relaxation_lambda`) rather than exposing a separate, partly-inert knob.
-"""
-function tracer_open_boundary_condition(boundary_function, boundary_index, forcing, name, config::AbstractForcingConfig)
-    haskey(forcing, name) || error(
-        "relaxation_edge names a tracer open boundary but the forcing does not prepare `$name`; " *
-        "add it to `config.parameters`.",
-    )
-    scheme = PerturbationAdvection(;
-        inflow_timescale = config.relaxation_timescale,
-        outflow_timescale = config.relaxation_timescale,
-    )
-    parameters = (fts = boundary_value_time_series(forcing, name), boundary_index)
-    return ValueBoundaryCondition(boundary_function; discrete_form = true, parameters, scheme)
-end
+@inline exterior_state(velocity, elevation, depth) = (velocity * depth, elevation)
 
 """
-    lateral_tracer_open_boundary_conditions(grid, forcing, config::AbstractForcingConfig, tracer_names)
+    south_boundary_transport(i, k, grid, clock, model_fields, parameters)
 
-An open `ValueBoundaryCondition` on `config.relaxation_edge` for every tracer in `tracer_names`
-(e.g. `:T`, `:S`), relaxing towards the same exterior series the interior relaxation band already
-nudges towards. Complements, rather than replaces, that interior forcing: this acts at the exact
-boundary column, the band acts across the interior `relaxation_cells`. Errors if `forcing` does not
-prepare one of `tracer_names` — naming a relaxation edge implies the forcing should supply every
-simulated tracer there.
-
-Velocity is untouched — the edge stays the closed wall `open_boundary_conditions` builds; see that
-function's docstring for why a genuinely open velocity boundary is not attempted here.
+Exterior `(transport, elevation)` at the southern boundary face `(i, 1)`: `vbar` times the model's
+column depth there, and `eta`, both from the prepared boundary series in `parameters`.
 """
-function lateral_tracer_open_boundary_conditions(grid, forcing, config::AbstractForcingConfig, tracer_names)
-    edge = config.relaxation_edge
-    edge in LATERAL_EDGES ||
-        throw(ArgumentError("relaxation_edge must be one of $LATERAL_EDGES, got :$edge"))
-
-    boundary_function, boundary_index = if edge === :west
-        x_boundary_tracer_value, 1
-    elseif edge === :east
-        x_boundary_tracer_value, grid.Nx
-    elseif edge === :south
-        y_boundary_tracer_value, 1
-    else
-        y_boundary_tracer_value, grid.Ny
-    end
-
-    return NamedTuple(
-        name => (; Symbol(edge) => tracer_open_boundary_condition(boundary_function, boundary_index, forcing, name, config))
-        for name in tracer_names
+@inline function south_boundary_transport(i, k, grid, clock, model_fields, parameters)
+    time = Time(clock.time)
+    depth = column_depthᶜᶠᵃ(i, 1, grid.Nz + 1, grid, model_fields.η)
+    return exterior_state(
+        boundary_value(parameters.vbar, i, 1, time),
+        boundary_value(parameters.eta, i, 1, time),
+        depth,
     )
 end
 
 """
-    open_boundary_conditions(::Val{edge})
+    north_boundary_transport(i, k, grid, clock, model_fields, parameters)
 
-The open boundary condition for the forcing config's `relaxation_edge`, as a nested named tuple
-`recursive_merge` can merge into the rest. The open component is the velocity normal to that edge.
-
-Derived rather than configured: the relaxation edge is by construction the edge the regional domain
-is open on, so a setup that named it twice could only ever disagree with itself.
+As `south_boundary_transport`, at the northern boundary face `(i, Ny + 1)`.
 """
-open_boundary_conditions(::Val{:south}) = (v = (south = NormalFlowBoundaryCondition(nothing),),)
-open_boundary_conditions(::Val{:north}) = (v = (north = NormalFlowBoundaryCondition(nothing),),)
-open_boundary_conditions(::Val{:west}) = (u = (west = NormalFlowBoundaryCondition(nothing),),)
-open_boundary_conditions(::Val{:east}) = (u = (east = NormalFlowBoundaryCondition(nothing),),)
+@inline function north_boundary_transport(i, k, grid, clock, model_fields, parameters)
+    time = Time(clock.time)
+    depth = column_depthᶜᶠᵃ(i, grid.Ny + 1, grid.Nz + 1, grid, model_fields.η)
+    return exterior_state(
+        boundary_value(parameters.vbar, i, 1, time),
+        boundary_value(parameters.eta, i, 1, time),
+        depth,
+    )
+end
 
-open_boundary_conditions(::Val{edge}) where {edge} = throw(
-    ArgumentError("relaxation_edge must be one of $LATERAL_EDGES, got :$edge"),
+"""
+    west_boundary_transport(j, k, grid, clock, model_fields, parameters)
+
+As `south_boundary_transport`, at the western boundary face `(1, j)`, from `ubar`.
+"""
+@inline function west_boundary_transport(j, k, grid, clock, model_fields, parameters)
+    time = Time(clock.time)
+    depth = column_depthᶠᶜᵃ(1, j, grid.Nz + 1, grid, model_fields.η)
+    return exterior_state(
+        boundary_value(parameters.ubar, j, 1, time),
+        boundary_value(parameters.eta, j, 1, time),
+        depth,
+    )
+end
+
+"""
+    east_boundary_transport(j, k, grid, clock, model_fields, parameters)
+
+As `west_boundary_transport`, at the eastern boundary face `(Nx + 1, j)`.
+"""
+@inline function east_boundary_transport(j, k, grid, clock, model_fields, parameters)
+    time = Time(clock.time)
+    depth = column_depthᶠᶜᵃ(grid.Nx + 1, j, grid.Nz + 1, grid, model_fields.η)
+    return exterior_state(
+        boundary_value(parameters.ubar, j, 1, time),
+        boundary_value(parameters.eta, j, 1, time),
+        depth,
+    )
+end
+
+#####
+##### The four groups, one method per edge each
+#####
+
+"""
+    boundary_series_value(boundaries, name, edge)
+
+The prepared boundary series for `name`, or a stated error naming what to prepare. The exterior
+state is data, so a missing variable is a preparation step that has not been run rather than a
+default to fall back on.
+"""
+function boundary_series_value(boundaries, name, edge)
+    haskey(boundaries, name) || error(
+        "The open :$edge boundary needs `$name` but the prepared boundary file does not carry it. " *
+        "Add its source variable to the boundary config's `parameters` and re-run " *
+        "`prepare_boundaries`.",
+    )
+    return getproperty(boundaries, name)
+end
+
+"""
+    open_normal_velocity_boundary_conditions(::Val{edge}, boundaries, scheme)
+
+The 3D velocity component normal to `edge`, radiating with `scheme` towards its own prepared series.
+
+This is the condition that used to be `NormalFlowBoundaryCondition(nothing)` — a closed wall, since
+`getbc` of `nothing` is `zero(grid)`. The series is passed straight through as the condition: a
+reduced `FieldTimeSeries` is a boundary condition Oceananigans indexes by the two tangential indices
+on its own, so no discrete-form wrapper is needed.
+"""
+open_normal_velocity_boundary_conditions(::Val{:south}, boundaries, scheme) = (
+    v = (south = NormalFlowBoundaryCondition(boundary_series_value(boundaries, :v, :south); scheme),),
+)
+open_normal_velocity_boundary_conditions(::Val{:north}, boundaries, scheme) = (
+    v = (north = NormalFlowBoundaryCondition(boundary_series_value(boundaries, :v, :north); scheme),),
+)
+open_normal_velocity_boundary_conditions(::Val{:west}, boundaries, scheme) = (
+    u = (west = NormalFlowBoundaryCondition(boundary_series_value(boundaries, :u, :west); scheme),),
+)
+open_normal_velocity_boundary_conditions(::Val{:east}, boundaries, scheme) = (
+    u = (east = NormalFlowBoundaryCondition(boundary_series_value(boundaries, :u, :east); scheme),),
+)
+open_normal_velocity_boundary_conditions(::Val{edge}, boundaries, scheme) where {edge} =
+    throw(ArgumentError("open_edge must be one of $LATERAL_EDGES, got :$edge"))
+
+"""
+    open_tangential_velocity_boundary_conditions(::Val{edge}, boundaries, scheme)
+
+The 3D velocity component *tangential* to `edge`, as a `Value` condition radiating with `scheme`.
+
+A tangential velocity is Center-located across the boundary, so it takes the same shape of condition
+a tracer does: `NormalRadiation` decides inflow from the boundary-normal velocity one cell in and
+writes the halo cell, never an interior one.
+"""
+open_tangential_velocity_boundary_conditions(::Val{:south}, boundaries, scheme) = (
+    u = (south = ValueBoundaryCondition(boundary_series_value(boundaries, :u, :south); scheme),),
+)
+open_tangential_velocity_boundary_conditions(::Val{:north}, boundaries, scheme) = (
+    u = (north = ValueBoundaryCondition(boundary_series_value(boundaries, :u, :north); scheme),),
+)
+open_tangential_velocity_boundary_conditions(::Val{:west}, boundaries, scheme) = (
+    v = (west = ValueBoundaryCondition(boundary_series_value(boundaries, :v, :west); scheme),),
+)
+open_tangential_velocity_boundary_conditions(::Val{:east}, boundaries, scheme) = (
+    v = (east = ValueBoundaryCondition(boundary_series_value(boundaries, :v, :east); scheme),),
+)
+open_tangential_velocity_boundary_conditions(::Val{edge}, boundaries, scheme) where {edge} =
+    throw(ArgumentError("open_edge must be one of $LATERAL_EDGES, got :$edge"))
+
+"""
+    open_transport_boundary_conditions(::Val{edge}, boundaries)
+
+The barotropic transport normal to `edge`, as a Flather (`GravityWaveRadiation`) condition reading
+the exterior transport and elevation through one of the `*_boundary_transport` functions.
+
+`U` for a west or east edge, `V` for a south or north one — the same staggering as the 3D velocity,
+one integral up. Both prepared series ride along in `parameters`, which is also what keeps them
+paged in: `Oceananigans.OutputReaders.extract_field_time_series` walks a discrete boundary
+function's parameters, and reaches this one because barotropic `U` and `V` are in
+`Oceananigans.fields(model)`.
+"""
+open_transport_boundary_conditions(::Val{:south}, boundaries) = (
+    V = (
+        south = GravityWaveRadiationBoundaryCondition(
+            south_boundary_transport;
+            discrete_form = true,
+            parameters = transport_parameters(boundaries, :vbar, :south),
+        ),
+    ),
+)
+open_transport_boundary_conditions(::Val{:north}, boundaries) = (
+    V = (
+        north = GravityWaveRadiationBoundaryCondition(
+            north_boundary_transport;
+            discrete_form = true,
+            parameters = transport_parameters(boundaries, :vbar, :north),
+        ),
+    ),
+)
+open_transport_boundary_conditions(::Val{:west}, boundaries) = (
+    U = (
+        west = GravityWaveRadiationBoundaryCondition(
+            west_boundary_transport;
+            discrete_form = true,
+            parameters = transport_parameters(boundaries, :ubar, :west),
+        ),
+    ),
+)
+open_transport_boundary_conditions(::Val{:east}, boundaries) = (
+    U = (
+        east = GravityWaveRadiationBoundaryCondition(
+            east_boundary_transport;
+            discrete_form = true,
+            parameters = transport_parameters(boundaries, :ubar, :east),
+        ),
+    ),
+)
+open_transport_boundary_conditions(::Val{edge}, boundaries) where {edge} =
+    throw(ArgumentError("open_edge must be one of $LATERAL_EDGES, got :$edge"))
+
+"""
+    transport_parameters(boundaries, barotropic_name, edge)
+
+The two prepared series a `*_boundary_transport` function reads, under the names it reads them by.
+
+`barotropic_name` is `:ubar` or `:vbar` depending on the edge; both are bound under their own key so
+one parameter shape serves all four edges without a rename.
+"""
+transport_parameters(boundaries, barotropic_name::Symbol, edge) = NamedTuple{(barotropic_name, :eta)}((
+    boundary_series_value(boundaries, barotropic_name, edge),
+    boundary_series_value(boundaries, :eta, edge),
+))
+
+"""
+    open_tracer_boundary_conditions(::Val{edge}, boundaries, tracers, scheme)
+
+One radiating `Value` condition per simulated tracer on `edge`, towards that tracer's own prepared
+series.
+
+Errors if a tracer has no prepared series: naming an open edge implies the boundary data should
+supply every simulated tracer there. A biogeochemical tracer therefore needs its own source variable
+in the boundary config's `parameters`.
+"""
+open_tracer_boundary_conditions(::Val{edge}, boundaries, tracers, scheme) where {edge} = NamedTuple(
+    name => (; Symbol(edge) => ValueBoundaryCondition(boundary_series_value(boundaries, name, edge); scheme))
+    for name in tracers
 )
 
 """
+    boundary_condition_sides(config, grid, forcing, forcing_config, tracers, boundaries)
     boundary_condition_sides(config, grid, forcing, forcing_config, tracers)
 
 One `AbstractBoundaryConditionConfig`'s contribution, as a nested named tuple keyed by field and
@@ -221,10 +382,22 @@ FjordSim hook that could not be re-exported and had to be reached as
 `FjordSim.BoundaryConditions.boundary_conditions`; and any caller binding a local of that name
 shadowed the hook it was trying to call.
 
-Declared with no method, so a subtype that does not implement it fails as a `MethodError` naming the
-hook.
+`boundaries` is the prepared open-boundary state — the `NamedTuple` of reduced `FieldTimeSeries`
+`FjordSim.Forcing.boundary_series` returns, or `nothing` for a setup with no boundary data. Passed
+in rather than read here for the same reason `forcing` is: `build_simulation` is where the
+`start_date` every time axis is zeroed at is known, and a config that read the file itself would
+have to be told that instant a second time.
+
+The five-argument form is the fallback, and forwards to the six-argument one *without* `boundaries`,
+so a boundary config that ignores the prepared state — the built-in `AirSeaFluxes` and
+`QuadraticBottomDrag`, or an out-of-tree config with a constant exterior — implements the shorter
+signature and never sees it.
+
+Declared with no six-argument method beyond that forwarding, so a subtype that implements neither
+fails as a `MethodError` naming the hook.
 """
-function boundary_condition_sides end
+boundary_condition_sides(config, grid, forcing, forcing_config, tracers, boundaries) =
+    boundary_condition_sides(config, grid, forcing, forcing_config, tracers)
 
 """
     AirSeaFluxes()
@@ -264,26 +437,70 @@ boundary_condition_sides(config::QuadraticBottomDrag, grid, forcing, forcing_con
     quadratic_bottom_drag_boundary_conditions(config.coefficient)
 
 """
-    OpenLateralBoundary()
+    OpenLateralBoundaryFromForcing(; inflow_timescale, outflow_timescale)
 
-The domain's open edge: a closed wall on the velocity normal to the forcing config's
-`relaxation_edge`, plus a relaxing `ValueBoundaryCondition` on every simulated tracer there.
+The domain's open edge, with every exterior value read from the prepared open-boundary file.
 
-Carries no fields, because everything it needs is already stated in the forcing config — which edge
-(`relaxation_edge`) and how fast (`relaxation_timescale`) — and a second copy could only disagree
-with the interior relaxation band that reads the same two. A setup with no open edge leaves this out
-of its `MergedBoundaryConditions`.
+Four groups on the forcing config's `open_edge`: a Flather condition on the barotropic transport
+(from `ubar`/`vbar` and `eta`), and Orlanski radiation with nudging on the normal 3D velocity, on
+the tangential 3D velocity, and on every simulated tracer. Oceananigans adds the Chapman condition
+on `η` itself. The result is a boundary water, heat and salt actually cross — the predecessor of this
+config, `OpenLateralBoundary`, put `NormalFlowBoundaryCondition(nothing)` on the normal velocity,
+which is a closed wall, so only the tracers there were ever open.
+
+Renamed to say where its values come from. They come from the boundary dataset hanging off the
+forcing config (`forcing_config.boundaries`), read by
+`FjordSim.Forcing.boundary_series` and handed in by `build_simulation` — hourly NorKyst for the
+built-in setups, because a Flather boundary without a tide is not worth prescribing and the interior
+forcing is daily means.
+
+# Fields
+- `inflow_timescale`: seconds to nudge towards the exterior state on inflow. Marchesiello et al.
+  (2001) use about a day.
+- `outflow_timescale`: seconds to nudge on outflow, where radiation should do the work instead. About
+  a year in the same reference; `Inf` is pure radiation.
+
+Both are fields rather than derivations, unlike the single `relaxation_timescale` this used to take
+from the forcing config: a genuinely open boundary treats inflow and outflow differently, and the
+outflow rate is information no other config states. Nothing in this stack has a default, so a setup
+states both.
 """
-struct OpenLateralBoundary <: AbstractBoundaryConditionConfig end
+struct OpenLateralBoundaryFromForcing <: AbstractBoundaryConditionConfig
+    inflow_timescale::Float64
+    outflow_timescale::Float64
+end
 
-boundary_condition_sides(::OpenLateralBoundary, grid, forcing, forcing_config, tracers) =
-    recursive_merge(
-        open_boundary_conditions(Val(forcing_config.relaxation_edge)),
-        lateral_tracer_open_boundary_conditions(grid, forcing, forcing_config, tracers),
+OpenLateralBoundaryFromForcing(; inflow_timescale, outflow_timescale) =
+    OpenLateralBoundaryFromForcing(Float64(inflow_timescale), Float64(outflow_timescale))
+
+function boundary_condition_sides(
+    config::OpenLateralBoundaryFromForcing,
+    grid,
+    forcing,
+    forcing_config,
+    tracers,
+    boundaries,
+)
+    isnothing(boundaries) && error(
+        "OpenLateralBoundaryFromForcing reads its exterior state from the prepared boundary file, " *
+        "but this setup's forcing config names no `boundaries`. Give it an " *
+        "`AbstractBoundaryDataConfig`, or use a boundary condition that carries its own exterior " *
+        "state.",
     )
 
+    edge = Val(forcing_config.open_edge)
+    scheme = boundary_radiation_scheme(config)
+
+    return recursive_merge(
+        open_normal_velocity_boundary_conditions(edge, boundaries, scheme),
+        open_tangential_velocity_boundary_conditions(edge, boundaries, scheme),
+        open_transport_boundary_conditions(edge, boundaries),
+        open_tracer_boundary_conditions(edge, boundaries, tracers, scheme),
+    )
+end
+
 """
-    field_boundary_conditions(config, grid, forcing, forcing_config, tracers)
+    field_boundary_conditions(config, grid, forcing, forcing_config, tracers, boundaries)
 
 The boundary conditions a whole `AbstractBoundaryConditionSetConfig` describes, materialized into
 the `NamedTuple` a model constructor consumes.
@@ -311,6 +528,10 @@ can specialize, so the merge strategy and the `FieldBoundaryConditions` result s
 every model FjordSim could ever assemble; and it said nothing about what the tuple *was*. A model
 whose boundary objects are something else, or that wants precedence resolved another way, is now a
 sibling of this type.
+
+The materialized result may name barotropic `U`/`V` and `η` as well as the prognostic fields, which
+`HydrostaticFreeSurfaceModel` accepts: it regularizes them through `assumed_field_location` and hands
+`bcs.U`/`bcs.V` to the split-explicit free surface.
 """
 struct MergedBoundaryConditions{P<:Tuple} <: AbstractBoundaryConditionSetConfig
     pieces::P
@@ -325,9 +546,10 @@ function field_boundary_conditions(
     forcing,
     forcing_config,
     tracers,
+    boundaries = nothing,
 )
     merged = mapreduce(
-        piece -> boundary_condition_sides(piece, grid, forcing, forcing_config, tracers),
+        piece -> boundary_condition_sides(piece, grid, forcing, forcing_config, tracers, boundaries),
         recursive_merge,
         config.pieces;
         init = (;),

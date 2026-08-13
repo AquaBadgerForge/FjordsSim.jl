@@ -10,7 +10,7 @@ using Oceananigans:
     WENO,
     WENOVectorInvariant
 using Oceananigans.TurbulenceClosures: HorizontalScalarBiharmonicDiffusivity
-using Oceananigans.Units: days, hour, minutes, second
+using Oceananigans.Units: day, days, hour, minutes, second
 using Dates: DateTime
 using SeawaterPolynomials.TEOS10: TEOS10EquationOfState
 using NumericalEarth: FreezingLimitedOceanTemperature
@@ -20,9 +20,9 @@ using ..Utils: progress
 using ..Grids: EvenGrid
 using ..Bathymetry: DybdedataConfig
 using ..Atmospheres: NORA3Config
-using ..Forcing: NorKystConfig, OF800RiversConfig
+using ..Forcing: NorKystConfig, OF800RiversConfig, NorKystBoundariesConfig
 using ..BoundaryConditions:
-    AirSeaFluxes, QuadraticBottomDrag, OpenLateralBoundary, MergedBoundaryConditions
+    AirSeaFluxes, QuadraticBottomDrag, OpenLateralBoundaryFromForcing, MergedBoundaryConditions
 using ..Simulations:
     SimulationConfig,
     CoupledHydrostaticSimulation,

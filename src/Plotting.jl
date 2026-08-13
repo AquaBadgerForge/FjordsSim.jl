@@ -1,6 +1,6 @@
 module Plotting
 
-export plot_bathymetry, plot_forcing, plot_atmosphere
+export plot_bathymetry, plot_forcing, plot_boundaries, plot_atmosphere
 
 using CairoMakie
 using NCDatasets
@@ -12,8 +12,10 @@ using Oceananigans.Grids: x_domain, y_domain
 using ..Configs:
     AbstractBathymetryConfig,
     AbstractForcingConfig,
+    AbstractBoundaryDataConfig,
     AbstractAtmosphereConfig,
     forcing_path,
+    boundary_data_path,
     atmosphere_path,
     plot_path
 
@@ -24,6 +26,9 @@ const BATHYMETRY_PLOT_PIXELS_PER_CELL = 6
 const BATHYMETRY_PLOT_MARGIN = (300, 150)
 const FORCING_PLOT_PIXELS_PER_CELL = 3
 const FORCING_PLOT_MARGIN = (200, 150)
+# A boundary section is one row of cells by a handful of levels, so it gets a fixed panel size
+# rather than one derived from the grid: a per-cell height would make eighteen levels unreadable.
+const BOUNDARY_PLOT_PANEL_SIZE = (420, 220)
 const ATMOSPHERE_PLOT_PIXELS_PER_CELL = 6
 const ATMOSPHERE_PLOT_MARGIN = (200, 200)
 const ATMOSPHERE_PLOT_COLUMNS = 4
@@ -35,6 +40,18 @@ const FORCING_PLOT_PANELS = (
     (name = "u", label = "u (m s⁻¹)", colormap = :balance),
     (name = "v", label = "v (m s⁻¹)", colormap = :balance),
     (name = "T_lambda", label = "T relaxation rate (s⁻¹)", colormap = :viridis),
+)
+
+# Prepared boundary variables worth eyeballing, in the order they are laid out. `T`, `S`, `u` and
+# `v` are sections (along the edge by depth); `eta`, `ubar` and `vbar` are lines along the edge.
+const BOUNDARY_PLOT_PANELS = (
+    (name = "T", label = "Temperature (ᵒC)", colormap = :thermal),
+    (name = "S", label = "Salinity (g kg⁻¹)", colormap = :haline),
+    (name = "u", label = "u (m s⁻¹)", colormap = :balance),
+    (name = "v", label = "v (m s⁻¹)", colormap = :balance),
+    (name = "eta", label = "Elevation (m)", colormap = :balance),
+    (name = "ubar", label = "ubar (m s⁻¹)", colormap = :balance),
+    (name = "vbar", label = "vbar (m s⁻¹)", colormap = :balance),
 )
 
 # Every variable of a prepared atmosphere file, with the colormap suiting each.
@@ -211,6 +228,94 @@ function plot_forcing(grid, config::AbstractForcingConfig)
     end
 
     return plot_file
+end
+
+"""
+    plot_boundaries(edge, config::AbstractBoundaryDataConfig)
+
+Write a diagnostic plot of the prepared boundary file at `boundary_data_path(config)` to
+`plot_path(config)`: one panel per `BOUNDARY_PLOT_PANELS` entry present in the file for `edge`.
+Returns the plot path.
+
+Two panel shapes, because the file holds two: a full-depth variable is a section along the edge
+against depth, a surface variable a line along the edge. Both are drawn against the along-edge cell
+index rather than a coordinate — the file states its own dimensions but not which way round the edge
+runs, and the index is what a `NaN` in a section can be traced back to.
+
+Takes `edge` because the variables are named for their side, so the plot cannot know which of them to
+read without being told which boundary it is looking at.
+"""
+function plot_boundaries(edge, config::AbstractBoundaryDataConfig)
+    boundary_file = boundary_data_path(config)
+    plot_file = prepare_plot_file(config)
+
+    NCDataset(boundary_file) do ds
+        panels = [
+            (; panel..., variable = string(edge, "_", panel.name))
+            for panel in BOUNDARY_PLOT_PANELS
+        ]
+        panels = [panel for panel in panels if haskey(ds, panel.variable)]
+        isempty(panels) && error("Boundary file $boundary_file carries no :$edge variables to plot.")
+
+        figure = Figure(
+            size = (
+                length(panels) * BOUNDARY_PLOT_PANEL_SIZE[1],
+                BOUNDARY_PLOT_PANEL_SIZE[2] + FORCING_PLOT_MARGIN[2],
+            ),
+        )
+        date = ds["time"][1]
+        depth = haskey(ds, "Nz") ? Array{Float64}(ds["Nz"][:]) : Float64[]
+
+        for (column, panel) in enumerate(panels)
+            data = boundary_slice(ds, panel.variable)
+            axis = Axis(
+                figure[1, column];
+                xlabel = "Cell along the :$edge boundary",
+                ylabel = column == 1 ? (ndims(data) == 2 ? "Depth (m)" : "") : "",
+                title = panel.name,
+            )
+
+            if ndims(data) == 2
+                finite = filter(isfinite, data)
+                colorrange = isempty(finite) || allequal(finite) ? (0, 1) : extrema(finite)
+                plot = heatmap!(
+                    axis,
+                    1:size(data, 1),
+                    depth,
+                    data;
+                    colormap = panel.colormap,
+                    colorrange,
+                    nan_color = :ivory,
+                )
+                Colorbar(figure[2, column], plot; label = panel.label, vertical = false)
+            else
+                lines!(axis, 1:length(data), data)
+                axis.ylabel = panel.label
+            end
+        end
+
+        Label(
+            figure[0, :],
+            "Prepared $(dataset_label(config)) :$edge boundary at $date",
+            fontsize = 20,
+        )
+        save(plot_file, figure)
+    end
+
+    return plot_file
+end
+
+"""
+    boundary_slice(ds, name)
+
+A prepared boundary variable at the first time step, as a `Float32` array with missing values turned
+into `NaN` so Makie leaves land blank: a `(along, Nz)` section for a full-depth variable, a
+`(along,)` line for a surface one.
+"""
+function boundary_slice(ds, name)
+    variable = ds[name]
+    slice = variable[ntuple(_ -> Colon(), ndims(variable) - 1)..., 1]
+    return Float32.(coalesce.(slice, NaN32))
 end
 
 """

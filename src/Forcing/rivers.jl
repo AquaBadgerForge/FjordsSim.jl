@@ -227,7 +227,7 @@ function add_rivers(target_grid, config::AbstractForcingConfig, rivers::Abstract
     end
 
     locations = river_locations(rivers)
-    cells = river_cells(target_grid, locations, config.relaxation_edge, river_search_radius(rivers))
+    cells = river_cells(target_grid, locations, config.open_edge, river_search_radius(rivers))
     isempty(cells) && error("None of the $(length(locations)) river outlets landed on the grid.")
 
     report_river_cells(cells)
