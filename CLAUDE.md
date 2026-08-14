@@ -198,14 +198,20 @@ modules, in `include` order from `src/FjordSim.jl`:
    with `smoothing_options(config)` → `write_bathymetry_file`. The core also owns the smoothing
    kernels and the `center_coordinates`/`expand_domain`/`vertical_faces` domain helpers.
 
-   `smooth_bathymetry_gaps!` runs three stages. The topological cleanup every source gets
-   (diagonal-pair fills, isolated sea/land cells), then two stages a source opts into through
-   `smoothing_options`, each skipped when its parameter is zero: `fill_shallow_spikes` and
-   `limit_bottom_slope`. The order is forced — the topological pass first, because checkerboard
-   noise would skew the neighbour medians; despiking before slope limiting, because a spike is
-   exactly the one-cell feature slope limiting would smear into its neighbours instead of removing.
+   `smooth_bathymetry_gaps!` runs four stages. The topological cleanup every source gets
+   (diagonal-pair fills, isolated sea/land cells), then three stages a source opts into through
+   `smoothing_options`, each skipped when its parameter is `false` or zero:
+   `remove_narrow_passages`, `fill_shallow_spikes` and `limit_bottom_slope`.
 
-   Both exist because `PartialCellBottom` bounds how *thin* a cell may be but says nothing about
+   The order is forced. The topological pass first, because checkerboard noise would skew the
+   neighbour medians. Then `remove_narrow_passages`, because it is the only stage that changes the
+   *land mask*: run after either of the others, the cells it is about to turn into land would already
+   have contributed to a neighbour median and to a slope pair. Then despiking before slope limiting,
+   because a spike is exactly the one-cell feature slope limiting would smear into its neighbours
+   instead of removing.
+
+   `fill_shallow_spikes` and `limit_bottom_slope` exist because `PartialCellBottom` bounds how *thin*
+   a cell may be but says nothing about
    how much depth may change between adjacent *columns*, and that is what destabilizes a regional
    run: a shallow cell beside a deep one carries the same transport in a fraction of the water
    column, so velocity grows there until the time-step wizard's timescale goes NaN and
@@ -214,6 +220,48 @@ modules, in `include` order from `src/FjordSim.jl`:
    depth in much deeper water leaves a shallow spike, which is why the two are configured together.
    `limit_bottom_slope` moves each offending pair symmetrically, so water volume is conserved
    exactly rather than quietly shifted.
+
+   ### `remove_narrow_passages`
+
+   `remove_narrow_passages` bounds something neither of those two can see: channel **width**. Both of
+   them bound depth *contrast*, so a one-cell-wide sea passage whose neighbours are equally shallow
+   passes every check they make — and it is the width that is wrong.
+
+   A one-cell-wide passage is a sea cell that is sea on both sides along one axis and land on both
+   sides along the other. Regridding leaves one wherever a strait too narrow to resolve cuts through a
+   peninsula. The two basins such a cell joins are usually *already* connected elsewhere, so it closes
+   a loop, and the barotropic head difference around that loop is forced through a cross-section one
+   cell wide and a few metres deep. With only a quadratic bottom drag and a biharmonic viscosity to
+   resist it, velocity there grows without bound.
+
+   On `oslofjorden` there were 66 such passages, 23 of them at exactly the 2 m `minimum_depth` floor.
+   One — a 2.35 m canal through a peninsula at 10.43°E, 59.09°N (i = 67–68, j = 49) — carried a
+   coherent, depth-independent 47 m s⁻¹ jet that held the domain maximum in 36 of 39 snapshot records
+   and collapsed the adaptive time step from its 3-minute cap to 0.3 s. The same defect blew up the
+   pre-open-boundary runs too, after 3.2 days rather than 4 hours: a genuinely open boundary admitting
+   a tide only excites it sooner.
+
+   Three things about the stage are load-bearing.
+
+   **A passage that is the sole link to a basin is kept**, since closing it would delete that water
+   from the domain. On `oslofjorden` 12 of the 78 one-cell passages are of that kind.
+
+   **Candidates are tested one at a time against the partially closed field**, not all at once against
+   the input. Two passages that are each redundant *while the other is open* would together sever a
+   basin if closed as a batch; sequential testing makes the stage unable to disconnect anything. It is
+   therefore order-dependent, but deterministically so — row-major.
+
+   **One pass, not iterated to convergence.** Closing a passage can leave a neighbouring cell
+   one-cell-wide in turn, and iterating would erode a genuine narrow arm cell by cell. The
+   isolated-cell cleanup loop does run again afterwards, to take the dead-end stubs a closure leaves
+   behind; it cannot re-open a closed passage, because a passage cell has two land neighbours by
+   definition and they stay land, so `fill_isolated_land_cells` — which needs all four wet — can never
+   fire on it. That fill is also the likely *origin* of some of these canals: it floods a one-cell-thick
+   isthmus, which is why the test fixtures make their peninsulas two cells thick.
+
+   `wet_component` is the flood fill it tests with, hand-rolled rather than
+   `ImageMorphology.label_components` (which `NumericalEarth.remove_minor_basins!` uses): that package
+   reaches FjordSim only transitively, and one breadth-first walk is all this needs.
 
    `geonorge.jl` holds `DybdedataConfig <: AbstractBathymetryConfig` and the Geonorge Sjøkart
    Dybdedata implementation of the two hooks: derive the native region from the target grid
@@ -1138,7 +1186,7 @@ Bathymetry — `AbstractBathymetryConfig`, consumed by `prepare_bathymetry`:
 |---|---|---|
 | `bathymetry_dataset(target_grid, config)` → NumericalEarth dataset | yes | none |
 | `regrid_options(config)` → NamedTuple for `regrid_bathymetry` | no | `(;)` |
-| `smoothing_options(config)` → NamedTuple for `smooth_bathymetry_gaps!` | no | `(;)` |
+| `smoothing_options(config)` → NamedTuple for `smooth_bathymetry_gaps!` — `close_narrow_passages`, `spike_ratio`, `max_slope_factor`, `minimum_depth` | no | `(;)`, leaving only the topological cleanup |
 
 Forcing — `AbstractForcingConfig`, consumed by `prepare_forcing`:
 

@@ -80,6 +80,20 @@ across fjords.
   A floor alone is not enough, and on its own makes a second problem: lifting a sliver to a
   constant depth in much deeper water leaves a shallow *spike*, which destabilizes its neighbours
   the same way. Pair it with `spike_ratio`.
+- `close_narrow_passages`: Run `remove_narrow_passages`, which turns every one-cell-wide sea passage
+  whose removal leaves both of its sides connected into land. `false` disables the stage.
+
+  This is a *width* problem, and the only one of the four stages that moves the coastline. Regridding
+  leaves a one-cell channel wherever a strait too narrow to resolve cuts through a peninsula; the two
+  basins it joins are usually already connected elsewhere, so it closes a loop, and the barotropic
+  head difference around that loop is forced through a cross-section one cell wide and a few metres
+  deep. On `oslofjorden` there were 66 such passages, 23 of them at exactly the `minimum_depth` floor,
+  and one of them — a 2.35 m canal through a peninsula at 10.43°E, 59.09°N — carried a coherent
+  47 m s⁻¹ barotropic jet that collapsed the time step from three minutes to 0.3 s. Neither
+  `spike_ratio` nor `max_slope_factor` touches them, because both bound depth *contrast* and such a
+  cell agrees with its neighbours.
+
+  A passage that is the sole link to a basin is kept, so no water is deleted from the domain.
 - `spike_ratio`: `fill_shallow_spikes` threshold — a sea cell shallower than this fraction of its
   neighbours' median depth is replaced by that median. `0.0` disables despiking. This is what
   removes the interpolation spikes, and the ones `minimum_depth` itself creates.
@@ -111,6 +125,7 @@ Base.@kwdef mutable struct DybdedataConfig <: AbstractBathymetryConfig
     interpolation_passes::Int = 1
     major_basins::Int = 1
     minimum_depth::Float64 = 0.0
+    close_narrow_passages::Bool = false
     spike_ratio::Float64 = 0.0
     max_slope_factor::Float64 = 0.0
     geonorge_cache::Bool = true
@@ -159,6 +174,7 @@ The `smooth_bathymetry_gaps!` options this setup configures.
 `limit_bottom_slope` must not undo the floor while flattening a slope.
 """
 smoothing_options(config::DybdedataConfig) = (;
+    close_narrow_passages = config.close_narrow_passages,
     spike_ratio = config.spike_ratio,
     max_slope_factor = config.max_slope_factor,
     minimum_depth = config.minimum_depth,

@@ -216,6 +216,7 @@ FjordConfig(
         interpolation_passes  = 1,
         major_basins          = 1,
         minimum_depth         = 2.0,
+        close_narrow_passages = true,
         spike_ratio           = 0.5,
         max_slope_factor      = 0.5,
         geonorge_cache        = true,

@@ -1331,6 +1331,79 @@ end
         h6 = [0.0 -1.0 0.0; -1.0 -1.0 -1.0; 0.0 -1.0 0.0]
         @test fill_isolated_land_cells(h6) == h6
 
+        remove_narrow_passages = FjordSim.Bathymetry.remove_narrow_passages
+        wet_component = FjordSim.Bathymetry.wet_component
+
+        # The flood fill honours `blocked`, which is what lets one candidate be tested without
+        # mutating the field first.
+        channel = [-1.0 -1.0 -1.0 -1.0 -1.0]
+        @test count(wet_component(channel, (1, 1), (0, 0))) == 5
+        @test count(wet_component(channel, (1, 1), (1, 3))) == 2
+
+        # A basin split by a peninsula along j = 4, cut through at (4, 4) by a one-cell canal — the
+        # geometry of the real Oslofjord defect. The canal closes a loop, since the water either side
+        # of it is joined around both ends of the peninsula, so it goes.
+        #
+        # Two details of the fixture are load-bearing. The water is at least two cells thick
+        # everywhere else, because in a one-cell-wide ring *every* cell is a one-cell-wide passage.
+        # And the peninsula is two cells thick, because `fill_isolated_land_cells` would flood a
+        # one-cell-thick one before this stage ever saw it — which is plausibly where the real canals
+        # came from.
+        loop = [
+            -9.0 -9.0 -9.0 -9.0 -9.0 -9.0 -9.0
+            -9.0 -9.0 -9.0  0.0 -9.0 -9.0 -9.0
+            -9.0 -9.0 -9.0  0.0 -9.0 -9.0 -9.0
+            -9.0 -9.0 -9.0 -2.0 -9.0 -9.0 -9.0
+            -9.0 -9.0 -9.0  0.0 -9.0 -9.0 -9.0
+            -9.0 -9.0 -9.0  0.0 -9.0 -9.0 -9.0
+            -9.0 -9.0 -9.0 -9.0 -9.0 -9.0 -9.0
+        ]
+        opened = remove_narrow_passages(loop)
+        @test opened[4, 4] == 0.0
+        @test count(<(0), opened) == count(<(0), loop) - 1  # only the canal closed
+        @test remove_narrow_passages(opened) == opened  # nothing left to close
+
+        # The same one-cell canal when it is the *only* link between the two sides: kept, because
+        # closing it would delete that water from the domain. This is what the connectivity test buys.
+        pocket = [
+            0.0  0.0  0.0  0.0  0.0  0.0 0.0
+            0.0 -9.0 -9.0  0.0 -9.0 -9.0 0.0
+            0.0 -9.0 -9.0 -2.0 -9.0 -9.0 0.0
+            0.0 -9.0 -9.0  0.0 -9.0 -9.0 0.0
+            0.0  0.0  0.0  0.0  0.0  0.0 0.0
+        ]
+        @test remove_narrow_passages(pocket) == pocket
+
+        # Two canals through one isthmus, each redundant only while the other is open. Testing
+        # candidates one at a time against the partially closed field closes exactly one; testing
+        # them all at once against the input would close both and sever the two sides.
+        pair = [
+            0.0  0.0  0.0  0.0 0.0
+            0.0 -9.0  0.0 -9.0 0.0
+            0.0 -9.0 -2.0 -9.0 0.0
+            0.0 -9.0  0.0 -9.0 0.0
+            0.0 -9.0 -2.0 -9.0 0.0
+            0.0 -9.0  0.0 -9.0 0.0
+            0.0  0.0  0.0  0.0 0.0
+        ]
+        unlooped = remove_narrow_passages(pair)
+        @test count(<(0), unlooped) == count(<(0), pair) - 1
+        @test count(wet_component(unlooped, (2, 2), (0, 0))) == count(<(0), unlooped)  # still one basin
+
+        # A two-cell-wide canal through the same isthmus is not narrow, so it is left alone: the
+        # stage targets width, and two cells is the narrowest a resolved flow can occupy.
+        wide = [
+            -9.0 -9.0 -9.0 -9.0 -9.0 -9.0
+            -9.0 -9.0 -9.0  0.0 -9.0 -9.0
+            -9.0 -9.0 -9.0  0.0 -9.0 -9.0
+            -9.0 -9.0 -9.0 -2.0 -9.0 -9.0
+            -9.0 -9.0 -9.0 -2.0 -9.0 -9.0
+            -9.0 -9.0 -9.0  0.0 -9.0 -9.0
+            -9.0 -9.0 -9.0  0.0 -9.0 -9.0
+            -9.0 -9.0 -9.0 -9.0 -9.0 -9.0
+        ]
+        @test remove_narrow_passages(wide) == wide
+
         fill_shallow_spikes = FjordSim.Bathymetry.fill_shallow_spikes
         limit_bottom_slope = FjordSim.Bathymetry.limit_bottom_slope
 
@@ -1388,17 +1461,27 @@ end
             end
         end
 
-        # Both stages are opt-in: the default keeps the topological cleanup and nothing else, which is
-        # what leaves every other source's bathymetry unchanged. Asserted on configs built here rather
-        # than on the built-in setups', whose numbers are a per-fjord choice.
+        # All three stages are opt-in: the default keeps the topological cleanup and nothing else,
+        # which is what leaves every other source's bathymetry unchanged. Asserted on configs built
+        # here rather than on the built-in setups', whose numbers are a per-fjord choice.
         smoothing_options = FjordSim.Bathymetry.smoothing_options
-        @test smoothing_options(test_bathymetry_config()) ==
-              (spike_ratio = 0.0, max_slope_factor = 0.0, minimum_depth = 0.0)
+        @test smoothing_options(test_bathymetry_config()) == (
+            close_narrow_passages = false,
+            spike_ratio = 0.0,
+            max_slope_factor = 0.0,
+            minimum_depth = 0.0,
+        )
         @test smoothing_options(test_bathymetry_config(
+            close_narrow_passages = true,
             spike_ratio = 0.5,
             max_slope_factor = 0.4,
             minimum_depth = 2.0,
-        )) == (spike_ratio = 0.5, max_slope_factor = 0.4, minimum_depth = 2.0)
+        )) == (
+            close_narrow_passages = true,
+            spike_ratio = 0.5,
+            max_slope_factor = 0.4,
+            minimum_depth = 2.0,
+        )
 
         # smooth_bathymetry_gaps! round-trips a Field through the same pipeline
         architecture = CPU()
@@ -1423,6 +1506,42 @@ end
         end
 
         @test Array(interior(bottom_height, :, :, 1)) == expected
+
+        # The passage stage is wired into smooth_bathymetry_gaps! and its effect survives the two
+        # stages after it. The same canal shows why despiking cannot substitute: with the stage off,
+        # `spike_ratio` still lifts the 2 m canal to its neighbours' depth — fixing the *depth* and
+        # leaving the spurious connection wide open, which is the failure this stage exists for.
+        canal_grid = LatitudeLongitudeGrid(
+            CPU();
+            size = (7, 7, 1),
+            halo = (1, 1, 1),
+            longitude = (10.0, 11.0),
+            latitude = (59.0, 60.0),
+            z = [-10.0, 0.0],
+        )
+        canal_field = Field{Center, Center, Nothing}(canal_grid)
+
+        set!(canal_field, Float32.(loop))
+        FjordSim.Bathymetry.smooth_bathymetry_gaps!(
+            canal_field;
+            close_narrow_passages = true,
+            spike_ratio = 0.5,
+            max_slope_factor = 0.5,
+        )
+        closed_canal = Array(interior(canal_field, :, :, 1))
+        @test closed_canal[4, 4] >= 0                              # canal closed
+        @test remove_narrow_passages(closed_canal) == closed_canal  # and nothing reopened it
+        @test closed_canal[4, 3] == -9.0f0                          # neighbours untouched
+
+        set!(canal_field, Float32.(loop))
+        FjordSim.Bathymetry.smooth_bathymetry_gaps!(
+            canal_field;
+            close_narrow_passages = false,
+            spike_ratio = 0.5,
+            max_slope_factor = 0.5,
+        )
+        open_canal = Array(interior(canal_field, :, :, 1))
+        @test open_canal[4, 4] == -9.0f0  # despiked to its neighbours' depth, still wet
     end
 
     @testset "point sampling" begin

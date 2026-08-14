@@ -193,23 +193,35 @@ function write_bathymetry_file(filepath::String, target_grid, bottom_height)
 end
 
 """
-    smooth_bathymetry_gaps!(bottom_height; spike_ratio = 0, max_slope_factor = 0, minimum_depth = 0)
+    smooth_bathymetry_gaps!(bottom_height; close_narrow_passages = false, spike_ratio = 0,
+                            max_slope_factor = 0, minimum_depth = 0)
 
-Clean up the regridded bathymetry in place, in three stages.
+Clean up the regridded bathymetry in place, in four stages.
 
 First the topological pass every source gets: one diagonal-pair fill, then
 `BATHYMETRY_GAP_FILL_PASSES` rounds of isolated sea/land cell cleanup, following the fixed cleanup
 used for the Oslofjord ROMS-based bathymetry. This removes the checkerboard noise that would
 otherwise skew the neighbor medians the next stage takes.
 
-Then two optional stages, each skipped when its parameter is zero so a source that configures
-neither keeps exactly the behavior above: `fill_shallow_spikes` with `spike_ratio`, and
-`limit_bottom_slope` with `max_slope_factor` and `minimum_depth`. Despiking runs first, because a
-spike is precisely the kind of one-cell feature that slope limiting would otherwise smear into its
-neighbors instead of removing.
+Then three optional stages, each skipped when its parameter is `false` or zero so a source that
+configures none keeps exactly the behavior above: `remove_narrow_passages` with
+`close_narrow_passages`, `fill_shallow_spikes` with `spike_ratio`, and `limit_bottom_slope` with
+`max_slope_factor` and `minimum_depth`.
+
+The order of the three is forced. `remove_narrow_passages` runs first because it is the only stage
+that changes the *land mask*: run after either of the others, the cells it is about to turn into
+land would already have contributed to a neighbor median and to a slope pair. Despiking then
+precedes slope limiting, because a spike is precisely the kind of one-cell feature that slope
+limiting would otherwise smear into its neighbors instead of removing.
+
+Closing a passage leaves a dead-end stub behind — the cell on the far side of it now has three land
+neighbors — so the isolated-cell cleanup loop runs again afterwards. That loop cannot re-open a
+closed passage: a passage cell has two land neighbors by definition and they stay land, so
+`fill_isolated_land_cells`, which needs all four neighbors wet, can never fire on it.
 """
 function smooth_bathymetry_gaps!(
     bottom_height;
+    close_narrow_passages = false,
     spike_ratio = 0,
     max_slope_factor = 0,
     minimum_depth = 0,
@@ -220,6 +232,15 @@ function smooth_bathymetry_gaps!(
     h = fill_secondary_diagonal_pairs(fill_diagonal_pairs(h))
     for _ = 1:BATHYMETRY_GAP_FILL_PASSES
         h = fill_isolated_land_cells(remove_isolated_sea_cells(h))
+    end
+
+    if close_narrow_passages
+        wet_before = count(<(0), h)
+        h = remove_narrow_passages(h)
+        for _ = 1:BATHYMETRY_GAP_FILL_PASSES
+            h = fill_isolated_land_cells(remove_isolated_sea_cells(h))
+        end
+        @info "Closed $(wet_before - count(<(0), h)) cells of one-cell-wide passages and their stubs"
     end
 
     spike_ratio > 0 && (h = fill_shallow_spikes(h; ratio = spike_ratio))
@@ -396,6 +417,85 @@ function remove_isolated_sea_cells(h; sides = ISOLATED_SEA_CELL_LAND_SIDES)
     end
 
     return replaced
+end
+
+"""
+    wet_component(h, seed, blocked)
+
+The set of sea cells (`h < 0`) reachable from `seed` by north/south/east/west steps, treating
+`blocked` as land, as a `BitMatrix` the size of `h`.
+
+A hand-rolled flood fill rather than `ImageMorphology.label_components`, which
+`NumericalEarth.remove_minor_basins!` uses: that package reaches FjordSim only transitively, and
+one breadth-first walk is all `remove_narrow_passages` needs.
+"""
+function wet_component(h, seed, blocked)
+    Nx, Ny = size(h)
+    seen = falses(Nx, Ny)
+    seen[seed...] = true
+    stack = [seed]
+
+    while !isempty(stack)
+        i, j = pop!(stack)
+        for (di, dj) in ((1, 0), (-1, 0), (0, 1), (0, -1))
+            ii, jj = i + di, j + dj
+            (1 <= ii <= Nx && 1 <= jj <= Ny) || continue
+            (seen[ii, jj] || (ii, jj) == blocked) && continue
+            h[ii, jj] < 0 || continue
+            seen[ii, jj] = true
+            push!(stack, (ii, jj))
+        end
+    end
+
+    return seen
+end
+
+"""
+    remove_narrow_passages(h)
+
+Turn every one-cell-wide sea passage whose removal leaves both of its sides connected into land.
+
+A one-cell-wide passage is a sea cell that is sea on both sides along one axis and land on both
+sides along the other — regridding leaves these where a channel too narrow to resolve cuts through
+a peninsula. They are what destabilizes a regional run once the boundary admits a tide: the two
+basins such a cell joins are usually already connected elsewhere, so it closes a loop, and the
+barotropic head difference around that loop is pushed through a cross-section of one cell width and
+a few metres depth. Velocity there grows until the time-step wizard collapses. Neither
+`fill_shallow_spikes` nor `limit_bottom_slope` can help, because both bound depth *contrast* and
+the passage agrees with its neighbors — it is its *width* that is wrong.
+
+A passage that is the sole link to a basin is kept: closing it would delete that water from the
+domain. Candidates are therefore tested one at a time against the partially closed field rather than
+all at once against the input, which is what makes the stage unable to sever a basin — two passages
+that are each redundant while the other is open would together disconnect one if closed as a batch.
+
+One pass, deliberately: closing a passage can leave a neighbouring cell one-cell-wide in turn, and
+iterating to convergence would erode a genuine narrow arm cell by cell.
+"""
+function remove_narrow_passages(h)
+    closed = copy(h)
+    Nx, Ny = size(h)
+
+    for i = 2:Nx-1, j = 2:Ny-1
+        closed[i, j] < 0 || continue
+
+        west, east = closed[i-1, j] < 0, closed[i+1, j] < 0
+        south, north = closed[i, j-1] < 0, closed[i, j+1] < 0
+
+        sides = if west && east && !south && !north
+            ((i - 1, j), (i + 1, j))
+        elseif south && north && !west && !east
+            ((i, j - 1), (i, j + 1))
+        else
+            continue
+        end
+
+        # Redundant only if the far side is still reachable with this cell blocked.
+        wet_component(closed, sides[1], (i, j))[sides[2]...] || continue
+        closed[i, j] = zero(eltype(h))
+    end
+
+    return closed
 end
 
 """
