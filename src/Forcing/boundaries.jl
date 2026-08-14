@@ -251,6 +251,24 @@ the dataset can supply.
 function boundary_variable_names end
 
 """
+    boundary_source_slab(config, reader, step, source_name)
+
+One source slab of `source_name` for `step`, as `write_boundaries_file` interpolates from.
+
+Defaults to `blended_slab`, which reads the variable straight out of the downloaded file — the right
+answer for any variable that already means what its name says. A source overrides this when a
+variable needs deriving from more than one of its own, which a vector component does: the pipeline
+prepares one variable at a time, so a rotation from grid-relative to geographic axes has nowhere else
+to happen. Rotating after interpolation is not an option, since on a south edge `ubar` lands on
+`Nx_faces` and `vbar` on `Nx`, different node counts under different masks.
+
+Both slabs of a pair are available here, from the same `reader` at the same `step`, so a component
+derived this way stays consistent with its partner.
+"""
+boundary_source_slab(config::AbstractBoundaryDataConfig, reader, step, source_name) =
+    blended_slab(reader, step, source_name)
+
+"""
     download_boundaries(config::FjordConfig)
     download_boundaries(target_grid, config::AbstractBoundaryDataConfig)
 
@@ -432,7 +450,9 @@ function prepare_boundaries(target_grid, config::AbstractBoundaryDataConfig; cov
 
     output_file = boundary_data_path(config)
     @info "Writing boundary file to $output_file, interpolating on $(summary(architecture))"
-    write_boundaries_file(output_file, edges, target_grid, variables, steps, source, architecture)
+    write_boundaries_file(
+        output_file, edges, target_grid, variables, steps, source, architecture, config,
+    )
     @info "Finished preparing the $(join(edges, ", ")) boundary"
 
     return (;
@@ -480,7 +500,7 @@ function prepare_boundaries(config::FjordConfig)
 end
 
 """
-    write_boundaries_file(filepath, edge, target_grid, variables, steps, source, architecture)
+    write_boundaries_file(filepath, edges, target_grid, variables, steps, source, architecture, config)
 
 Write the boundary NetCDF, streaming one time step at a time so peak memory stays at a single
 boundary slab. Interpolation runs on `architecture`.
@@ -488,8 +508,20 @@ boundary slab. Interpolation runs on `architecture`.
 Two source fields rather than `write_forcing_file`'s one: the full-depth variables share the source's
 own depth axis, and the surface variables need the single-level grid `surface_source_field_grid`
 builds.
+
+`config` is carried this far only to reach `boundary_source_slab`, which is the one step of the loop a
+source can override — everything else here is dataset-agnostic.
 """
-function write_boundaries_file(filepath, edges, target_grid, variables, steps, source, architecture)
+function write_boundaries_file(
+    filepath,
+    edges,
+    target_grid,
+    variables,
+    steps,
+    source,
+    architecture,
+    config,
+)
     isdir(dirname(filepath)) || mkpath(dirname(filepath))
     isfile(filepath) && rm(filepath; force = true)
 
@@ -534,7 +566,7 @@ function write_boundaries_file(filepath, edges, target_grid, variables, steps, s
 
                 for (variable, device) in zip(variables, devices)
                     source_field = device.surface ? surface_field : full_depth_field
-                    slab = blended_slab(reader, step, variable.source_name)
+                    slab = boundary_source_slab(config, reader, step, variable.source_name)
                     set_source_field!(source_field, slab, variable.mask_fill)
                     interpolate_to_target!(
                         device.output, source_field, device.x, device.y, device.z, device.mask, architecture,

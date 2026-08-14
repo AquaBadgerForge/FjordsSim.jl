@@ -549,11 +549,15 @@ end
 
 """
     write_hourly_source_stub(filepath; dates, longitude, latitude, depths = [0.0, 5.0, 20.0],
-                             value = (name, level, index) -> ...)
+                             value = (name, level, index) -> ..., grid_angle = 0.0)
 
 One downloaded hourly-NorKyst month, as `download_boundaries` writes it: `X`/`Y`/`depth`/`time`
-dimensions, 2D `lon`/`lat`, the `projection_stere.proj4` attribute `boundary_source_grid` reads, four
-full-depth variables and three surface ones.
+dimensions, 2D `lon`/`lat`, the `projection_stere.proj4` attribute `boundary_source_grid` reads, the
+`angle` field `boundary_source_slab` rotates `ubar`/`vbar` with, four full-depth variables and three
+surface ones.
+
+`grid_angle` is that angle in radians, defaulting to zero so a fixture that does not care about the
+rotation gets the identity and can compare `ubar`/`vbar` against the values it wrote.
 
 The projected `X`/`Y` box is derived from the target `longitude`/`latitude` through
 `projected_target_nodes`, so it actually contains the projected target nodes — a box in arbitrary
@@ -573,6 +577,7 @@ function write_hourly_source_stub(
     depths = [0.0, 5.0, 20.0],
     value = (name, level, index) -> Float32(level + index),
     source_size = (6, 5),
+    grid_angle = 0.0,
 )
     NX, NY = source_size
 
@@ -603,6 +608,9 @@ function write_hourly_source_stub(
         projection = defVar(ds, "projection_stere", Int32, ())
         projection.attrib["proj4"] = NORKYST_STUB_PROJ4
         projection[] = Int32(0)
+
+        # ROMS' angle from east to its own x axis, which is what derotates `ubar`/`vbar`.
+        defVar(ds, "angle", Float64, ("X", "Y"))[:, :] = fill(grid_angle, NX, NY)
 
         for name in ("temperature", "salinity", "u_eastward", "v_northward")
             variable = defVar(ds, name, Float32, ("X", "Y", "depth", "time");

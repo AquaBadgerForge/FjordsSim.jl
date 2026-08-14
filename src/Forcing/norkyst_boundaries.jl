@@ -18,6 +18,12 @@ const NORKYST_HOURLY_OPENDAP_URL = "https://thredds.met.no/thredds/dodsC/fou-hi/
 
 # NorKyst variable names and the FjordSim boundary names they become. `zeta`, `ubar` and `vbar` are
 # the three surface variables; the other four are full-depth.
+#
+# Note the asymmetry between the two velocity pairs, and that it is only skin deep. The 3D pair comes
+# from `u_eastward`/`v_northward`, which met.no publishes already rotated to geographic axes. The
+# barotropic pair has no such derotated twin in the collection — ROMS writes `ubar`/`vbar` along its
+# own curvilinear axes — so `boundary_source_slab` rotates them here before anything else sees them.
+# By the time either pair reaches the prepared file both are eastward/northward.
 const NORKYST_BOUNDARY_VARIABLE_NAMES = Dict(
     "temperature" => "T",
     "salinity" => "S",
@@ -27,6 +33,11 @@ const NORKYST_BOUNDARY_VARIABLE_NAMES = Dict(
     "ubar" => "ubar",
     "vbar" => "vbar",
 )
+
+# The two grid-relative barotropic components, and the ROMS variable holding the angle from east to
+# the model's own x axis at each cell.
+const NORKYST_GRID_RELATIVE_COMPONENTS = ("ubar", "vbar")
+const NORKYST_GRID_ANGLE_VARIABLE = "angle"
 
 """
     NorKystBoundariesConfig
@@ -187,6 +198,49 @@ function boundary_source_grid(config::NorKystBoundariesConfig, filepath)
 
         return ProjectedSourceGrid(x, y, depths, proj4)
     end
+end
+
+"""
+    boundary_source_slab(config::NorKystBoundariesConfig, reader, step, source_name)
+
+As the default for every variable except `ubar` and `vbar`, which are rotated from NorKyst's own
+curvilinear axes to eastward/northward before being returned.
+
+ROMS writes `ubar`/`vbar` along its grid's x and y axes, and NorKyst's grid is rotated about 59
+degrees from east in the Oslofjord region — so `vbar` is very nearly the *eastward* barotropic
+velocity there, not the northward one. Left unrotated it reaches `GravityWaveRadiation` as the
+exterior transport normal to a south edge, which is a signal of roughly the right magnitude and
+essentially no correlation with the true normal flow (measured: 0.03) — a persistent spurious
+transport across the boundary rather than a small error.
+
+The 3D `u_eastward`/`v_northward` need none of this, being derotated upstream by met.no. The
+collection publishes no barotropic equivalent, which is the only reason this method exists.
+
+The rotation is applied on the native source grid, before any interpolation, for the same reason
+`nora3_source.jl` rotates NORA3's winds there: the angle is a property of the source geometry, and
+after interpolation the two components live on different edge rows under different masks and can no
+longer be combined.
+
+`angle` is read from whichever file the reader has open rather than cached, which is safe because it
+is grid geometry — every monthly file of one subset carries the same plane — and cheap, being a single
+46x63 plane against seven full slabs of real work in the same step. It is read *after* the two
+`blended_slab` calls, since those are what leave the reader pointing at a file at all.
+"""
+function boundary_source_slab(
+    config::NorKystBoundariesConfig,
+    reader,
+    step,
+    source_name,
+)
+    source_name in NORKYST_GRID_RELATIVE_COMPONENTS ||
+        return blended_slab(reader, step, source_name)
+
+    eastward_slab = blended_slab(reader, step, "ubar")
+    northward_slab = blended_slab(reader, step, "vbar")
+    angle = as_source_slab(Float32.(reader.dataset[NORKYST_GRID_ANGLE_VARIABLE][:, :]))
+    eastward, northward = rotate_to_east_north(angle, eastward_slab, northward_slab)
+
+    return source_name == "ubar" ? eastward : northward
 end
 
 # --- Download ---

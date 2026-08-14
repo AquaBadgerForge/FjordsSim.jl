@@ -1964,6 +1964,70 @@ end
         hourly_time_steps = FjordSim.Forcing.hourly_time_steps
         SourceRecord = FjordSim.Forcing.SourceRecord
 
+        boundary_source_slab = FjordSim.Forcing.boundary_source_slab
+        blended_slab = FjordSim.Forcing.blended_slab
+
+        # `ubar`/`vbar` are the one pair NorKyst publishes along its own curvilinear axes rather than
+        # derotated, so they are rotated to eastward/northward on the source grid. Every other
+        # variable, and every other source, keeps the plain `blended_slab` read.
+        mktempdir() do tmp
+            dates = [DateTime(2020, 1, 1), DateTime(2020, 1, 1, 1)]
+            config = test_boundaries_config(data_root = tmp, architecture = :cpu)
+            mkpath(boundary_data_directory(config))
+            stub = write_hourly_source_stub(
+                joinpath(
+                    boundary_data_directory(config),
+                    FjordSim.Forcing.boundary_monthly_filename(config, 2020, 1),
+                );
+                dates,
+                longitude = (10.0, 11.0),
+                latitude = (59.0, 60.0),
+                # A quarter turn makes the rotation unmistakable: east becomes north exactly.
+                grid_angle = π / 2,
+                value = (name, level, index) -> name == "ubar" ? 3.0f0 :
+                                                name == "vbar" ? 4.0f0 : Float32(level + index),
+            )
+
+            steps = hourly_time_steps([SourceRecord(date, stub, index)
+                                       for (index, date) in enumerate(dates)])
+            reader = FjordSim.Forcing.SourceReader(stub)
+            try
+                step = first(steps)
+
+                # angle = pi/2: (3, 4) -> (-4, 3).
+                @test all(≈(-4.0f0), boundary_source_slab(config, reader, step, "ubar"))
+                @test all(≈(3.0f0), boundary_source_slab(config, reader, step, "vbar"))
+
+                # A rotation preserves speed, which the raw pair does not have in common with a
+                # component-wise rescale — this is what catches a sign or transpose slip.
+                rotated = hypot.(
+                    boundary_source_slab(config, reader, step, "ubar"),
+                    boundary_source_slab(config, reader, step, "vbar"),
+                )
+                @test all(≈(5.0f0), rotated)
+
+                # Everything else is the untouched default, byte for byte.
+                for name in ("temperature", "salinity", "u_eastward", "v_northward", "zeta")
+                    @test boundary_source_slab(config, reader, step, name) ==
+                          blended_slab(reader, step, name)
+                end
+
+                # And the supertype default is what a source that overrides nothing gets, including
+                # for the two velocity names.
+                other = test_boundaries_config(data_root = tmp)
+                invoke_default = FjordSim.Configs.AbstractBoundaryDataConfig
+                for name in ("ubar", "vbar", "zeta")
+                    @test invoke(
+                        boundary_source_slab,
+                        Tuple{invoke_default,Any,Any,Any},
+                        other, reader, step, name,
+                    ) == blended_slab(reader, step, name)
+                end
+            finally
+                close(reader)
+            end
+        end
+
         # The side is in the variable name, not the filename, so one file holds several boundaries.
         @test boundary_variable_name(:south, "T") == "south_T"
         @test boundary_variable_name(:west, "eta") == "west_eta"

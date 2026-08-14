@@ -588,6 +588,41 @@ modules, in `include` order from `src/FjordSim.jl`:
    NorKyst's grid is rotated ~59° from east here, so a thin geographic band is not thin in either `X`
    or `Y` — its bounding index box is still about a tenth of the whole-domain one, which is the point.
 
+   ### `ubar`/`vbar` are grid-relative and must be rotated
+
+   The two velocity pairs this collection publishes are **not in the same frame**, and that asymmetry
+   is load-bearing. `u_eastward`/`v_northward` are diagnostics met.no has already derotated to
+   geographic axes. `ubar`/`vbar` are what ROMS itself writes — depth-averaged velocity along the
+   *model's own curvilinear x and y axes* — and the collection publishes no derotated twin for them.
+
+   Since NorKyst's grid is rotated ~59° from east here, `vbar` in the Oslofjord region is very nearly
+   the **eastward** barotropic velocity, not the northward one. Used unrotated it reaches
+   `GravityWaveRadiation` as the exterior transport normal to a south edge, so the Flather condition
+   nudges the barotropic mode towards a signal of roughly the right magnitude and essentially no
+   correlation with the true normal flow. That is a persistent spurious transport across the open
+   boundary, not a small error — measured on a year of prepared data, `cor(vbar, depth-mean v)` was
+   **-0.034** while `cor(vbar, depth-mean u)` was **-0.916**, and the best-fit rotation carrying
+   `(ubar, vbar)` onto the depth average of the geographic pair was **+59.05°** at gain 1.028, i.e. a
+   pure rotation. In a run it showed up as a band of ~0.5 m/s mean flow 4–7 km inside the southern
+   boundary, some 50x what the domain's tidal prism can account for.
+
+   `boundary_source_slab(config::NorKystBoundariesConfig, …)` fixes this by rotating the pair with
+   `rotate_to_east_north` and NorKyst's own `angle` variable — 58.86–59.92° over this subset, which
+   `define_output_file` already copies into every downloaded monthly file, pre-subset to the band. So
+   the fix costs no re-download.
+
+   Three things about it are load-bearing. It runs on the **native source grid before interpolation**,
+   the same order `nora3_source.jl` rotates NORA3's winds in, because afterwards the two components sit
+   on different edge rows (`Nx_faces` versus `Nx`) under different masks and can no longer be combined.
+   It needs a **hook** rather than a line in the pipeline because `prepare_boundaries` prepares one
+   variable at a time and a rotation needs both — `boundary_source_slab` is the one step of the writer's
+   per-step loop a source can override, and both slabs are reachable there from the same `reader` at the
+   same `step`. And `angle` is read from whichever file the reader has open rather than cached, which is
+   safe only because it is grid geometry and identical in every monthly file of one subset.
+
+   The 3D pair needs none of this, and neither does `zeta`, being a scalar — so `norkyst.jl`, which
+   reads only `u_eastward`/`v_northward`, has no equivalent problem.
+
    Worth knowing: NorKyst's own global attributes name its lateral boundary conditions
    `zeta: Che`, `ubar/vbar: Shc`, `u/v/temp/salt: RadNud` — Chapman, Flather-family and
    Orlanski-plus-nudging. That is exactly the scheme set FjordSim now applies at its own edge, which
@@ -1230,6 +1265,7 @@ Open-boundary data — `AbstractBoundaryDataConfig`, consumed by `prepare_bounda
 | `boundary_variable_names(config)` → `Dict` source name => FjordSim name | yes | none |
 | `download_boundaries(target_grid, config)` | only if it downloads; reads its edges with `open_edges(config)`, and subsets the box `boundary_domain` derives from them | none |
 | `boundary_date_range(config)` → `(first, last)` `DateTime`s | no | reads `ds["time"]` from the prepared NetCDF |
+| `boundary_source_slab(config, reader, step, source_name)` → one source slab | no | `blended_slab`, a plain read. Override only for a variable *derived* from more than one of the source's own — a velocity component stated along the source's own grid axes is the case that needs it |
 
 Unlike a river config, this **is** a `FjordConfig` field, `boundary_config`, `nothing` for a setup
 whose lateral boundary is not data-driven. It hung off the forcing config's `boundaries` field until a

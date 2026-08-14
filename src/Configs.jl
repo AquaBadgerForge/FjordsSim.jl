@@ -249,6 +249,10 @@ edge is a set of new variables in the same file rather than a new file or a form
 - `boundary_date_range(config)`: first and last date the prepared file covers, as a
   `(first, last)` tuple, or `nothing` to skip the check. Optional; defaults to reading `ds["time"]`
   from the prepared NetCDF, so `validate_time_coverage` also guards the `Cyclical()` wrap here.
+- `boundary_source_slab(config, reader, step, source_name)`: one source slab as the writer
+  interpolates from. Optional; defaults to `blended_slab`, a plain read. Override it only for a
+  variable that must be *derived* from more than one of the source's own — which a velocity component
+  is, when the source states it along its own grid axes rather than eastward/northward.
 
 `FjordSim.Forcing.NorKystBoundariesConfig` is the built-in implementation, for MET Norway's hourly
 NorKyst-800m collection; `src/Forcing/norkyst_boundaries.jl` is the template to copy for a new

@@ -36,6 +36,7 @@ using ..Configs:
     open_edges,
     simulation_grid
 using ..Plotting: plot_forcing, plot_boundaries
+using ..Atmospheres: rotate_to_east_north
 
 export forcing_from_file,
     simulation_forcing,
@@ -67,6 +68,7 @@ export forcing_from_file,
     boundary_variable_names,
     boundary_date_range,
     boundary_variable_name,
+    boundary_source_slab,
     NorKystBoundariesConfig
 
 """ Custom backend for FieldTimeSeries """
