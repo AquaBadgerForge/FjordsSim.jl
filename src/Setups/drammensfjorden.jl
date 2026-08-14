@@ -58,26 +58,27 @@ function drammensfjorden()
             output_directory = "norkyst",
             output_file      = "forcing.nc",
             plot_file        = "forcing.png",
-            open_edge        = :south,
             architecture     = :auto,
             parameters       = ["temperature", "salinity", "u_eastward", "v_northward"],
             years            = [2020],
             rivers           = OF800RiversConfig(data_root = data_root),
-            # The hourly exterior state along the open southern edge, as in `oslofjorden()`. Its own
-            # `data_root`, so this setup downloads its own band rather than sharing Oslofjord's:
-            # the band is derived from *this* grid's southern edge, which is 20 km further north.
-            boundaries       = NorKystBoundariesConfig(
-                data_root        = data_root,
-                output_directory = "norkyst_hourly",
-                output_file      = "boundaries.nc",
-                plot_file        = "boundaries.png",
-                margin           = 0.05,
-                architecture     = :auto,
-                parameters       = [
-                    "temperature", "salinity", "u_eastward", "v_northward", "zeta", "ubar", "vbar",
-                ],
-                years            = [2020],
-            ),
+        ),
+        # The hourly exterior state along the open southern edge, as in `oslofjorden()`, and the one
+        # place that edge is stated. Its own `data_root`, so this setup downloads its own band rather
+        # than sharing Oslofjord's: the band is derived from *this* grid's southern edge, which is
+        # 20 km further north.
+        boundary_config = NorKystBoundariesConfig(
+            data_root        = data_root,
+            output_directory = "norkyst_hourly",
+            output_file      = "boundaries.nc",
+            plot_file        = "boundaries.png",
+            open_edges       = :south,
+            margin           = 0.05,
+            architecture     = :auto,
+            parameters       = [
+                "temperature", "salinity", "u_eastward", "v_northward", "zeta", "ubar", "vbar",
+            ],
+            years            = [2020],
         ),
         # Overloads atmosphere_time_steps, atmosphere_source_grid, atmosphere_variable_names,
         # download_atmosphere, prescribed_atmosphere and prescribed_radiation — the hooks
@@ -120,12 +121,13 @@ function drammensfjorden()
             ),
             # MergedBoundaryConditions overloads field_boundary_conditions; each piece inside it
             # overloads boundary_condition_sides. Air-sea fluxes and quadratic bottom drag are
-            # separate pieces, so either can be swapped alone, plus the genuinely open southern edge
-            # reading the hourly boundary dataset. The two timescales are Marchesiello et al. (2001).
+            # separate pieces, so either can be swapped alone, plus the genuinely open southern edge,
+            # whose edge and exterior state both come from `boundary_config` above. The two timescales
+            # are Marchesiello et al. (2001).
             boundary_conditions = MergedBoundaryConditions(
                 AirSeaFluxes(),
                 QuadraticBottomDrag(coefficient = 0.003),
-                OpenLateralBoundaryFromForcing(
+                OpenLateralBoundaryFromData(
                     inflow_timescale  = 1day,
                     outflow_timescale = 360days,
                 ),

@@ -47,7 +47,13 @@ struct MinimalRivers <: AbstractRiverConfig
     output_file::String
     relaxation_timescale::Float64
     search_radius::Int
+    standalone::Bool
 end
+
+# `standalone` last with a default, so a site that only cares about the supertype's older fields
+# names them positionally as before.
+MinimalRivers(data_root, output_file, relaxation_timescale, search_radius) =
+    MinimalRivers(data_root, output_file, relaxation_timescale, search_radius, false)
 
 struct MinimalAtmosphere <: AbstractAtmosphereConfig
     data_root::String
@@ -95,7 +101,11 @@ struct StubRivers <: AbstractRiverConfig
     search_radius::Int
     locations::Vector{FjordSim.Forcing.RiverLocation}
     series::Dict{String,Matrix{Float32}}
+    standalone::Bool
 end
+
+StubRivers(data_root, output_file, relaxation_timescale, search_radius, locations, series) =
+    StubRivers(data_root, output_file, relaxation_timescale, search_radius, locations, series, false)
 
 FjordSim.Forcing.river_locations(config::StubRivers) = config.locations
 FjordSim.Forcing.river_series(config::StubRivers, times) = config.series
@@ -144,6 +154,7 @@ end
     test_grid_config(; kwargs...)
     test_bathymetry_config(; data_root = tempdir(), kwargs...)
     test_forcing_config(; data_root = tempdir(), kwargs...)
+    test_boundaries_config(; data_root = tempdir(), kwargs...)
     test_atmosphere_config(; data_root = tempdir(), kwargs...)
 
 The built-in configs with their required keywords filled in, so a test that cares about one field
@@ -152,6 +163,10 @@ overrides anything named here.
 
 These fill in *only* the keywords each config requires; every defaulted field stays defaulted, so a
 test asserting a default asserts the config's own and not this file's.
+
+`test_boundaries_config` fills in `open_edges`, which the config requires: it is the one place the open
+edges are stated, so every test that opens a boundary goes through this factory or names the field. It
+takes one `Symbol` or several, so a four-edge fixture is `open_edges = (:south, :north, :west, :east)`.
 
 A site that asserts an `UndefKeywordError` must keep spelling its keywords out — there, the omission
 is the assertion, and a factory would fill in the very field being withheld.
@@ -182,6 +197,7 @@ test_forcing_config(; data_root = tempdir(), kwargs...) = NorKystConfig(;
 test_boundaries_config(; data_root = tempdir(), kwargs...) = NorKystBoundariesConfig(;
     data_root,
     output_directory = "norkyst_hourly",
+    open_edges = :south,
     parameters = ["temperature", "salinity", "u_eastward", "v_northward", "zeta", "ubar", "vbar"],
     years = [2020],
     kwargs...,
@@ -295,7 +311,7 @@ test_time_stepping(;
 test_boundary_conditions() = MergedBoundaryConditions(
     AirSeaFluxes(),
     QuadraticBottomDrag(coefficient = 0.003),
-    OpenLateralBoundaryFromForcing(inflow_timescale = 1day, outflow_timescale = 360days),
+    OpenLateralBoundaryFromData(inflow_timescale = 1day, outflow_timescale = 360days),
 )
 
 test_progress_callback(; name = :progress, interval = 1hour, report = progress) =
@@ -471,13 +487,17 @@ function write_prepared_forcing(
 end
 
 """
-    write_prepared_boundaries(filepath; size, edge = :south,
+    write_prepared_boundaries(filepath; size, edges = :south,
                               names = ("T", "S", "u", "v", "eta", "ubar", "vbar"),
                               dates = ..., value = (name, index) -> 1.0f0, land = nothing)
 
 A NetCDF file in exactly the layout `prepare_boundaries` writes: the same six spatial dimensions the
-forcing file defines, one `Float32` variable per name *prefixed with its edge*, no `_lambda` twins, a
-CF-encoded `time`, and the `open_edge` global attribute.
+forcing file defines, one `Float32` variable per name *prefixed with its edge* for each edge, no
+`_lambda` twins, a CF-encoded `time`, and the comma-joined `open_edge` global attribute.
+
+`edges` takes one `Symbol` or several, like a boundary config's own field, so a fixture for a domain
+open all round is `edges = (:south, :north, :west, :east)` — one file with four sides in it, which is
+what the real writer produces.
 
 The staggering and rank come from `Forcing.boundary_dimension_names`, the same function
 `prepare_boundaries` writes with, so a change to the layout earns a failing read rather than a
@@ -490,13 +510,14 @@ passing test against a file the model cannot use.
 function write_prepared_boundaries(
     filepath;
     size,
-    edge = :south,
+    edges = :south,
     names = ("T", "S", "u", "v", "eta", "ubar", "vbar"),
     dates = [DateTime(2020, 1, 1), DateTime(2020, 1, 1, 1)],
     value = (name, index) -> 1.0f0,
     land = nothing,
 )
     Nx, Ny, Nz = size
+    open_edges = FjordSim.Forcing.lateral_edges(edges)
 
     NCDataset(filepath, "c") do ds
         for (name, length) in (
@@ -507,9 +528,9 @@ function write_prepared_boundaries(
         end
         defDim(ds, "time", Base.length(dates))
         defVar(ds, "time", dates, ("time",))
-        ds.attrib["open_edge"] = String(edge)
+        ds.attrib["open_edge"] = join(open_edges, ",")
 
-        for name in names
+        for edge in open_edges, name in names
             dimensions = FjordSim.Forcing.boundary_dimension_names(Val(edge), name)
             shape = ntuple(index -> ds.dim[dimensions[index]], Base.length(dimensions) - 1)
             variable = defVar(ds, FjordSim.Forcing.boundary_variable_name(edge, name), Float32,

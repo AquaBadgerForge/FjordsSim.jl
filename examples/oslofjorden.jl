@@ -58,9 +58,10 @@ FjordSim.free_surface(config::ImplicitFreeSurfaceConfig, grid) = ImplicitFreeSur
 
 # --- RadiatingLateralBoundary: a new AbstractBoundaryConditionConfig -------------------------
 
-# Replaces FjordSim's closed-wall `OpenLateralBoundary` with a radiating one relaxing towards a
-# quiescent exterior. Carries its own `edge` and `relaxation_timescale` rather than reading the
-# forcing config's, since `forcing_config` is `nothing` here.
+# Replaces FjordSim's data-driven `OpenLateralBoundaryFromData` with a radiating one relaxing towards
+# a quiescent exterior. Carries its own `edge` and `relaxation_timescale` rather than reading them off
+# a boundary data config, since this setup names neither `forcing_config` nor `boundary_config` — its
+# exterior state is a pair of constants, not a prepared file.
 struct RadiatingLateralBoundary <: AbstractBoundaryConditionConfig
     edge::Symbol
     relaxation_timescale::Float64
@@ -101,7 +102,10 @@ open_tracer_boundary_conditions(::Val{edge}, config::RadiatingLateralBoundary, t
         for name in tracer_names
     )
 
-FjordSim.boundary_condition_sides(config::RadiatingLateralBoundary, grid, forcing, forcing_config, tracers) =
+# The fourth argument is the setup's boundary data config, which this piece has no use for: it
+# carries its own edge and its own constant exterior state, so it implements the five-argument form
+# and never sees the prepared boundary series either.
+FjordSim.boundary_condition_sides(config::RadiatingLateralBoundary, grid, forcing, boundary_config, tracers) =
     recursive_merge(
         open_velocity_boundary_conditions(Val(config.edge), config),
         open_tracer_boundary_conditions(Val(config.edge), config, tracers),

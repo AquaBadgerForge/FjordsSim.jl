@@ -36,6 +36,9 @@ ROMS river forcing NetCDF.
   the source does not carry. River salinity is 0 by definition of fresh water.
 - `relaxation_timescale`: seconds; the river cells relax this fast toward the river values.
 - `search_radius`: how far to look for a coastal water cell, in grid cells.
+- `standalone`: whether `add_rivers` writes a forcing file carrying only rivers rather than patching
+  a copy of the prepared interior forcing. `false` by default, so the step keeps needing
+  `prepare_forcing` unless a setup says otherwise.
 """
 Base.@kwdef mutable struct OF800RiversConfig <: AbstractRiverConfig
     data_root::String
@@ -48,6 +51,7 @@ Base.@kwdef mutable struct OF800RiversConfig <: AbstractRiverConfig
     constants::Dict{String,Float64} = Dict("S" => 0.0)
     relaxation_timescale::Float64 = 3600.0
     search_radius::Int = 10
+    standalone::Bool = false
 end
 
 """

@@ -1,9 +1,21 @@
-# Rivers: the generic half of the river pipeline. `add_rivers` copies a prepared forcing file
-# and writes river relaxation into the surface level of the copy, one grid cell per river. Only
-# the three hooks `river_locations`, `river_series` and `download_rivers` are dataset-specific —
-# `src/Forcing/of800_rivers.jl` is the template to copy for a new river dataset.
+# Rivers: the generic half of the river pipeline. `add_rivers` writes river relaxation into the
+# surface level of a forcing file, one grid cell per river — either a copy of the one
+# `prepare_forcing` wrote, or a river-only file of its own. Only the three hooks `river_locations`,
+# `river_series` and `download_rivers` are dataset-specific — `src/Forcing/of800_rivers.jl` is the
+# template to copy for a new river dataset.
 
 const RIVER_NEIGHBOUR_OFFSETS = ((-1, -1), (-1, 0), (-1, 1), (0, -1), (0, 1), (1, -1), (1, 0), (1, 1))
+
+# Spacing of a standalone river file's time axis. River records are daily and `river_series` matches
+# them by calendar date, so a finer axis would only repeat records.
+const RIVER_TIME_SPACING = Day(1)
+
+"""
+Global attribute marking a forcing file that carries only rivers, so a reader wanting ocean state
+rather than forcing terms can refuse it rather than reading `NaN` everywhere. Set by
+`create_river_forcing_file`, read by `FjordSim.Simulations.forcing_state`.
+"""
+const RIVERS_ONLY_ATTRIBUTE = "rivers_only"
 
 """
     RiverLocation(id, name, longitude, latitude)
@@ -63,14 +75,18 @@ land on one. Defaults to `config.search_radius`.
 river_search_radius(config::AbstractRiverConfig) = config.search_radius
 
 """
-    coastal_water_mask(target_grid, edge)
+    coastal_water_mask(target_grid)
 
-Surface-level water mask of `target_grid`, as a `Ny`-by-`Nx`-shaped `(i, j)` matrix. Built from
-the same `water_mask` that `prepare_forcing` uses, so "water" means exactly what it means when
-the forcing file is written, including `PartialCellBottom` cells.
+Surface-level water mask of `target_grid`, as an `(i, j)` matrix. Built from the same `water_mask`
+that `prepare_forcing` uses, so "water" means exactly what it means when the forcing file is written,
+including `PartialCellBottom` cells.
+
+The open edge does not enter: this asks for the tracer location, and every `open_boundary_water!`
+method returns the mask untouched unless the location is staggered across its own edge. A river
+enters at a tracer cell, so the edge could only ever have been a no-op here.
 """
-function coastal_water_mask(target_grid, edge)
-    mask = water_mask(target_grid, Center, Center, edge)
+function coastal_water_mask(target_grid)
+    mask = water_mask(target_grid, Center, Center, nothing)
     return mask[:, :, size(mask, 3)]
 end
 
@@ -127,7 +143,7 @@ function nearest_coastal_cell(mask, i, j, radius)
 end
 
 """
-    river_cells(target_grid, locations, edge, radius)
+    river_cells(target_grid, locations, radius)
 
 Snap each `RiverLocation` to the coastal water cell that will carry it. An outlet is located by
 independent nearest-node lookups in longitude and latitude, then moved to the nearest coastal
@@ -137,8 +153,8 @@ Outlets outside the grid, and outlets with no coastal cell in reach, are dropped
 warning — writing a river into a land cell would be silently lost when the model reads the
 forcing back.
 """
-function river_cells(target_grid, locations, edge, radius)
-    mask = coastal_water_mask(target_grid, edge)
+function river_cells(target_grid, locations, radius)
+    mask = coastal_water_mask(target_grid)
     longitudes = Array(λnodes(target_grid, Center()))
     latitudes = Array(φnodes(target_grid, Center()))
 
@@ -169,22 +185,28 @@ end
 
 """
     add_rivers(config::FjordConfig)
-    add_rivers(target_grid, config::AbstractForcingConfig)
+    add_rivers(target_grid, config::AbstractForcingConfig; coverage = nothing)
 
-Write river relaxation on top of the forcing file prepared by `prepare_forcing`, into the copy
-at `river_forcing_path(config.rivers)`. Returns `nothing` when the setup has no rivers, or no
-forcing at all.
+Write river relaxation into the forcing file at `river_forcing_path(config.rivers)`. Returns
+`nothing` when the setup has no rivers, or no forcing config at all.
 
 Rivers enter as relaxation, not as a mass flux: each river cell gets its value and a lambda of
 `1 / relaxation_timescale` at the surface level, for every time step. That lambda is well
 inside the `|λ| < 1` regime of `ForcingFromFile`, so the river cells relax toward the river
-values while the rest of the domain keeps whatever `prepare_forcing` wrote — including the
-boundary relaxation band, which a river cell landing inside it would override.
+values while the rest of the domain keeps whatever the rest of the file says.
+
+Where that file comes from is the river config's `standalone`:
+
+- `false` copies the file `prepare_forcing` wrote and patches the copy, taking its time axis from
+  it. The original is never modified, so the step re-runs without redoing `prepare_forcing`, and a
+  missing prepared forcing is an error naming the step that produces it.
+- `true` writes the file from scratch, carrying *only* rivers — no interior forcing to download or
+  regrid. Its time axis comes from the run window instead of from a prepared file, so it needs
+  `coverage`. See `create_river_forcing_file`.
 
 The `FjordConfig` method is the setup-level driver: it reads the grid from the processed
-bathymetry, so the river cells are snapped against the same land mask the forcing was written
-with, and downloads the river data first. The original forcing file is never modified, so the
-step can be re-run without redoing `prepare_forcing`.
+bathymetry, so the river cells are snapped against the same land mask the forcing would be written
+with, downloads the river data first, and takes `coverage` from the simulation config.
 """
 function add_rivers(config::FjordConfig)
     isnothing(config.forcing_config) && return nothing
@@ -200,8 +222,8 @@ function add_rivers(config::FjordConfig)
     download_rivers(rivers)
 
     # The grid stays on the CPU: building the land masks walks `peripheral_node` cell by cell.
-    grid = ImmersedBoundaryGrid(bathymetry_file, CPU(), config.grid_config.halo)
-    result = add_rivers(grid, config.forcing_config)
+    grid = simulation_grid(config.grid_config, bathymetry_file, CPU())
+    result = add_rivers(grid, config.forcing_config; coverage = coverage_window(config.simulation_config))
 
     @info "Placed $(length(result.cells)) of $(length(river_locations(rivers))) rivers"
     @info "Patched variables: $(join(result.variables, ", "))"
@@ -211,23 +233,22 @@ function add_rivers(config::FjordConfig)
     return result
 end
 
-add_rivers(target_grid, config::AbstractForcingConfig) = add_rivers(target_grid, config, config.rivers)
+add_rivers(target_grid, config::AbstractForcingConfig; coverage = nothing) =
+    add_rivers(target_grid, config, config.rivers; coverage)
 
-add_rivers(target_grid, config::AbstractForcingConfig, ::Nothing) = nothing
+add_rivers(target_grid, config::AbstractForcingConfig, ::Nothing; coverage = nothing) = nothing
 
-function add_rivers(target_grid, config::AbstractForcingConfig, rivers::AbstractRiverConfig)
+function add_rivers(
+    target_grid,
+    config::AbstractForcingConfig,
+    rivers::AbstractRiverConfig;
+    coverage = nothing,
+)
     forcing_file = forcing_path(config)
-    isfile(forcing_file) || error(
-        "Forcing file $forcing_file does not exist. " *
-        "Run `julia --project -m FjordSim prepare_forcing` for this setup first.",
-    )
-
-    times = NCDataset(forcing_file) do ds
-        DateTime.(ds["time"][:])
-    end
+    times = river_forcing_times(rivers, forcing_file, coverage)
 
     locations = river_locations(rivers)
-    cells = river_cells(target_grid, locations, config.open_edge, river_search_radius(rivers))
+    cells = river_cells(target_grid, locations, river_search_radius(rivers))
     isempty(cells) && error("None of the $(length(locations)) river outlets landed on the grid.")
 
     report_river_cells(cells)
@@ -239,9 +260,13 @@ function add_rivers(target_grid, config::AbstractForcingConfig, rivers::Abstract
         "Give the river config an `output_file` that differs from the forcing config's.",
     )
 
-    @info "Copying $forcing_file to $output_file"
     isdir(dirname(output_file)) || mkpath(dirname(output_file))
-    cp(forcing_file, output_file; force = true)
+    if rivers.standalone
+        create_river_forcing_file(output_file, target_grid, sort(collect(keys(series))), times)
+    else
+        @info "Copying $forcing_file to $output_file"
+        cp(forcing_file, output_file; force = true)
+    end
 
     lambda = Float32(1 / rivers.relaxation_timescale)
     written = write_rivers(output_file, cells, locations, series, lambda, length(times))
@@ -249,6 +274,102 @@ function add_rivers(target_grid, config::AbstractForcingConfig, rivers::Abstract
     @info "Finished adding rivers"
 
     return (; output_file, cells, variables = written, times)
+end
+
+"""
+    river_forcing_times(rivers, forcing_file, coverage)
+
+The time axis the river forcing file is written on: the prepared forcing's own axis when patching a
+copy of it, and a daily axis spanning the run window when `standalone`.
+
+The standalone axis is anchored at the window's first instant and extended until it passes the last,
+so `forcing_date_range` reports a span `validate_time_coverage` accepts — every reader indexes time
+`Cyclical()`, which wraps rather than failing outside its data, and the coverage check is what keeps
+that wrap unreachable.
+
+Daily because a river dataset's records are daily and `river_series` matches them by *calendar
+date*, so a finer cadence would ask for the same record several times over. A sub-daily dataset would
+want a hook here.
+"""
+function river_forcing_times(rivers::AbstractRiverConfig, forcing_file, coverage)
+    rivers.standalone || return prepared_forcing_times(forcing_file)
+
+    isnothing(coverage) && error(
+        "A standalone river forcing file takes its time axis from the run window, but this setup " *
+        "names no `simulation_config` to read `start_date` and `stop_time` from. Name one, or set " *
+        "the river config's `standalone` to false and prepare interior forcing first.",
+    )
+
+    first_date, last_date = coverage
+    dates = collect(first_date:RIVER_TIME_SPACING:last_date)
+    # Extend until the axis reaches past the window's end, and to at least two records: the reader
+    # keeps two time indices in memory, so a single-record axis reads past the end of the file.
+    while last(dates) < last_date || length(dates) < 2
+        push!(dates, last(dates) + RIVER_TIME_SPACING)
+    end
+
+    return dates
+end
+
+function prepared_forcing_times(forcing_file)
+    isfile(forcing_file) || error(
+        "Forcing file $forcing_file does not exist. " *
+        "Run `julia --project -m FjordSim prepare_forcing` for this setup first, or set the river " *
+        "config's `standalone` to true for a forcing file carrying only rivers.",
+    )
+
+    return NCDataset(forcing_file) do ds
+        DateTime.(ds["time"][:])
+    end
+end
+
+"""
+    create_river_forcing_file(output_file, target_grid, names, dates)
+
+Write an otherwise-empty forcing file for `write_rivers` to patch: the layout `forcing_from_file`
+reads, on `dates`, with a `value`/`_lambda` pair per name in `names` and no data in it.
+
+The dimensions and coordinates are `define_forcing_dimensions!`'s, so this is the same contract
+`prepare_forcing` writes and the reader's dimension check against the grid holds unchanged.
+
+Only the **surface level** is filled in, with `NaN32` values and zero lambdas — that is the level
+`write_rivers` patches, and the levels below it carry no river forcing at all, so they are left
+unwritten and read back as the file's `_FillValue`. Both are inert twice over: a non-finite value
+becomes the `-999.0` sentinel every branch of `ForcingFromFile` gates on with `value > -990`, and a
+non-finite lambda fails each of `λ > 1`, `λ < -1` and `-1 < λ < 1`. It is also what dry cells already
+read as in a file `prepare_forcing` wrote.
+
+The `rivers_only` global attribute marks what the file is, so a reader that needs actual ocean state
+— `FromForcing` initial conditions, which would otherwise start the run from zeros everywhere — can
+refuse it instead of silently succeeding.
+"""
+function create_river_forcing_file(output_file, target_grid, names, dates)
+    @info "Creating river-only forcing file $output_file with $(length(dates)) time steps: " *
+          "$(first(dates)) to $(last(dates))"
+    isfile(output_file) && rm(output_file; force = true)
+
+    NCDataset(output_file, "c") do ds
+        define_forcing_dimensions!(ds, target_grid, dates)
+        ds.attrib[RIVERS_ONLY_ATTRIBUTE] = "true"
+
+        for name in names
+            dimensions = forcing_dimension_names(name)
+            nx, ny = ds.dim[dimensions[1]], ds.dim[dimensions[2]]
+            surface = ds.dim["Nz"]
+
+            for (variable_name, fill_value) in ((name, NaN32), (name * "_lambda", 0.0f0))
+                variable = defVar(ds, variable_name, Float32, dimensions;
+                    chunksizes = [nx, ny, 1, 1], deflatelevel = FORCING_DEFLATE_LEVEL,
+                    attrib = ["_FillValue" => NaN32])
+                slab = fill(fill_value, nx, ny)
+                for index in eachindex(dates)
+                    variable[:, :, surface, index] = slab
+                end
+            end
+        end
+    end
+
+    return output_file
 end
 
 """

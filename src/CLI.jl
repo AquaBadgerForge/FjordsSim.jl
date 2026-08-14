@@ -59,15 +59,18 @@ Subcommands, in the order a setup is prepared and run:
   prepare_bathymetry    Regrid the bathymetry source onto the setup's grid. Downloads the Geonorge
                         Sjøkart FileGDB on first use (~2.3 GB).
   download_forcing      Download and subset the forcing dataset over the setup's region and years.
+                        A setup with no forcing config does nothing.
   prepare_forcing       Regrid the download onto the simulation grid. Needs prepare_bathymetry.
                         Where the interpolation runs is the forcing config's `architecture` field,
-                        not a command-line option.
+                        not a command-line option. A setup with no forcing config does nothing.
   add_rivers            Write river relaxation into a copy of the prepared forcing, leaving the
-                        original untouched. A setup with no rivers does nothing.
+                        original untouched — or, when the river config is `standalone`, into a
+                        forcing file carrying only rivers, needing no prepared forcing at all. A
+                        setup with no rivers does nothing.
   download_boundaries   Download and subset hourly source data along the open lateral boundary. A
                         thin band rather than the whole domain, since the exterior state an open
                         boundary needs has to resolve the tide and daily means do not. A setup
-                        whose forcing config names no `boundaries` does nothing.
+                        naming no boundary config does nothing.
   prepare_boundaries    Regrid the download onto the open edge of the simulation grid. Needs
                         prepare_bathymetry and download_boundaries.
   download_atmosphere   Download and subset the atmosphere dataset. By far the slowest step: NORA3

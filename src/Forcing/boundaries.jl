@@ -177,16 +177,35 @@ function boundary_target_nodes(::Val{edge}, target_grid, LX, LY) where {edge}
 end
 
 """
+    boundary_domain(edges, target_grid, margin)
     boundary_domain(::Val{edge}, target_grid, margin)
 
-The longitude/latitude box a download needs to cover the boundary row: the full extent along the
-edge, and a `margin`-degree band around the edge itself across it.
+The longitude/latitude box a download needs to cover the boundary rows: for one edge, the full extent
+along it and a `margin`-degree band around the edge itself across it; for several, the smallest box
+containing each of their bands.
 
 A thin band rather than the whole domain box, because the boundary file is hourly: the full box at
 24 records a day is more than twenty times the interior download, while the band is a tenth of the
 box. `margin` must still leave room for the source cells surrounding the boundary row, since the
 interpolation is bilinear.
+
+**That saving is a single-edge one.** Two opposite edges, or a domain in the open ocean naming all
+four, have bands whose bounding box is the whole domain plus the margin — so a multi-edge download is
+the full box at hourly cadence, and the interior of it is downloaded and never read. Keeping it one
+box is what lets `boundary_time_steps` and `boundary_source_grid` stay single-file hooks and
+`prepare_boundaries` interpolate every edge from one source. Per-edge downloads would be the
+optimization, at the price of both hooks becoming per-edge.
 """
+function boundary_domain(edges, target_grid, margin)
+    boxes = [boundary_domain(Val(edge), target_grid, margin) for edge in lateral_edges(edges)]
+    isempty(boxes) && throw(ArgumentError("boundary_domain needs at least one open edge, got none."))
+
+    longitude = (minimum(box -> box[1][1], boxes), maximum(box -> box[1][2], boxes))
+    latitude = (minimum(box -> box[2][1], boxes), maximum(box -> box[2][2], boxes))
+
+    return longitude, latitude
+end
+
 function boundary_domain(::Val{edge}, target_grid, margin) where {edge}
     longitude = x_domain(target_grid)
     latitude = y_domain(target_grid)
@@ -233,28 +252,26 @@ function boundary_variable_names end
 
 """
     download_boundaries(config::FjordConfig)
-    download_boundaries(target_grid, edge, config::AbstractBoundaryDataConfig)
+    download_boundaries(target_grid, config::AbstractBoundaryDataConfig)
 
 Fetch and subset the hourly source data a later `prepare_boundaries` call reads, into
 `boundary_data_directory(config)`.
 
 The `FjordConfig` form is the generic driver, the same shape as `download_forcing`: it builds the
-setup's grid on the CPU, reads the open edge from the forcing config — the one place it is stated —
-and dispatches on the boundary config.
+setup's grid on the CPU and dispatches on the setup's boundary config, which is also where the open
+edges are stated — so a dataset reads them with `open_edges(config)` rather than being handed them. It
+says
+nothing about forcing: a setup can name boundary data and no interior forcing, or the other way
+round.
 """
 function download_boundaries(config::FjordConfig)
-    isnothing(config.forcing_config) && return nothing
-    boundaries = config.forcing_config.boundaries
+    boundaries = config.boundary_config
     isnothing(boundaries) && return nothing
 
-    return download_boundaries(
-        domain_grid(config.grid_config, CPU()),
-        validate_open_edge(config.forcing_config.open_edge),
-        boundaries,
-    )
+    return download_boundaries(domain_grid(config.grid_config, CPU()), boundaries)
 end
 
-download_boundaries(target_grid, edge, ::Nothing) = nothing
+download_boundaries(target_grid, ::Nothing) = nothing
 
 """
     boundary_date_range(config)
@@ -363,11 +380,17 @@ function prepared_boundary_variable(
 end
 
 """
-    prepare_boundaries(target_grid, edge, config::AbstractBoundaryDataConfig; coverage = nothing)
+    prepare_boundaries(target_grid, config::AbstractBoundaryDataConfig; coverage = nothing)
 
 Regrid the hourly source files already downloaded into `boundary_data_directory(config)` onto the
-`edge` row of `target_grid`, and write the boundary NetCDF at `boundary_data_path(config)` that
-`boundary_series` reads.
+open edge rows of `target_grid`, and write the boundary NetCDF at `boundary_data_path(config)` that
+`boundary_series` reads. The edges are `open_edges(config)`, so they are read from the one config that
+states them rather than passed alongside that config, where the two could disagree.
+
+Every named edge is prepared into the **same file**, which the layout already allowed for: variables
+are named for their side (`south_T`, `west_T`), all six spatial dimensions are defined in every
+boundary file, and one time axis serves all of them. A domain in the open ocean naming all four edges
+therefore writes one file with four sides in it, not four files.
 
 The dataset enters only through `boundary_variable_names`, `boundary_time_steps` and
 `boundary_source_grid`, exactly as `prepare_forcing`'s does; everything after them is shared, and
@@ -382,14 +405,9 @@ range.
 # Returns
 A named tuple with `output_file`, `times` and `variables` (the written variable names).
 """
-function prepare_boundaries(
-    target_grid,
-    edge,
-    config::AbstractBoundaryDataConfig;
-    coverage = nothing,
-)
+function prepare_boundaries(target_grid, config::AbstractBoundaryDataConfig; coverage = nothing)
     architecture = interpolation_architecture(config)
-    validate_open_edge(edge)
+    edges = open_edges(config)
 
     variable_names = boundary_variable_names(config)
     source_names = [name for name in config.parameters if haskey(variable_names, name)]
@@ -401,19 +419,21 @@ function prepare_boundaries(
     steps = pad_time_steps(hourly_time_steps(boundary_time_steps(config)), coverage)
     reference_file = first(steps).lower.filepath
     source = boundary_source_grid(config, reference_file)
-    @info "Preparing $edge boundary from " *
+    @info "Preparing the $(join(edges, ", ")) boundary from " *
           "$(length(unique(step -> step.lower.filepath, steps))) file(s), " *
           "$(length(steps)) time steps: $(first(steps).date) to $(last(steps).date)"
 
+    # Every edge's variables go into one vector and one file: they are named for their side, so the
+    # writer needs no notion of which edge it is on, and one time axis serves all of them.
     variables = [
         prepared_boundary_variable(name, edge, target_grid, source, reference_file, config)
-        for name in source_names
+        for edge in edges for name in source_names
     ]
 
     output_file = boundary_data_path(config)
     @info "Writing boundary file to $output_file, interpolating on $(summary(architecture))"
-    write_boundaries_file(output_file, edge, target_grid, variables, steps, source, architecture)
-    @info "Finished preparing the $edge boundary"
+    write_boundaries_file(output_file, edges, target_grid, variables, steps, source, architecture)
+    @info "Finished preparing the $(join(edges, ", ")) boundary"
 
     return (;
         output_file,
@@ -422,7 +442,7 @@ function prepare_boundaries(
     )
 end
 
-prepare_boundaries(target_grid, edge, ::Nothing; coverage = nothing) = nothing
+prepare_boundaries(target_grid, ::Nothing; coverage = nothing) = nothing
 
 """
     prepare_boundaries(config::FjordConfig)
@@ -435,11 +455,10 @@ from the processed bathymetry so the boundary row's land mask matches the model 
 `prepare_bathymetry` must have run first, and the coverage window comes from the simulation config.
 
 # Returns
-The `prepare_boundaries(target_grid, edge, config)` named tuple with `plot_file` added.
+The `prepare_boundaries(target_grid, config)` named tuple with `plot_file` added.
 """
 function prepare_boundaries(config::FjordConfig)
-    isnothing(config.forcing_config) && return nothing
-    boundaries = config.forcing_config.boundaries
+    boundaries = config.boundary_config
     isnothing(boundaries) && return nothing
 
     bathymetry_file = bathymetry_path(config.bathymetry_config)
@@ -448,15 +467,9 @@ function prepare_boundaries(config::FjordConfig)
         "Run `julia --project -m FjordSim prepare_bathymetry` for this setup first.",
     )
 
-    edge = validate_open_edge(config.forcing_config.open_edge)
     grid = simulation_grid(config.grid_config, bathymetry_file, CPU())
-    result = prepare_boundaries(
-        grid,
-        edge,
-        boundaries;
-        coverage = coverage_window(config.simulation_config),
-    )
-    plot_file = plot_boundaries(edge, boundaries)
+    result = prepare_boundaries(grid, boundaries; coverage = coverage_window(config.simulation_config))
+    plot_file = plot_boundaries(boundaries)
 
     @info "Prepared boundary variables: $(join(result.variables, ", "))"
     @info "Time range: $(first(result.times)) to $(last(result.times)) ($(length(result.times)) steps)"
@@ -476,14 +489,14 @@ Two source fields rather than `write_forcing_file`'s one: the full-depth variabl
 own depth axis, and the surface variables need the single-level grid `surface_source_field_grid`
 builds.
 """
-function write_boundaries_file(filepath, edge, target_grid, variables, steps, source, architecture)
+function write_boundaries_file(filepath, edges, target_grid, variables, steps, source, architecture)
     isdir(dirname(filepath)) || mkpath(dirname(filepath))
     isfile(filepath) && rm(filepath; force = true)
 
     ds = NCDataset(filepath, "c")
     try
-        define_forcing_dimensions!(ds, target_grid, steps)
-        ds.attrib[BOUNDARY_EDGE_ATTRIBUTE] = String(edge)
+        define_forcing_dimensions!(ds, target_grid, [step.date for step in steps])
+        ds.attrib[BOUNDARY_EDGE_ATTRIBUTE] = join(edges, ",")
 
         for variable in variables
             # One boundary section of one time step per chunk, matching how both this writer and
@@ -503,7 +516,10 @@ function write_boundaries_file(filepath, edge, target_grid, variables, steps, so
             mask = on_architecture(architecture, variable.mask),
             output = on_architecture(architecture, zeros(Float32, size(variable.mask))),
             host = Array{Float32}(undef, size(variable.mask)),
-            surface = is_surface_boundary_variable(unprefixed_boundary_name(variable.name, edge)),
+            # A surface variable is the one with no depth dimension, which is the same test as
+            # `is_surface_boundary_variable` on its bare name but needs no notion of which edge this
+            # variable belongs to — and this file may hold several.
+            surface = length(variable.dimensions) == 2,
         ) for variable in variables]
 
         reader = SourceReader(first(steps).lower.filepath)
@@ -725,34 +741,67 @@ function set!(fts::BoundaryFTS, path::String = fts.path, name::String = fts.name
 end
 
 """
-    boundary_series(config, grid, edge, reference_date)
+    boundary_series(config, grid, reference_date)
 
-The prepared exterior state along `edge`, as a `NamedTuple` of reduced `FieldTimeSeries` keyed by
-the bare FjordSim names — `(; T, S, u, v, eta, ubar, vbar)`, restricted to what the file carries.
+The prepared exterior state along every edge `open_edges(config)` names, as a `NamedTuple` keyed by
+*edge* whose entries are `NamedTuple`s of reduced `FieldTimeSeries` keyed by the bare FjordSim names —
+`(; south = (; T, S, u, v, eta, ubar, vbar), west = …)`, each restricted to what the file carries.
 
-Keyed on the bare name rather than the prefixed one, so the same call serves a second edge and the
-boundary condition never spells a side into a variable name.
+Keyed by edge because a domain may be open on several, and keyed on the bare name inside because the
+side is already the outer key — so no boundary condition spells a side into a variable name, and the
+`(; T, S, …)` group a scheme consumes is the same shape whichever edge it came from.
 
 `reference_date` is the instant the time axes are zeroed at — the simulation config's `start_date`,
 the same instant the interior forcing and the atmosphere are zeroed at, which is the only thing
 keeping the three in phase. Indexing is `Cyclical()` like every other FjordSim reader, and
 `validate_time_coverage` is what keeps the wrap unreachable.
 """
-function boundary_series(config::AbstractBoundaryDataConfig, grid, edge, reference_date = nothing)
-    validate_open_edge(edge)
+function boundary_series(config::AbstractBoundaryDataConfig, grid, reference_date = nothing)
+    edges = open_edges(config)
     filepath = boundary_data_path(config)
     isfile(filepath) || error(
         "Prepared boundary file $filepath does not exist. " *
         "Run `julia --project -m FjordSim prepare_boundaries` for this setup first.",
     )
 
+    validate_boundary_file_edges(filepath, edges)
+
+    return NamedTuple(edge => boundary_edge_series(config, grid, edge, filepath, reference_date) for edge in edges)
+end
+
+"""
+    validate_boundary_file_edges(filepath, edges)
+
+Check the prepared file states every edge the setup opens.
+
+The file records its own sides in the `open_edge` global attribute, so a setup that has since opened
+another edge is caught here — before the missing variables surface as a bare `haskey` failure — and
+told to re-run the step that would write them.
+"""
+function validate_boundary_file_edges(filepath, edges)
+    stated = NCDataset(filepath) do ds
+        get(ds.attrib, BOUNDARY_EDGE_ATTRIBUTE, nothing)
+    end
+    isnothing(stated) && return nothing
+
+    written = Symbol.(split(stated, ","))
+    missing_edges = setdiff(edges, written)
+    isempty(missing_edges) || error(
+        "Boundary file $filepath was written for the $(join(written, ", ")) edge(s) but this setup " *
+        "opens $(join(edges, ", ")). Re-run `julia --project -m FjordSim prepare_boundaries` for it.",
+    )
+
+    return nothing
+end
+
+"""
+    boundary_edge_series(config, grid, edge, filepath, reference_date)
+
+One edge's group: the reduced `FieldTimeSeries` the file carries for that side, keyed by bare name.
+"""
+function boundary_edge_series(config, grid, edge, filepath, reference_date)
     names = sort(collect(values(boundary_variable_names(config))))
     present = NCDataset(filepath) do ds
-        stated = get(ds.attrib, BOUNDARY_EDGE_ATTRIBUTE, nothing)
-        isnothing(stated) || stated == String(edge) || error(
-            "Boundary file $filepath was written for the :$stated edge but this setup opens " *
-            ":$edge. Re-run `prepare_boundaries` for this setup.",
-        )
         [name for name in names if haskey(ds, boundary_variable_name(edge, name))]
     end
     isempty(present) &&
@@ -791,7 +840,7 @@ function boundary_series(config::AbstractBoundaryDataConfig, grid, edge, referen
     return NamedTuple(series)
 end
 
-boundary_series(::Nothing, grid, edge, reference_date = nothing) = nothing
+boundary_series(::Nothing, grid, reference_date = nothing) = nothing
 
 """
     reduced_series_size(grid, locations)

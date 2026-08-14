@@ -1,5 +1,6 @@
 using FjordSim
 using FjordSim.Bathymetry: write_bathymetry_file
+using FjordSim.Configs: open_edges
 using Dates: DateTime, Hour
 using Test
 using ArchGDAL
@@ -74,7 +75,7 @@ include("utilities.jl")
             :field_boundary_conditions,
             :AirSeaFluxes,
             :QuadraticBottomDrag,
-            :OpenLateralBoundaryFromForcing,
+            :OpenLateralBoundaryFromData,
             :MergedBoundaryConditions,
             :domain_grid,
             :simulation_grid,
@@ -222,23 +223,20 @@ include("utilities.jl")
         mktempdir() do tmp
             (; grid) = immersed_test_grid(joinpath(tmp, "bathymetry.nc"); size = (2, 3, 2))
             boundaries_config = test_boundaries_config(data_root = tmp)
-            forcing_config = test_forcing_config(
-                data_root = tmp, open_edge = :south, boundaries = boundaries_config,
-            )
             write_prepared_boundaries(
                 FjordSim.boundary_data_path(boundaries_config);
                 size = (2, 3, 2),
-                edge = :south,
+                edges = :south,
                 value = (name, index) -> name == "T" ? 6.0f0 : name == "S" ? 30.0f0 : 0.5f0,
             )
-            boundaries = FjordSim.boundary_series(boundaries_config, grid, :south, DateTime(2020, 1, 1))
+            boundaries = FjordSim.boundary_series(boundaries_config, grid, DateTime(2020, 1, 1))
 
             # Every part of the state gets its own condition. The predecessor of this config put a
             # closed wall on the normal velocity and opened only the tracers, so the barotropic `V`
             # is the row that says the boundary is genuinely open.
             sides = boundary_condition_sides(
-                OpenLateralBoundaryFromForcing(inflow_timescale = 1day, outflow_timescale = 360days),
-                grid, NamedTuple(), forcing_config, (:T, :S), boundaries,
+                OpenLateralBoundaryFromData(inflow_timescale = 1day, outflow_timescale = 360days),
+                grid, NamedTuple(), boundaries_config, (:T, :S), boundaries,
             )
             @test Set(keys(sides)) == Set((:v, :u, :V, :T, :S))
             for field in (:v, :u, :V, :T, :S)
@@ -261,8 +259,8 @@ include("utilities.jl")
             # condition Oceananigans indexes by the two tangential indices on its own.
             @test sides.V.south.classification isa
                   Oceananigans.BoundaryConditions.NormalFlow{<:Oceananigans.BoundaryConditions.GravityWaveRadiation}
-            @test sides.T.south.condition === boundaries.T
-            @test sides.v.south.condition === boundaries.v
+            @test sides.T.south.condition === boundaries.south.T
+            @test sides.v.south.condition === boundaries.south.v
 
             # The stored transport function actually reads the prepared exterior state and turns it
             # into a transport with the model's own column depth — the check that closes the gap
@@ -278,43 +276,68 @@ include("utilities.jl")
             for (edge, normal, tangential, barotropic) in (
                 (:north, :v, :u, :V), (:west, :u, :v, :U), (:east, :u, :v, :U),
             )
+                edge_config = test_boundaries_config(data_root = tmp, open_edges = edge)
                 write_prepared_boundaries(
-                    FjordSim.boundary_data_path(boundaries_config); size = (2, 3, 2), edge,
+                    FjordSim.boundary_data_path(edge_config); size = (2, 3, 2), edges = edge,
                 )
-                edge_boundaries =
-                    FjordSim.boundary_series(boundaries_config, grid, edge, DateTime(2020, 1, 1))
+                edge_boundaries = FjordSim.boundary_series(edge_config, grid, DateTime(2020, 1, 1))
                 edge_sides = boundary_condition_sides(
-                    OpenLateralBoundaryFromForcing(inflow_timescale = 1day, outflow_timescale = 360days),
-                    grid, NamedTuple(),
-                    test_forcing_config(data_root = tmp, open_edge = edge, boundaries = boundaries_config),
-                    (:T,), edge_boundaries,
+                    OpenLateralBoundaryFromData(inflow_timescale = 1day, outflow_timescale = 360days),
+                    grid, NamedTuple(), edge_config, (:T,), edge_boundaries,
                 )
                 @test Set(keys(edge_sides)) == Set((normal, tangential, barotropic, :T))
                 @test keys(getproperty(edge_sides, normal)) == (edge,)
                 @test keys(getproperty(edge_sides, barotropic)) == (edge,)
             end
 
-            # A bad edge is an `ArgumentError` from the `Val` fallback, not a silently empty tuple.
-            @test_throws ArgumentError boundary_condition_sides(
-                OpenLateralBoundaryFromForcing(inflow_timescale = 1day, outflow_timescale = 360days),
-                grid, NamedTuple(),
-                test_forcing_config(data_root = tmp, open_edge = :middle, boundaries = boundaries_config),
-                (:T,), boundaries,
+            # A bad edge is rejected where it is stated, at construction, rather than surviving as far
+            # as a silently empty tuple of conditions.
+            @test_throws ArgumentError test_boundaries_config(data_root = tmp, open_edges = :middle)
+            # ...and the `Val` fallback behind that check is itself an `ArgumentError` rather than a
+            # missing method, which is what makes an out-of-tree caller's mistake legible.
+            @test_throws ArgumentError FjordSim.Forcing.boundary_along_axis(Val(:middle))
+            @test_throws ArgumentError FjordSim.BoundaryConditions.open_normal_velocity_boundary_conditions(
+                Val(:middle), boundaries.south, nothing,
             )
+
+            # Several edges at once: a domain in the open ocean opens all four, and every group lands
+            # on every side. `u` picks up a normal condition on the west and east and a tangential one
+            # on the south and north; each tracer picks up all four.
+            all_edges = (:south, :north, :west, :east)
+            open_ocean = test_boundaries_config(data_root = tmp, open_edges = all_edges)
+            write_prepared_boundaries(
+                FjordSim.boundary_data_path(open_ocean); size = (2, 3, 2), edges = all_edges,
+            )
+            ocean_series = FjordSim.boundary_series(open_ocean, grid, DateTime(2020, 1, 1))
+            @test Set(keys(ocean_series)) == Set(all_edges)
+
+            ocean_sides = boundary_condition_sides(
+                OpenLateralBoundaryFromData(inflow_timescale = 1day, outflow_timescale = 360days),
+                grid, NamedTuple(), open_ocean, (:T, :S), ocean_series,
+            )
+            @test Set(keys(ocean_sides)) == Set((:u, :v, :U, :V, :T, :S))
+            for field in (:T, :S, :u, :v)
+                @test Set(keys(getproperty(ocean_sides, field))) == Set(all_edges)
+            end
+            # The barotropic transports carry only the sides they are normal to, which is what pairs
+            # Oceananigans' Chapman condition onto each of the four.
+            @test Set(keys(ocean_sides.V)) == Set((:south, :north))
+            @test Set(keys(ocean_sides.U)) == Set((:west, :east))
         end
     end
 
     @testset "open lateral boundary without prepared data" begin
         mktempdir() do tmp
             (; grid) = immersed_test_grid(joinpath(tmp, "bathymetry.nc"); size = (2, 3, 2))
-            forcing_config = test_forcing_config(data_root = tmp, open_edge = :south)
             open_boundary =
-                OpenLateralBoundaryFromForcing(inflow_timescale = 1day, outflow_timescale = 360days)
+                OpenLateralBoundaryFromData(inflow_timescale = 1day, outflow_timescale = 360days)
 
             # The exterior state is data, so a setup naming no boundary dataset is a stated error
-            # rather than a boundary that quietly relaxes towards nothing.
+            # rather than a boundary that quietly relaxes towards nothing. Two independent statements
+            # are missing there — the config that names the edge, and the series read from its file —
+            # so each has its own error.
             @test_throws ErrorException boundary_condition_sides(
-                open_boundary, grid, NamedTuple(), forcing_config, (:T, :S), nothing,
+                open_boundary, grid, NamedTuple(), nothing, (:T, :S), nothing,
             )
 
             # ...and so is a tracer the prepared file does not carry.
@@ -322,12 +345,12 @@ include("utilities.jl")
             write_prepared_boundaries(
                 FjordSim.boundary_data_path(boundaries_config); size = (2, 3, 2),
             )
-            boundaries =
-                FjordSim.boundary_series(boundaries_config, grid, :south, DateTime(2020, 1, 1))
+            boundaries = FjordSim.boundary_series(boundaries_config, grid, DateTime(2020, 1, 1))
             @test_throws ErrorException boundary_condition_sides(
-                open_boundary, grid, NamedTuple(),
-                test_forcing_config(data_root = tmp, open_edge = :south, boundaries = boundaries_config),
-                (:T, :not_prepared), boundaries,
+                open_boundary, grid, NamedTuple(), nothing, (:T, :not_prepared), boundaries,
+            )
+            @test_throws ErrorException boundary_condition_sides(
+                open_boundary, grid, NamedTuple(), boundaries_config, (:T, :not_prepared), boundaries,
             )
         end
     end
@@ -336,28 +359,25 @@ include("utilities.jl")
         mktempdir() do tmp
             (; grid) = immersed_test_grid(joinpath(tmp, "bathymetry.nc"); size = (2, 3, 2))
             boundaries_config = test_boundaries_config(data_root = tmp)
-            forcing_config = test_forcing_config(
-                data_root = tmp, open_edge = :south, boundaries = boundaries_config,
-            )
+            forcing_config = test_forcing_config(data_root = tmp)
             write_prepared_forcing(forcing_path(forcing_config); size = (2, 3, 2))
             write_prepared_boundaries(
                 FjordSim.boundary_data_path(boundaries_config); size = (2, 3, 2),
             )
             forcing = forcing_from_file(forcing_config; grid, tracers = (:T, :S))
-            boundaries =
-                FjordSim.boundary_series(boundaries_config, grid, :south, DateTime(2020, 1, 1))
+            boundaries = FjordSim.boundary_series(boundaries_config, grid, DateTime(2020, 1, 1))
 
             # The surface and the bottom are separate pieces now, so each must contribute its own
             # half and nothing else — that separability is the whole point of the split.
             surface = boundary_condition_sides(
-                AirSeaFluxes(), grid, forcing, forcing_config, (:T, :S),
+                AirSeaFluxes(), grid, forcing, boundaries_config, (:T, :S),
             )
             @test Set(keys(surface)) == Set((:u, :v, :T, :S))
             @test keys(surface.u) == (:top,)
             @test keys(surface.T) == (:top,)
 
             drag = boundary_condition_sides(
-                QuadraticBottomDrag(coefficient = 0.003), grid, forcing, forcing_config, (:T, :S),
+                QuadraticBottomDrag(coefficient = 0.003), grid, forcing, boundaries_config, (:T, :S),
             )
             @test Set(keys(drag)) == Set((:u, :v))
             @test keys(drag.u) == (:bottom,)
@@ -373,8 +393,8 @@ include("utilities.jl")
             # velocity, barotropic transport and every tracer. That merge is what left
             # `build_simulation`, and nothing but a full model build would otherwise exercise it.
             open = boundary_condition_sides(
-                OpenLateralBoundaryFromForcing(inflow_timescale = 1day, outflow_timescale = 360days),
-                grid, forcing, forcing_config, (:T, :S), boundaries,
+                OpenLateralBoundaryFromData(inflow_timescale = 1day, outflow_timescale = 360days),
+                grid, forcing, boundaries_config, (:T, :S), boundaries,
             )
             @test Set(keys(open)) == Set((:v, :u, :V, :T, :S))
             @test keys(open.v) == (:south,)
@@ -384,7 +404,7 @@ include("utilities.jl")
             # the five-argument hook and reach the six-argument one through its forwarding
             # fallback — which is what keeps an out-of-tree boundary config working unchanged.
             @test boundary_condition_sides(
-                AirSeaFluxes(), grid, forcing, forcing_config, (:T, :S), boundaries,
+                AirSeaFluxes(), grid, forcing, boundaries_config, (:T, :S), boundaries,
             ) |> keys |> Set == Set((:u, :v, :T, :S))
 
             # The set config materializes every piece into `FieldBoundaryConditions`, which is what
@@ -394,11 +414,11 @@ include("utilities.jl")
                 MergedBoundaryConditions(
                     AirSeaFluxes(),
                     QuadraticBottomDrag(coefficient = 0.003),
-                    OpenLateralBoundaryFromForcing(
+                    OpenLateralBoundaryFromData(
                         inflow_timescale = 1day, outflow_timescale = 360days,
                     ),
                 ),
-                grid, forcing, forcing_config, (:T, :S), boundaries,
+                grid, forcing, boundaries_config, (:T, :S), boundaries,
             )
             @test materialized.v isa FieldBoundaryConditions
             @test !isnothing(materialized.v.top)
@@ -416,7 +436,7 @@ include("utilities.jl")
             # Naming no pieces is a valid statement — the model's own defaults everywhere — rather
             # than an error, so a setup can opt out of every piece.
             @test field_boundary_conditions(
-                MergedBoundaryConditions(), grid, forcing, forcing_config, (:T, :S),
+                MergedBoundaryConditions(), grid, forcing, boundaries_config, (:T, :S),
             ) == (;)
 
             # The set is a struct rather than a bare `Tuple`, which is what makes an alternative
@@ -571,23 +591,33 @@ end
         @test forcing_directory(forcing_config) == joinpath(data_root, "norkyst")
         @test forcing_config.parameters == ["temperature", "salinity"]
 
-        # The prepared forcing file, its plot and the open edge are defaulted, since there is one
-        # prepared forcing file per setup and both current setups open the same side.
+        # The prepared forcing file and its plot are defaulted, since there is one prepared forcing
+        # file per setup. The open edge is not a field here at all: a forcing dataset says nothing
+        # about which edge of the domain is open.
         @test forcing_path(forcing_config) == joinpath(data_root, "forcing.nc")
         @test plot_path(forcing_config) == joinpath(data_root, "forcing.png")
-        @test forcing_config.open_edge === :south
+        @test !hasfield(typeof(forcing_config), :open_edges)
+        @test !hasfield(typeof(forcing_config), :boundaries)
 
-        # Open-boundary data is opt-in, like rivers: unnamed, it defaults to `nothing` and both
-        # boundary steps are no-ops. Naming one roots it with the rest of the setup, and its own
-        # `boundary_data_*` helpers resolve its file and download directory.
-        @test isnothing(forcing_config.boundaries)
+        # Open-boundary data is opt-in and independent of forcing: a `FjordConfig` field of its own,
+        # `nothing` unless named, and it is what states the open edge. Its own `boundary_data_*`
+        # helpers resolve its file and download directory.
         boundaries_config = test_boundaries_config(; data_root)
         @test boundaries_config isa AbstractBoundaryDataConfig
         @test boundary_data_path(boundaries_config) == joinpath(data_root, "boundaries.nc")
         @test boundary_data_directory(boundaries_config) == joinpath(data_root, "norkyst_hourly")
         @test plot_path(boundaries_config) == joinpath(data_root, "boundaries.png")
-        @test test_forcing_config(; data_root, boundaries = boundaries_config).boundaries ===
-              boundaries_config
+        @test open_edges(boundaries_config) == [:south]
+        @test open_edges(test_boundaries_config(; data_root, open_edges = :west)) == [:west]
+        # No default, so every setup states which edge it opens rather than inheriting a side.
+        @test_throws UndefKeywordError NorKystBoundariesConfig(
+            data_root = data_root,
+            output_directory = "norkyst_hourly",
+            parameters = ["temperature"],
+            years = [2020],
+        )
+        # A setup naming none has no open edge at all, which is how a closed domain is stated.
+        @test isempty(open_edges(nothing))
 
         # Where the interpolation runs is a config field, not a command-line flag. `:auto` is the
         # default so one setup runs on a GPU machine and a laptop alike; `:cpu` is honoured
@@ -647,8 +677,17 @@ end
             z_faces = [-20.0, -10.0, 0.0],
         )
 
-        config = FjordConfig(; grid_config, bathymetry_config, forcing_config, atmosphere_config)
+        boundary_config = test_boundaries_config(; data_root)
+        config = FjordConfig(;
+            grid_config, bathymetry_config, forcing_config, boundary_config, atmosphere_config,
+        )
         grid = domain_grid(config.grid_config, CPU())
+
+        # The open-boundary config is a `FjordConfig` field of its own, independent of the forcing
+        # one: either is nameable without the other, which is what lets a setup run with no interior
+        # forcing but a data-driven open boundary, or the reverse.
+        @test config.boundary_config === boundary_config
+        @test isnothing(FjordConfig(; grid_config, bathymetry_config).boundary_config)
 
         # `native_region!` derives the padded native region from the target grid: 4 cells of
         # 1 degree either side, refined by the default raw_resolution_factor of 4.
@@ -702,6 +741,8 @@ end
         @test fieldtype(typeof(config), :grid_config) === SingleColumnGrid
         @test fieldtype(typeof(config), :atmosphere_config) === MinimalAtmosphere
         @test fieldtype(typeof(config), :simulation_config) === MinimalSimulation
+        # Unnamed, so its own type parameter resolves to `Nothing` — concrete, like the rest.
+        @test fieldtype(typeof(config), :boundary_config) === Nothing
 
         # ...and the built-in types remain valid, i.e. FjordConfig is genuinely generic.
         @test FjordConfig(
@@ -795,12 +836,12 @@ end
         @test_throws MethodError coupled_simulation(MinimalModel(), grid)
         @test_throws MethodError free_surface(MinimalFreeSurface(), grid)
         @test_throws MethodError boundary_condition_sides(
-            MinimalBoundary(), grid, (;), config.forcing_config, (:T,),
+            MinimalBoundary(), grid, (;), config.boundary_config, (:T,),
         )
         # The set level is its own contract, so a set config that does not materialize its pieces
         # is missing a method rather than falling back to `MergedBoundaryConditions`' merge.
         @test_throws MethodError field_boundary_conditions(
-            MinimalBoundarySet(), grid, (;), config.forcing_config, (:T,),
+            MinimalBoundarySet(), grid, (;), config.boundary_config, (:T,),
         )
         @test_throws MethodError attach_writer!(
             nothing, MinimalWriter(), config.simulation_config, 1,
@@ -1682,7 +1723,7 @@ end
             @test !u[1, 1, 1]     # closed west wall
             @test !u[5, 1, 1]     # closed east wall
 
-            # ...but the open boundary named by open_edge must survive, because that is where the
+            # ...but an open boundary the config names must survive, because that is where the
             # setup puts its radiating NormalFlowBoundaryCondition and where `prepare_boundaries`
             # samples the exterior velocity. peripheral_node alone marks it land, since the tracer
             # cell outside the domain is an inactive halo cell.
@@ -1696,6 +1737,17 @@ end
             # A south edge must not touch the u mask, and a west edge must open its western column.
             @test water_mask(grid, Face, Center, :south)[1, 1, :] == [false, false]
             @test water_mask(grid, Face, Center, :west)[1, 1, :] == tracer[1, 1, :]
+
+            # A setup naming no open-boundary data has no open edge: every lateral boundary stays the
+            # closed wall `peripheral_node` calls it, which is the right reading with no exterior
+            # state to read there.
+            @test !any(water_mask(grid, Center, Face, nothing)[:, 1, :])
+            @test !any(water_mask(grid, Center, Face, nothing)[:, 3, :])
+            # ...and the tracer mask is edge-independent, which is why `add_rivers` needs no edge:
+            # every `open_boundary_water!` method returns early unless the location is staggered
+            # across its own edge.
+            @test water_mask(grid, Center, Center, nothing) == water_mask(grid, Center, Center, :south)
+            @test water_mask(grid, Center, Center, nothing) == water_mask(grid, Center, Center, :west)
         end
     end
 
@@ -1904,7 +1956,7 @@ end
                 latitude = (latitude[1] - 0.2, latitude[2] + 0.2),
             )
 
-            result = prepare_boundaries(grid, :south, boundaries_config)
+            result = prepare_boundaries(grid, boundaries_config)
             @test result.output_file == boundary_data_path(boundaries_config)
             @test result.times == dates
             @test Set(result.variables) == Set(
@@ -1944,7 +1996,9 @@ end
 
             # Reading it back gives reduced series on the model grid, keyed by the bare names, with
             # the dry column filled and the time axis zeroed at the instant the run starts.
-            series = FjordSim.boundary_series(boundaries_config, grid, :south, DateTime(2020, 1, 1))
+            all_series = FjordSim.boundary_series(boundaries_config, grid, DateTime(2020, 1, 1))
+            @test keys(all_series) == (:south,)
+            series = all_series.south
             @test Set(keys(series)) == Set((:T, :S, :u, :v, :eta, :ubar, :vbar))
             @test size(series.T) == (4, 1, 2, length(dates))
             @test size(series.u) == (5, 1, 2, length(dates))
@@ -1956,19 +2010,101 @@ end
             # An `Hour(1)` axis zeroed at a later instant is negative before it, which is what keeps
             # the boundary in phase with the forcing and the atmosphere rather than with its own
             # first record.
-            shifted = FjordSim.boundary_series(
-                boundaries_config, grid, :south, DateTime(2020, 1, 1, 2),
-            )
-            @test shifted.T.times == [-7200, -3600, 0]
+            shifted = FjordSim.boundary_series(boundaries_config, grid, DateTime(2020, 1, 1, 2))
+            @test shifted.south.T.times == [-7200, -3600, 0]
 
-            # A file written for one edge cannot be read as another: the variables would be missing,
-            # and the stated edge says so first.
+            # A file written for one edge cannot be read as a config that opens another: the
+            # variables would be missing, and the stated edge says so first.
             @test_throws ErrorException FjordSim.boundary_series(
-                boundaries_config, grid, :north, DateTime(2020, 1, 1),
+                test_boundaries_config(data_root = tmp, open_edges = :north), grid, DateTime(2020, 1, 1),
             )
 
-            # The plot reads both panel shapes out of the same file.
-            @test isfile(plot_boundaries(:south, boundaries_config))
+            # The plot reads both panel shapes out of the same file, taking the side from the config.
+            @test isfile(plot_boundaries(boundaries_config))
+        end
+    end
+
+    @testset "open ocean round-trip" begin
+        # A domain open on all four sides, through the real regrid-and-write path: one file with four
+        # sides in it, which is what the layout was built for — variables named per side, all six
+        # spatial dimensions defined, one time axis. The single-edge round-trip above cannot catch a
+        # writer or reader that assumed one side.
+        mktempdir() do tmp
+            longitude, latitude = (10.0, 11.0), (59.0, 60.0)
+            dates = [DateTime(2020, 1, 1) + Hour(hour) for hour = 0:2]
+            edges = (:south, :north, :west, :east)
+
+            (; grid) = immersed_test_grid(
+                joinpath(tmp, "bathymetry.nc");
+                size = (4, 3, 2),
+                halo = (1, 1, 1),
+                longitude,
+                latitude,
+                z_faces = [-20.0, -10.0, 0.0],
+                bottom_height = fill(-20.0, 4, 3),
+            )
+
+            config = test_boundaries_config(data_root = tmp, architecture = :cpu, open_edges = edges)
+            mkpath(boundary_data_directory(config))
+            write_hourly_source_stub(
+                joinpath(
+                    boundary_data_directory(config),
+                    FjordSim.Forcing.boundary_monthly_filename(config, 2020, 1),
+                );
+                dates,
+                longitude = (longitude[1] - 0.2, longitude[2] + 0.2),
+                latitude = (latitude[1] - 0.2, latitude[2] + 0.2),
+            )
+
+            # The download box is the bounding box of the four bands, which for opposite edges is the
+            # whole domain — the thin-band saving is a single-edge one, and this is where that shows.
+            box_longitude, box_latitude = FjordSim.Forcing.boundary_domain(edges, grid, 0.05)
+            @test box_longitude == (longitude[1] - 0.05, longitude[2] + 0.05)
+            @test box_latitude == (latitude[1] - 0.05, latitude[2] + 0.05)
+
+            result = prepare_boundaries(grid, config)
+            @test length(result.variables) == 4 * 7
+            @test Set(result.variables) ==
+                  Set("$(edge)_$name" for edge in edges
+                      for name in ("T", "S", "u", "v", "eta", "ubar", "vbar"))
+
+            NCDataset(result.output_file) do ds
+                # One file, four sides, one time axis, and the attribute lists every side.
+                @test Set(Symbol.(split(ds.attrib["open_edge"], ","))) == Set(edges)
+                @test ds.dim["time"] == length(dates)
+                # The along-boundary axis and the staggering follow the edge: a south section runs
+                # along x, a west one along y, and each normal velocity is on its own face axis.
+                @test size(ds["south_T"]) == (4, 2, length(dates))
+                @test size(ds["west_T"]) == (3, 2, length(dates))
+                @test size(ds["south_v"]) == (4, 2, length(dates))
+                @test size(ds["west_u"]) == (3, 2, length(dates))
+                @test size(ds["north_eta"]) == (4, length(dates))
+                # ...and a *tangential* component is staggered along the edge it runs down, so `vbar`
+                # on an east edge sits on y-faces: one node more than the tracer row beside it.
+                @test size(ds["east_vbar"]) == (4, length(dates))
+                @test size(ds["south_ubar"]) == (5, length(dates))
+            end
+
+            series = FjordSim.boundary_series(config, grid, DateTime(2020, 1, 1))
+            @test Set(keys(series)) == Set(edges)
+            for edge in edges
+                @test Set(keys(getproperty(series, edge))) ==
+                      Set((:T, :S, :u, :v, :eta, :ubar, :vbar))
+                @test all(isfinite, interior(getproperty(series, edge).T, :, :, :, :))
+            end
+            # Each group is reduced across its own edge, so a south series is one cell thick in y and
+            # a west series one cell thick in x.
+            @test size(series.south.T) == (4, 1, 2, length(dates))
+            @test size(series.west.T) == (1, 3, 2, length(dates))
+
+            # The forcing land mask opens all four velocity face rows at once.
+            u_mask = FjordSim.Forcing.water_mask(grid, Face, Center, edges)
+            v_mask = FjordSim.Forcing.water_mask(grid, Center, Face, edges)
+            @test any(u_mask[1, :, :]) && any(u_mask[5, :, :])
+            @test any(v_mask[:, 1, :]) && any(v_mask[:, 4, :])
+
+            # One plot, one block of rows per edge.
+            @test isfile(plot_boundaries(config))
         end
     end
 
@@ -2007,7 +2143,7 @@ end
             (; grid) = land_column_test_grid(joinpath(tmp, "bathymetry.nc"))
 
             # The mask comes from the same water_mask prepare_forcing uses, taken at the surface.
-            mask = coastal_water_mask(grid, :south)
+            mask = coastal_water_mask(grid)
             @test size(mask) == (5, 4)
             @test !mask[2, 1]
             @test mask[1, 1]
@@ -2023,7 +2159,7 @@ end
                 FjordSim.Forcing.RiverLocation(2, "open water", longitudes[4], latitudes[2]),
                 FjordSim.Forcing.RiverLocation(3, "outside", 20.0, latitudes[2]),
             ]
-            cells = river_cells(grid, locations, :south, 10)
+            cells = river_cells(grid, locations, 10)
             @test length(cells) == 2
             @test [cell.location.id for cell in cells] == [1, 2]
             @test (cells[1].i, cells[1].j, cells[1].distance) == (1, 2, 1.0)
@@ -2033,10 +2169,10 @@ end
             # An outlet sitting exactly on the outermost node counts as outside, matching the
             # reference's strict bounds test.
             edge = FjordSim.Forcing.RiverLocation(4, "on the edge", longitudes[1], latitudes[2])
-            @test isempty(river_cells(grid, [edge], :south, 10))
+            @test isempty(river_cells(grid, [edge], 10))
 
             # With no reach, the on-land outlet is dropped too rather than written into land.
-            @test isempty(river_cells(grid, [locations[1]], :south, 0))
+            @test isempty(river_cells(grid, [locations[1]], 0))
         end
     end
 
@@ -2098,6 +2234,84 @@ end
                 @test all(original["T"][:, :, :, :] .== 1.0f0)
                 @test all(original["T_lambda"][:, :, :, :] .== 2.0f-5)
             end
+        end
+    end
+
+    @testset "standalone rivers" begin
+        mktempdir() do tmp
+            (; grid) = land_column_test_grid(joinpath(tmp, "bathymetry.nc"))
+
+            longitudes = Array(Oceananigans.Grids.λnodes(grid, Center()))
+            latitudes = Array(Oceananigans.Grids.φnodes(grid, Center()))
+            location = FjordSim.Forcing.RiverLocation(7, "test river", longitudes[2], latitudes[2])
+
+            # Two days plus the step past the window's end: a daily axis anchored at `start_date`
+            # covering `start_date + 1day`, which is what `river_forcing_times` builds.
+            coverage = (DateTime(2020, 1, 1), DateTime(2020, 1, 2))
+            dates = [DateTime(2020, 1, 1), DateTime(2020, 1, 2)]
+            rivers(; standalone) = StubRivers(
+                tmp,
+                "forcing_rivers.nc",
+                3600.0,
+                10,
+                [location],
+                Dict("T" => Float32[3.0 4.0], "S" => Float32[0.0 0.0]),
+                standalone,
+            )
+            forcing_config = test_forcing_config(data_root = tmp, rivers = rivers(standalone = true))
+            @test all(isconcretetype, fieldtypes(typeof(forcing_config)))
+
+            # No prepared forcing exists, and none is needed: the whole point of `standalone`.
+            @test !isfile(forcing_path(forcing_config))
+            result = add_rivers(grid, forcing_config; coverage)
+            @test result.output_file == joinpath(tmp, "forcing_rivers.nc")
+            @test result.times == dates
+            @test result.variables == ["S", "T"]
+            @test !isfile(forcing_path(forcing_config))
+
+            NCDataset(result.output_file) do written
+                # The layout is the prepared-forcing contract, so `forcing_from_file`'s dimension
+                # check against the grid holds — that is what makes the file readable at all.
+                for (name, expected) in
+                    ("Nx" => 5, "Ny" => 4, "Nz" => 2, "Nx_faces" => 6, "Ny_faces" => 5, "time" => 2)
+                    @test written.dim[name] == expected
+                end
+                @test DateTime.(written["time"][:]) == dates
+                @test written.attrib["rivers_only"] == "true"
+
+                # The river cell carries its values and lambda at the surface, for every step...
+                @test written["T"][1, 2, 2, :] == Float32[3.0, 4.0]
+                @test all(written["T_lambda"][1, 2, 2, :] .≈ Float32(1 / 3600))
+
+                # ...and every other cell is empty rather than zero-valued, which the reader turns
+                # into the same land sentinel a dry cell gets: no forcing anywhere but the river.
+                @test all(ismissing, written["T"][1, 3, 2, :])
+                @test all(iszero, written["T_lambda"][1, 3, 2, :])
+
+                # Nothing but the surface level is written at all, and only the variables the river
+                # dataset named exist.
+                @test all(ismissing, written["T"][1, 2, 1, :])
+                @test !haskey(written, "u")
+            end
+
+            # The axis reaches past the window, so `validate_time_coverage` accepts a run that ends
+            # inside the last day rather than exactly on a record.
+            @test first(result.times) <= first(coverage)
+            @test last(result.times) >= last(coverage)
+
+            # A standalone file has no ocean state in it, so starting a run from one is refused
+            # rather than silently beginning at T = S = 0 everywhere.
+            @test_throws ErrorException FjordSim.Simulations.forcing_state(
+                result.output_file, grid, first(dates), (:T, :S),
+            )
+
+            # Without a run window there is no axis to build, and no prepared file to fall back on.
+            @test_throws ErrorException add_rivers(grid, forcing_config)
+
+            # ...while a non-standalone config still demands the prepared forcing, naming the step
+            # that writes it — a forgotten `prepare_forcing` must not silently become a river-only run.
+            plain = test_forcing_config(data_root = tmp, rivers = rivers(standalone = false))
+            @test_throws ErrorException add_rivers(grid, plain; coverage)
         end
     end
 end
@@ -2646,12 +2860,12 @@ end
             test_simulation_config(architecture = :tpu),
         )
 
-        # Which edge the domain is open on is stated once, on the forcing config, and read from
-        # there by everything that acts on it — see the "open lateral boundary" testset for the
-        # per-edge dispatch.
-        @test FjordSim.Simulations.open_edge(test_forcing_config(open_edge = :west)) === :west
-        @test isnothing(FjordSim.Simulations.open_edge(nothing))
-        @test isnothing(FjordSim.Simulations.boundary_data_config(nothing))
+        # Which edge the domain is open on is stated once, on the open-boundary data config, and read
+        # from there by everything that acts on it — see the "open lateral boundary" testset for the
+        # per-edge dispatch. It is a `Configs` accessor rather than a pair of one-liners reaching
+        # through the forcing config, which is what a `boundary_config` independent of forcing needs.
+        @test open_edges(test_boundaries_config(open_edges = :west)) == [:west]
+        @test isempty(open_edges(nothing))
 
         # A setup that configures rivers simulates the rivers-augmented copy, never the pre-rivers
         # file. Both registered setups do; the no-rivers branch is covered by `no_rivers` below.
@@ -3002,7 +3216,7 @@ end
             # The open lateral boundary reads its exterior state from the prepared boundary file, so
             # this build needs one — the file is what makes the boundary open rather than a wall.
             boundaries_config = test_boundaries_config(data_root = tmp)
-            forcing_config = test_forcing_config(data_root = tmp, boundaries = boundaries_config)
+            forcing_config = test_forcing_config(data_root = tmp)
             write_prepared_forcing(forcing_path(forcing_config); size = (Nx, Ny, Nz))
             write_prepared_boundaries(
                 boundary_data_path(boundaries_config);
@@ -3021,6 +3235,7 @@ end
                 grid_config,
                 bathymetry_config,
                 forcing_config,
+                boundary_config = boundaries_config,
                 simulation_config = test_simulation_config(; results_root = tmp, kwargs...),
             )
 
@@ -3069,10 +3284,10 @@ end
             @test passthrough.verbose == false
             @test passthrough.model.ocean.verbose == false
 
-            # The open boundary landed on the velocity normal to the forcing config's open edge, and
+            # The open boundary landed on the velocity normal to the boundary config's open edge, and
             # it radiates rather than being a wall — the whole point of the change, and something
             # only a real model build can show.
-            edge = config.forcing_config.open_edge
+            edge = only(open_edges(config.boundary_config))
             normal_velocity = edge in (:south, :north) ? :v : :u
             edge_bc = getproperty(
                 getproperty(ocean_model.velocities, normal_velocity).boundary_conditions, edge,
@@ -3197,6 +3412,143 @@ end
         end
     end
 
+    @testset "build simulation open all round" begin
+        # A coupled model on a domain open on all four sides, which is what an open-ocean region needs
+        # and what a single `open_edge` Symbol made impossible. Only a real build shows it: the four
+        # edges' conditions have to merge without colliding, `HydrostaticFreeSurfaceModel` has to
+        # regularize a `u` carrying a normal condition on two sides and a tangential one on the other
+        # two, and Oceananigans has to pair its Chapman condition onto all four.
+        mktempdir() do tmp
+            Nx, Ny, Nz = 16, 16, 8
+            edges = (:south, :north, :west, :east)
+            bathymetry_config = test_bathymetry_config(data_root = tmp)
+            (; grid_config) = immersed_test_grid(
+                bathymetry_path(bathymetry_config);
+                size = (Nx, Ny, Nz),
+                halo = (7, 7, 7),
+            )
+
+            boundaries_config = test_boundaries_config(data_root = tmp, open_edges = edges)
+            write_prepared_boundaries(
+                boundary_data_path(boundaries_config);
+                size = (Nx, Ny, Nz),
+                edges,
+                dates = [DateTime(2020, 1, 1, 12), DateTime(2020, 1, 2, 12)],
+            )
+
+            config = FjordConfig(;
+                grid_config,
+                bathymetry_config,
+                boundary_config = boundaries_config,
+                simulation_config = test_simulation_config(results_root = tmp),
+            )
+
+            simulation = build_simulation(config)
+            @test simulation isa Simulation
+
+            ocean_model = simulation.model.ocean.model
+            free_surface = ocean_model.free_surface
+
+            # Every side of both velocities is open, and each is the right kind: normal where the
+            # component crosses the edge, tangential where it runs along it.
+            for (component, normal_sides, tangential_sides) in (
+                (:u, (:west, :east), (:south, :north)),
+                (:v, (:south, :north), (:west, :east)),
+            )
+                conditions = getproperty(ocean_model.velocities, component).boundary_conditions
+                for side in normal_sides
+                    @test getproperty(conditions, side).classification isa
+                          Oceananigans.BoundaryConditions.NormalFlow{
+                        <:Oceananigans.BoundaryConditions.NormalRadiation,
+                    }
+                end
+                for side in tangential_sides
+                    @test getproperty(conditions, side).classification.scheme isa
+                          Oceananigans.BoundaryConditions.NormalRadiation
+                end
+            end
+
+            # Both barotropic transports carry the Flather condition on the two sides they are normal
+            # to, and Oceananigans paired the Chapman condition onto all four sides of η by itself.
+            for (barotropic, sides) in ((:U, (:west, :east)), (:V, (:south, :north)))
+                conditions =
+                    getproperty(free_surface.barotropic_velocities, barotropic).boundary_conditions
+                for side in sides
+                    @test getproperty(conditions, side).classification isa
+                          Oceananigans.BoundaryConditions.NormalFlow{
+                        <:Oceananigans.BoundaryConditions.GravityWaveRadiation,
+                    }
+                end
+            end
+            for side in edges
+                @test getproperty(free_surface.displacement.boundary_conditions, side).classification.scheme isa
+                      Oceananigans.BoundaryConditions.SurfaceWaveRadiation
+            end
+
+            # ...and every tracer is open on all four sides.
+            for tracer in (:T, :S)
+                conditions = getproperty(ocean_model.tracers, tracer).boundary_conditions
+                for side in edges
+                    @test getproperty(conditions, side).classification.scheme isa
+                          Oceananigans.BoundaryConditions.NormalRadiation
+                end
+            end
+        end
+    end
+
+    @testset "build simulation without forcing" begin
+        # A run with no interior forcing at all, but a data-driven open boundary — the combination
+        # that was impossible while the boundary dataset and the open edge both hung off the forcing
+        # config, since a `nothing` forcing config took them down with it. `examples/oslofjorden.jl`
+        # is the real-world shape of this.
+        mktempdir() do tmp
+            Nx, Ny, Nz = 16, 16, 8
+            bathymetry_config = test_bathymetry_config(data_root = tmp)
+            (; grid_config) = immersed_test_grid(
+                bathymetry_path(bathymetry_config);
+                size = (Nx, Ny, Nz),
+                halo = (7, 7, 7),
+            )
+
+            boundaries_config = test_boundaries_config(data_root = tmp)
+            write_prepared_boundaries(
+                boundary_data_path(boundaries_config);
+                size = (Nx, Ny, Nz),
+                dates = [DateTime(2020, 1, 1, 12), DateTime(2020, 1, 2, 12)],
+            )
+
+            config = FjordConfig(;
+                grid_config,
+                bathymetry_config,
+                boundary_config = boundaries_config,
+                simulation_config = test_simulation_config(results_root = tmp),
+            )
+            @test isnothing(config.forcing_config)
+
+            # No prepared forcing is looked for, so no prerequisite error fires and no forcing terms
+            # are built — the model gets Oceananigans' own empty forcing.
+            @test isnothing(FjordSim.Simulations.resolve_forcing_file(config))
+            @test simulation_forcing(config.forcing_config, nothing, nothing, (:T, :S), nothing) ==
+                  NamedTuple()
+
+            simulation = build_simulation(config)
+            @test simulation isa Simulation
+
+            # ...and the open boundary is still there, on the edge the boundary config names.
+            ocean_model = simulation.model.ocean.model
+            @test ocean_model.velocities.v.boundary_conditions.south.classification isa
+                  Oceananigans.BoundaryConditions.NormalFlow{
+                <:Oceananigans.BoundaryConditions.NormalRadiation,
+            }
+
+            # Reading a state from a forcing file that does not exist is a stated error rather than a
+            # failure inside `NCDataset(nothing)` after the grid has been built.
+            @test_throws ErrorException FjordSim.Simulations.resolve_initial_conditions(
+                FromForcing(), nothing, nothing, config.simulation_config,
+            )
+        end
+    end
+
     @testset "run! smoke test" begin
         # No other test in this suite calls `run!`/`time_step!` for real — every other
         # `build_simulation` call either stops at a prerequisite check or inspects the assembled
@@ -3213,7 +3565,7 @@ end
             )
 
             boundaries_config = test_boundaries_config(data_root = tmp)
-            forcing_config = test_forcing_config(data_root = tmp, boundaries = boundaries_config)
+            forcing_config = test_forcing_config(data_root = tmp)
             write_prepared_forcing(forcing_path(forcing_config); size = (Nx, Ny, Nz))
             write_prepared_boundaries(
                 boundary_data_path(boundaries_config);
@@ -3225,6 +3577,7 @@ end
                 grid_config,
                 bathymetry_config,
                 forcing_config,
+                boundary_config = boundaries_config,
                 simulation_config = test_simulation_config(results_root = tmp),
             )
 

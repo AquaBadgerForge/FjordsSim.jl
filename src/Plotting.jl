@@ -17,6 +17,7 @@ using ..Configs:
     forcing_path,
     boundary_data_path,
     atmosphere_path,
+    open_edges,
     plot_path
 
 # Logical figure pixels per grid cell, and fixed margin for title/labels/colorbar. Sized from
@@ -231,72 +232,81 @@ function plot_forcing(grid, config::AbstractForcingConfig)
 end
 
 """
-    plot_boundaries(edge, config::AbstractBoundaryDataConfig)
+    plot_boundaries(config::AbstractBoundaryDataConfig)
 
 Write a diagnostic plot of the prepared boundary file at `boundary_data_path(config)` to
-`plot_path(config)`: one panel per `BOUNDARY_PLOT_PANELS` entry present in the file for `edge`.
-Returns the plot path.
+`plot_path(config)`: one panel per `BOUNDARY_PLOT_PANELS` entry present in the file, for each edge in
+the config's own `open_edges`, stacked one block of rows per edge. Returns the plot path.
 
 Two panel shapes, because the file holds two: a full-depth variable is a section along the edge
 against depth, a surface variable a line along the edge. Both are drawn against the along-edge cell
 index rather than a coordinate — the file states its own dimensions but not which way round the edge
 runs, and the index is what a `NaN` in a section can be traced back to.
 
-Takes `edge` because the variables are named for their side, so the plot cannot know which of them to
-read without being told which boundary it is looking at.
+The variables are named for their side, so the plot has to know which boundaries it is looking at; it
+reads them from the config, which is where the edges are stated.
 """
-function plot_boundaries(edge, config::AbstractBoundaryDataConfig)
+function plot_boundaries(config::AbstractBoundaryDataConfig)
+    edges = open_edges(config)
     boundary_file = boundary_data_path(config)
     plot_file = prepare_plot_file(config)
 
     NCDataset(boundary_file) do ds
-        panels = [
-            (; panel..., variable = string(edge, "_", panel.name))
-            for panel in BOUNDARY_PLOT_PANELS
-        ]
-        panels = [panel for panel in panels if haskey(ds, panel.variable)]
-        isempty(panels) && error("Boundary file $boundary_file carries no :$edge variables to plot.")
+        # One block of rows per open edge, so a domain open all round gets four stacked sections of the
+        # same panels rather than four files.
+        blocks = [(; edge, panels = boundary_panels(ds, edge)) for edge in edges]
+        empty_edges = [block.edge for block in blocks if isempty(block.panels)]
+        isempty(empty_edges) || error(
+            "Boundary file $boundary_file carries no $(join(empty_edges, ", ")) variables to plot.",
+        )
 
+        columns = maximum(block -> length(block.panels), blocks)
         figure = Figure(
             size = (
-                length(panels) * BOUNDARY_PLOT_PANEL_SIZE[1],
-                BOUNDARY_PLOT_PANEL_SIZE[2] + FORCING_PLOT_MARGIN[2],
+                columns * BOUNDARY_PLOT_PANEL_SIZE[1],
+                length(blocks) * BOUNDARY_PLOT_PANEL_SIZE[2] + FORCING_PLOT_MARGIN[2],
             ),
         )
         date = ds["time"][1]
         depth = haskey(ds, "Nz") ? Array{Float64}(ds["Nz"][:]) : Float64[]
 
-        for (column, panel) in enumerate(panels)
-            data = boundary_slice(ds, panel.variable)
-            axis = Axis(
-                figure[1, column];
-                xlabel = "Cell along the :$edge boundary",
-                ylabel = column == 1 ? (ndims(data) == 2 ? "Depth (m)" : "") : "",
-                title = panel.name,
-            )
+        for (block_index, block) in enumerate(blocks)
+            # Two rows per edge: the sections, then their colorbars.
+            axis_row = 2 * block_index - 1
 
-            if ndims(data) == 2
-                finite = filter(isfinite, data)
-                colorrange = isempty(finite) || allequal(finite) ? (0, 1) : extrema(finite)
-                plot = heatmap!(
-                    axis,
-                    1:size(data, 1),
-                    depth,
-                    data;
-                    colormap = panel.colormap,
-                    colorrange,
-                    nan_color = :ivory,
+            for (column, panel) in enumerate(block.panels)
+                data = boundary_slice(ds, panel.variable)
+                axis = Axis(
+                    figure[axis_row, column];
+                    xlabel = "Cell along the :$(block.edge) boundary",
+                    ylabel = column == 1 ? (ndims(data) == 2 ? "Depth (m)" : "") : "",
+                    title = panel.name,
                 )
-                Colorbar(figure[2, column], plot; label = panel.label, vertical = false)
-            else
-                lines!(axis, 1:length(data), data)
-                axis.ylabel = panel.label
+
+                if ndims(data) == 2
+                    finite = filter(isfinite, data)
+                    colorrange = isempty(finite) || allequal(finite) ? (0, 1) : extrema(finite)
+                    plot = heatmap!(
+                        axis,
+                        1:size(data, 1),
+                        depth,
+                        data;
+                        colormap = panel.colormap,
+                        colorrange,
+                        nan_color = :ivory,
+                    )
+                    Colorbar(figure[axis_row+1, column], plot; label = panel.label, vertical = false)
+                else
+                    lines!(axis, 1:length(data), data)
+                    axis.ylabel = panel.label
+                end
             end
         end
 
         Label(
             figure[0, :],
-            "Prepared $(dataset_label(config)) :$edge boundary at $date",
+            "Prepared $(dataset_label(config)) $(join((string(":", edge) for edge in edges), ", ")) " *
+            "boundary at $date",
             fontsize = 20,
         )
         save(plot_file, figure)
@@ -304,6 +314,17 @@ function plot_boundaries(edge, config::AbstractBoundaryDataConfig)
 
     return plot_file
 end
+
+"""
+    boundary_panels(ds, edge)
+
+The `BOUNDARY_PLOT_PANELS` entries the file carries for one edge, each with the prefixed variable name
+it is read from.
+"""
+boundary_panels(ds, edge) = [
+    (; panel..., variable = string(edge, "_", panel.name))
+    for panel in BOUNDARY_PLOT_PANELS if haskey(ds, string(edge, "_", panel.name))
+]
 
 """
     boundary_slice(ds, name)

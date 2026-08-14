@@ -27,6 +27,7 @@ export AbstractGridConfig,
     atmosphere_directory,
     results_path,
     plot_path,
+    open_edges,
     run_tag,
     coverage_window
 
@@ -126,19 +127,17 @@ how to download and subset it.
 # Fields a subtype provides
 - `data_root`, `output_file`, `plot_file`: resolved by `forcing_path` and `plot_path`.
 - `output_directory`: resolved by `forcing_directory`; only needed by a dataset that downloads.
-- `open_edge`: which lateral boundary the domain is open on, one of `:south`, `:north`, `:west` or
-  `:east`. Read by `water_mask`, which unmasks that edge's velocity face row, and by the
-  boundary-condition configs, which put the open conditions there. Named `relaxation_edge` while the
-  edge carried an interior relaxation band; that band is gone — `prepare_forcing` writes zero
-  lambdas — so the edge is now only ever the open one.
 - `parameters`: source variable names to prepare.
 - `architecture`: `:auto`, `:cpu` or `:gpu`, resolved by `interpolation_architecture` to decide
   where `prepare_forcing` runs its interpolation kernel.
 - `rivers`: an `AbstractRiverConfig` read by `add_rivers`, or `nothing` for no rivers. Only
   needed by a setup that adds rivers.
-- `boundaries`: an `AbstractBoundaryDataConfig` read by `prepare_boundaries` and by the open
-  lateral boundary condition, or `nothing` for a setup with no open-boundary data. Only needed by a
-  setup whose lateral boundary is driven by data.
+
+The open edge is *not* a field here. It belongs to the open-boundary data config
+(`AbstractBoundaryDataConfig`), which hangs off `FjordConfig` rather than off this config, and
+reaches `prepare_forcing` as its `edge` keyword — a forcing dataset says nothing about which edge of
+the domain is open. It was a field here while the edge carried an interior relaxation band this
+config's `relaxation_timescale` set the rate of; that band is gone.
 
 # Methods a subtype provides
 - `forcing_time_steps(config)`: the downloaded time records, as `SourceRecord`s. Required.
@@ -177,6 +176,11 @@ entirely.
   the forcing file.
 - `relaxation_timescale`: seconds; its reciprocal is the lambda written at each river cell.
 - `search_radius`: read by the default `river_search_radius`.
+- `standalone`: whether `add_rivers` writes a forcing file carrying *only* rivers, instead of
+  patching a copy of the one `prepare_forcing` wrote. `true` skips the interior forcing entirely —
+  no download, no regrid — and takes the time axis from the run window instead of from the prepared
+  file. `false` is today's behaviour, including the error when no prepared forcing exists, so a
+  forgotten `prepare_forcing` still fails loudly.
 
 # Methods a subtype provides
 - `river_locations(config)`: the river outlets, as `RiverLocation`s. Required.
@@ -202,8 +206,14 @@ Not to be confused with `AbstractBoundaryConditionConfig`, one word away: that o
 boundary *condition* — which scheme acts where, and how fast it nudges — while this one describes
 the exterior *values* the condition relaxes towards. One is physics, the other is data.
 
-Open-boundary data is optional, like rivers: a forcing config whose `boundaries` field is `nothing`
-skips both boundary steps entirely, and a closed domain names none.
+Open-boundary data is optional: a `FjordConfig` whose `boundary_config` is `nothing` skips both
+boundary steps entirely, and its lateral boundaries are closed walls — `water_mask` unmasks no
+velocity face row, and no boundary condition has an exterior state to nudge towards.
+
+It hangs off `FjordConfig` rather than off the forcing config, and states the open edge itself. The
+exterior values were always a separate file read by a separate pipeline; being configured *inside*
+the forcing config said otherwise, and meant a setup running with no interior forcing could not have
+a data-driven open boundary at all.
 
 The boundary file is separate from the prepared forcing file rather than a part of it, because the
 exterior state a Flather/Orlanski boundary needs is **hourly** — a daily mean has the tide averaged
@@ -216,6 +226,12 @@ edge is a set of new variables in the same file rather than a new file or a form
 - `data_root`, `output_file`, `plot_file`: resolved by `boundary_data_path` and `plot_path`.
 - `output_directory`: resolved by `boundary_data_directory`; the directory the download writes its
   intermediate files into.
+- `open_edges`: which lateral boundaries the domain is open on, each one of `:south`, `:north`,
+  `:west` or `:east`, read by `open_edges` as a `Vector{Symbol}`. A domain in the open ocean names all
+  four; a fjord names the one it connects to the sea through. Stated once, here:
+  `download_boundaries` and `prepare_boundaries` read it off this config rather than taking it beside
+  it, `water_mask` unmasks each of those edges' velocity face rows for both this pipeline and the
+  interior forcing's, and the open lateral boundary condition puts its schemes on every one of them.
 - `parameters`: source variable names to prepare.
 - `architecture`: `:auto`, `:cpu` or `:gpu`, resolved by `interpolation_architecture`.
 
@@ -224,7 +240,8 @@ edge is a set of new variables in the same file rather than a new file or a form
 - `boundary_source_grid(config, filepath)`: geometry of the source data, e.g. a
   `ProjectedSourceGrid`. Required.
 - `boundary_variable_names(config)`: source variable name => FjordSim boundary name. Required.
-- `download_boundaries(target_grid, edge, config)`: fetch the source data. Only if it downloads.
+- `download_boundaries(target_grid, config)`: fetch the source data, reading the edges it subsets
+  along with `open_edges(config)`. Only if it downloads.
 - `boundary_date_range(config)`: first and last date the prepared file covers, as a
   `(first, last)` tuple, or `nothing` to skip the check. Optional; defaults to reading `ds["time"]`
   from the prepared NetCDF, so `validate_time_coverage` also guards the `Cyclical()` wrap here.
@@ -371,15 +388,16 @@ returns the *nested named tuple* shape (`(u = (top = …, bottom = …), T = (to
 `FieldBoundaryConditions`.
 
 # Methods a subtype provides
-- `boundary_condition_sides(config, grid, forcing, forcing_config, tracers[, boundaries])`: the
+- `boundary_condition_sides(config, grid, forcing, boundary_config, tracers[, boundaries])`: the
   nested named tuple this piece contributes, keyed by field and then by side. Required. Implement the
   six-argument form only if the piece reads the prepared open-boundary state (`boundaries`, from
   `FjordSim.Forcing.boundary_series`, or `nothing`); the five-argument form is reached through a
   forwarding fallback, which is what lets a piece that carries its own exterior state ignore it.
 
 `FjordSim.BoundaryConditions.AirSeaFluxes`, `FjordSim.BoundaryConditions.QuadraticBottomDrag` and
-`FjordSim.BoundaryConditions.OpenLateralBoundaryFromForcing` are the built-in implementations. Not to
-be confused with `AbstractBoundaryDataConfig`, which is the exterior *data* rather than the scheme.
+`FjordSim.BoundaryConditions.OpenLateralBoundaryFromData` are the built-in implementations. Not to
+be confused with `AbstractBoundaryDataConfig`, which is the exterior *data* rather than the scheme —
+and which is what the fourth argument holds, so a piece can read `open_edges` from it.
 """
 abstract type AbstractBoundaryConditionConfig end
 
@@ -399,7 +417,7 @@ objects are not Oceananigans `FieldBoundaryConditions`, or that wants something 
 last-wins merging, is now a new subtype here rather than an edit to that function.
 
 # Methods a subtype provides
-- `field_boundary_conditions(config, grid, forcing, forcing_config, tracers, boundaries)`: the materialized
+- `field_boundary_conditions(config, grid, forcing, boundary_config, tracers, boundaries)`: the materialized
   boundary conditions, as the `NamedTuple` the model constructor consumes. Required.
 
 `FjordSim.BoundaryConditions.MergedBoundaryConditions` is the built-in implementation.
@@ -530,6 +548,25 @@ The edge is *not* in the filename: every variable in the file is prefixed with i
 holds however many boundaries a setup opens.
 """
 boundary_data_path(config::AbstractBoundaryDataConfig) = joinpath(config.data_root, config.output_file)
+
+"""
+    open_edges(config)
+
+Which lateral boundaries the domain is open on, as named by an `AbstractBoundaryDataConfig` — a
+`Vector{Symbol}`, empty for a setup naming no open-boundary data, whose lateral boundaries are
+therefore all closed walls.
+
+Always a collection, never a bare `Symbol`, so a domain open on one edge, on all four, or on none is
+one code path in every consumer rather than a scalar case and a plural one. A built-in config's
+keyword constructor accepts either shape and normalizes with `FjordSim.Forcing.lateral_edges`.
+
+Declared here rather than beside the pipelines that read it because all of them do: `Forcing` needs
+it for `water_mask` and is included first, both boundary steps regrid and subset along the edges, and
+the open lateral boundary condition puts its schemes on each. Each of them reads it through this
+accessor, so the edges are stated in exactly one place — the config that describes the boundary.
+"""
+open_edges(::Nothing) = Symbol[]
+open_edges(config::AbstractBoundaryDataConfig) = config.open_edges
 boundary_data_directory(config::AbstractBoundaryDataConfig) =
     joinpath(config.data_root, config.output_directory)
 
@@ -637,6 +674,10 @@ functions taking it are untouched. Each instantiation still has concrete field t
 - `bathymetry_config`: any `AbstractBathymetryConfig`.
 - `forcing_config`: any `AbstractForcingConfig`, or `nothing` for a setup that runs with no
   forcing at all. Defaults to `nothing`, so a setup opts in by naming one.
+- `boundary_config`: any `AbstractBoundaryDataConfig`, or `nothing` for a setup whose lateral
+  boundaries are closed. Defaults to `nothing`, so a setup opts in by naming one. Independent of
+  `forcing_config`: the exterior state along the open edge is its own hourly file from its own
+  pipeline, and either config can be named without the other.
 - `atmosphere_config`: any `AbstractAtmosphereConfig`, or `nothing` for a setup that prepares no
   atmosphere. Defaults to `nothing`, so a setup opts in by naming one.
 - `simulation_config`: any `AbstractSimulationConfig`, or `nothing` for a setup that is only
@@ -657,12 +698,14 @@ Base.@kwdef mutable struct FjordConfig{
     G<:AbstractGridConfig,
     B<:AbstractBathymetryConfig,
     F,
+    O,
     A,
     S,
 }
     grid_config::G
     bathymetry_config::B
     forcing_config::F = nothing
+    boundary_config::O = nothing
     atmosphere_config::A = nothing
     simulation_config::S = nothing
 end

@@ -22,7 +22,7 @@ using ..Bathymetry: DybdedataConfig
 using ..Atmospheres: NORA3Config
 using ..Forcing: NorKystConfig, OF800RiversConfig, NorKystBoundariesConfig
 using ..BoundaryConditions:
-    AirSeaFluxes, QuadraticBottomDrag, OpenLateralBoundaryFromForcing, MergedBoundaryConditions
+    AirSeaFluxes, QuadraticBottomDrag, OpenLateralBoundaryFromData, MergedBoundaryConditions
 using ..Simulations:
     SimulationConfig,
     CoupledHydrostaticSimulation,

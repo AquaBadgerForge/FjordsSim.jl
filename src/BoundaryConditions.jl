@@ -7,7 +7,7 @@ export air_sea_flux_boundary_conditions,
     field_boundary_conditions,
     AirSeaFluxes,
     QuadraticBottomDrag,
-    OpenLateralBoundaryFromForcing,
+    OpenLateralBoundaryFromData,
     MergedBoundaryConditions
 
 using Oceananigans
@@ -21,8 +21,7 @@ using Oceananigans.Units: Time
 using Oceananigans.Fields: ZeroField
 using Oceananigans.Grids: column_depthᶜᶠᵃ, column_depthᶠᶜᵃ
 using NumericalEarth.Oceans: u_quadratic_bottom_drag, v_quadratic_bottom_drag, build_tracer_top_bc
-using ..Configs:
-    AbstractBoundaryConditionConfig, AbstractBoundaryConditionSetConfig, AbstractForcingConfig
+using ..Configs: AbstractBoundaryConditionConfig, AbstractBoundaryConditionSetConfig, open_edges
 using ..Forcing: LATERAL_EDGES
 using ..Utils: recursive_merge
 
@@ -223,6 +222,10 @@ end
 #####
 ##### The four groups, one method per edge each
 #####
+##### Each takes *one* edge's series — the `(; T, S, u, v, eta, ubar, vbar)` group
+##### `FjordSim.Forcing.boundary_series` returns under that edge's key, not the whole per-edge
+##### collection. `open_edge_boundary_conditions` is what unwraps a group per edge and merges the
+##### four; these functions never see a second side.
 
 """
     boundary_series_value(boundaries, name, edge)
@@ -369,8 +372,8 @@ open_tracer_boundary_conditions(::Val{edge}, boundaries, tracers, scheme) where 
 )
 
 """
-    boundary_condition_sides(config, grid, forcing, forcing_config, tracers, boundaries)
-    boundary_condition_sides(config, grid, forcing, forcing_config, tracers)
+    boundary_condition_sides(config, grid, forcing, boundary_config, tracers, boundaries)
+    boundary_condition_sides(config, grid, forcing, boundary_config, tracers)
 
 One `AbstractBoundaryConditionConfig`'s contribution, as a nested named tuple keyed by field and
 then by side: `(u = (top = …, bottom = …), T = (top = …,))`.
@@ -381,6 +384,11 @@ to be called. That name shadowed `Oceananigans.Fields.boundary_conditions`, so i
 FjordSim hook that could not be re-exported and had to be reached as
 `FjordSim.BoundaryConditions.boundary_conditions`; and any caller binding a local of that name
 shadowed the hook it was trying to call.
+
+`boundary_config` is the setup's `AbstractBoundaryDataConfig`, or `nothing` — what a piece reads
+`open_edges` from. It was the *forcing* config while the boundary dataset and the open edge both hung
+off that one; the arity is unchanged, so an out-of-tree piece that ignores this argument, as both
+built-in pieces below do, is unaffected. One that reads it now receives the boundary config.
 
 `boundaries` is the prepared open-boundary state — the `NamedTuple` of reduced `FieldTimeSeries`
 `FjordSim.Forcing.boundary_series` returns, or `nothing` for a setup with no boundary data. Passed
@@ -396,8 +404,8 @@ signature and never sees it.
 Declared with no six-argument method beyond that forwarding, so a subtype that implements neither
 fails as a `MethodError` naming the hook.
 """
-boundary_condition_sides(config, grid, forcing, forcing_config, tracers, boundaries) =
-    boundary_condition_sides(config, grid, forcing, forcing_config, tracers)
+boundary_condition_sides(config, grid, forcing, boundary_config, tracers, boundaries) =
+    boundary_condition_sides(config, grid, forcing, boundary_config, tracers)
 
 """
     AirSeaFluxes()
@@ -416,7 +424,7 @@ restating the surface.
 """
 struct AirSeaFluxes <: AbstractBoundaryConditionConfig end
 
-boundary_condition_sides(::AirSeaFluxes, grid, forcing, forcing_config, tracers) =
+boundary_condition_sides(::AirSeaFluxes, grid, forcing, boundary_config, tracers) =
     air_sea_flux_boundary_conditions(grid)
 
 """
@@ -433,26 +441,32 @@ end
 
 QuadraticBottomDrag(coefficient::Real) = QuadraticBottomDrag(Float64(coefficient))
 
-boundary_condition_sides(config::QuadraticBottomDrag, grid, forcing, forcing_config, tracers) =
+boundary_condition_sides(config::QuadraticBottomDrag, grid, forcing, boundary_config, tracers) =
     quadratic_bottom_drag_boundary_conditions(config.coefficient)
 
 """
-    OpenLateralBoundaryFromForcing(; inflow_timescale, outflow_timescale)
+    OpenLateralBoundaryFromData(; inflow_timescale, outflow_timescale)
 
 The domain's open edge, with every exterior value read from the prepared open-boundary file.
 
-Four groups on the forcing config's `open_edge`: a Flather condition on the barotropic transport
-(from `ubar`/`vbar` and `eta`), and Orlanski radiation with nudging on the normal 3D velocity, on
-the tangential 3D velocity, and on every simulated tracer. Oceananigans adds the Chapman condition
-on `η` itself. The result is a boundary water, heat and salt actually cross — the predecessor of this
-config, `OpenLateralBoundary`, put `NormalFlowBoundaryCondition(nothing)` on the normal velocity,
-which is a closed wall, so only the tracers there were ever open.
+Four groups on **each** edge the setup's `AbstractBoundaryDataConfig` names: a Flather condition on the
+barotropic transport (from `ubar`/`vbar` and `eta`), and Orlanski radiation with nudging on the normal
+3D velocity, on the tangential 3D velocity, and on every simulated tracer. Oceananigans adds the
+Chapman condition on `η` itself, on every side carrying a gravity-wave transport condition — so a
+domain in the open ocean naming all four edges needs nothing extra here or there.
 
-Renamed to say where its values come from. They come from the boundary dataset hanging off the
-forcing config (`forcing_config.boundaries`), read by
+The result is a boundary water, heat and salt actually cross — the
+first version of this config, `OpenLateralBoundary`, put `NormalFlowBoundaryCondition(nothing)` on the
+normal velocity, which is a closed wall, so only the tracers there were ever open.
+
+The values come from the boundary data config a setup names on its `FjordConfig`, read by
 `FjordSim.Forcing.boundary_series` and handed in by `build_simulation` — hourly NorKyst for the
 built-in setups, because a Flather boundary without a tide is not worth prescribing and the interior
 forcing is daily means.
+
+Called `OpenLateralBoundaryFromForcing` while the boundary dataset hung off the forcing config. The
+values were never forcing — they are a separate hourly file from a separate collection read by a
+separate pipeline — and the name is the last place that said otherwise.
 
 # Fields
 - `inflow_timescale`: seconds to nudge towards the exterior state on inflow. Marchesiello et al.
@@ -465,42 +479,66 @@ from the forcing config: a genuinely open boundary treats inflow and outflow dif
 outflow rate is information no other config states. Nothing in this stack has a default, so a setup
 states both.
 """
-struct OpenLateralBoundaryFromForcing <: AbstractBoundaryConditionConfig
+struct OpenLateralBoundaryFromData <: AbstractBoundaryConditionConfig
     inflow_timescale::Float64
     outflow_timescale::Float64
 end
 
-OpenLateralBoundaryFromForcing(; inflow_timescale, outflow_timescale) =
-    OpenLateralBoundaryFromForcing(Float64(inflow_timescale), Float64(outflow_timescale))
+OpenLateralBoundaryFromData(; inflow_timescale, outflow_timescale) =
+    OpenLateralBoundaryFromData(Float64(inflow_timescale), Float64(outflow_timescale))
 
 function boundary_condition_sides(
-    config::OpenLateralBoundaryFromForcing,
+    config::OpenLateralBoundaryFromData,
     grid,
     forcing,
-    forcing_config,
+    boundary_config,
     tracers,
     boundaries,
 )
-    isnothing(boundaries) && error(
-        "OpenLateralBoundaryFromForcing reads its exterior state from the prepared boundary file, " *
-        "but this setup's forcing config names no `boundaries`. Give it an " *
+    isnothing(boundary_config) && error(
+        "OpenLateralBoundaryFromData puts its schemes on the edges a boundary data config names, " *
+        "but this setup's `FjordConfig` names no `boundary_config`. Give it an " *
         "`AbstractBoundaryDataConfig`, or use a boundary condition that carries its own exterior " *
-        "state.",
+        "state and edges.",
     )
 
-    edge = Val(forcing_config.open_edge)
+    isnothing(boundaries) && error(
+        "OpenLateralBoundaryFromData reads its exterior state from the prepared boundary file, but " *
+        "none was read for this setup. Run `julia --project -m FjordSim prepare_boundaries` for it, " *
+        "or use a boundary condition that carries its own exterior state.",
+    )
+
     scheme = boundary_radiation_scheme(config)
 
-    return recursive_merge(
-        open_normal_velocity_boundary_conditions(edge, boundaries, scheme),
-        open_tangential_velocity_boundary_conditions(edge, boundaries, scheme),
-        open_transport_boundary_conditions(edge, boundaries),
-        open_tracer_boundary_conditions(edge, boundaries, tracers, scheme),
+    return mapreduce(
+        edge -> open_edge_boundary_conditions(Val(edge), getproperty(boundaries, edge), tracers, scheme),
+        recursive_merge,
+        open_edges(boundary_config);
+        init = (;),
     )
 end
 
 """
-    field_boundary_conditions(config, grid, forcing, forcing_config, tracers, boundaries)
+    open_edge_boundary_conditions(edge::Val, series, tracers, scheme)
+
+The four groups one open edge contributes, merged: the Flather condition on the barotropic transport,
+and Orlanski radiation with nudging on the normal velocity, the tangential velocity and every tracer.
+
+Split out so `boundary_condition_sides` can `mapreduce` it over several open edges. The merge across
+edges is the same `recursive_merge` as within one, and it composes rather than colliding: on a domain
+open to the south and the west, `u` picks up a *tangential* condition at `.south` and a *normal* one at
+`.west`, and each tracer picks up both sides. A corner cell is the one place two edges' conditions meet,
+and which of them fills it is Oceananigans' halo-fill order rather than anything stated here.
+"""
+open_edge_boundary_conditions(edge::Val, series, tracers, scheme) = recursive_merge(
+    open_normal_velocity_boundary_conditions(edge, series, scheme),
+    open_tangential_velocity_boundary_conditions(edge, series, scheme),
+    open_transport_boundary_conditions(edge, series),
+    open_tracer_boundary_conditions(edge, series, tracers, scheme),
+)
+
+"""
+    field_boundary_conditions(config, grid, forcing, boundary_config, tracers, boundaries)
 
 The boundary conditions a whole `AbstractBoundaryConditionSetConfig` describes, materialized into
 the `NamedTuple` a model constructor consumes.
@@ -544,12 +582,12 @@ function field_boundary_conditions(
     config::MergedBoundaryConditions,
     grid,
     forcing,
-    forcing_config,
+    boundary_config,
     tracers,
     boundaries = nothing,
 )
     merged = mapreduce(
-        piece -> boundary_condition_sides(piece, grid, forcing, forcing_config, tracers, boundaries),
+        piece -> boundary_condition_sides(piece, grid, forcing, boundary_config, tracers, boundaries),
         recursive_merge,
         config.pieces;
         init = (;),

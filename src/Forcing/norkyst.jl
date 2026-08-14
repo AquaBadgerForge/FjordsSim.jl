@@ -38,12 +38,6 @@ overrides `data_root` for that entry only.
 - `output_directory`: Name of the directory where monthly NetCDF files are written. Required.
 - `output_file`: Name of the prepared forcing NetCDF written by `prepare_forcing`.
 - `plot_file`: Name of the diagnostic forcing plot.
-- `open_edge`: Lateral boundary the domain is open on, one of `:south`, `:north`, `:west` or
-  `:east`. Read by `water_mask`, which unmasks that edge's velocity face row, by
-  `prepare_boundaries`, which regrids the exterior state onto it, and by the open lateral boundary
-  condition, which puts its schemes there. Called `relaxation_edge` while the edge carried an
-  interior relaxation band; that band is gone, and a genuinely open boundary nudges at the boundary
-  instead.
 - `architecture`: Where `prepare_forcing` interpolates — `:auto`, `:cpu` or `:gpu`, resolved by
   `interpolation_architecture`. `:auto` keeps one config usable on a GPU machine and a laptop.
 - `catalog_url`: THREDDS catalog URL listing available files.
@@ -53,23 +47,22 @@ overrides `data_root` for that entry only.
 - `rivers`: An `AbstractRiverConfig` for `add_rivers` to write on top of the prepared forcing,
   or `nothing` for a setup with no rivers. The struct is parametric over its type so the field
   stays concretely typed either way.
-- `boundaries`: An `AbstractBoundaryDataConfig` for `prepare_boundaries` to write the exterior state
-  along `open_edge` from, or `nothing` for a setup whose lateral boundary is not data-driven.
-  Parametric for the same reason as `rivers`.
+
+The open edge is not here, and neither is the open-boundary dataset: both belong to the
+`AbstractBoundaryDataConfig` a setup names on its `FjordConfig`. `prepare_forcing` takes the edge as
+a keyword.
 """
-Base.@kwdef mutable struct NorKystConfig{R,B} <: AbstractForcingConfig
+Base.@kwdef mutable struct NorKystConfig{R} <: AbstractForcingConfig
     data_root::String
     output_directory::String
     output_file::String = "forcing.nc"
     plot_file::String = "forcing.png"
-    open_edge::Symbol = :south
     architecture::Symbol = :auto
     catalog_url::String = NORKYST_CATALOG_URL
     opendap_url::String = NORKYST_OPENDAP_URL
     parameters::Vector{String}
     years::Vector{Int}
     rivers::R = nothing
-    boundaries::B = nothing
 end
 
 """

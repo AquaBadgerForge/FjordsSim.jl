@@ -111,7 +111,7 @@ export
     field_boundary_conditions,
     AirSeaFluxes,
     QuadraticBottomDrag,
-    OpenLateralBoundaryFromForcing,
+    OpenLateralBoundaryFromData,
     MergedBoundaryConditions,
     # simulations
     coupled_simulation,

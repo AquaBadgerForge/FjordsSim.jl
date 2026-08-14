@@ -18,7 +18,8 @@ julia --project -m FjordSim download_forcing --config oslofjorden
 # Regrid the downloaded forcing onto the fjord's grid (needs the bathymetry and download first)
 julia --project -m FjordSim prepare_forcing --config oslofjorden
 
-# Write river relaxation on top of the prepared forcing (needs prepare_forcing first)
+# Write river relaxation on top of the prepared forcing (needs prepare_forcing first, unless the
+# river config is `standalone`, which writes a forcing file carrying only rivers)
 julia --project -m FjordSim add_rivers --config oslofjorden
 
 # Download the hourly exterior state along the open lateral boundary (a thin band, not the box)
@@ -59,7 +60,9 @@ julia --project -m FjordSim prepare_atmosphere  --config oslofjorden   # rewrite
 
 `add_rivers` is not optional here: it `cp`s the forcing file and patches the copy, so
 `forcing_rivers.nc` — which is what `simulation_forcing_path` gives the simulation — still carries
-the *old* axis until it is re-run. No download step is affected; all three prepares are pure regrids.
+the *old* axis until it is re-run. A `standalone` river config takes the window even more directly,
+building its whole time axis from it. No download step is affected; all three prepares are pure
+regrids.
 `loops` is not part of the window, so changing it re-runs nothing.
 
 `-m` is Julia 1.12's package entry point, which is why `Project.toml` has `[compat] julia = "1.12"`.
@@ -96,12 +99,16 @@ modules, in `include` order from `src/FjordSim.jl`:
    `AbstractWriterConfig`, `AbstractCallbackConfig` and `AbstractTimeSteppingConfig` — plus
    `AbstractBoundaryConditionConfig`, one level further down inside the boundary-condition set, and
    `FjordConfig`, which holds a
-   grid, bathymetry, forcing, atmosphere and simulation config (parametrically, so every
-   instantiation stays concretely typed). `atmosphere_config` and `simulation_config` default to
-   `nothing`, so a setup opts in by naming one. A river config hangs off the forcing config's
-   `rivers` field instead, where `nothing` means the setup has no rivers; an
-   `AbstractBoundaryDataConfig` hangs off its `boundaries` field the same way, `nothing` meaning a
-   lateral boundary that is not data-driven. The five
+   grid, bathymetry, forcing, open-boundary, atmosphere and simulation config (parametrically, so
+   every instantiation stays concretely typed). `forcing_config`, `boundary_config`,
+   `atmosphere_config` and `simulation_config` all default to
+   `nothing`, so a setup opts in by naming one. A river config is the exception: it hangs off the
+   forcing config's `rivers` field, where `nothing` means the setup has no rivers, because rivers
+   really are interior forcing — they are written into the forcing file itself. Open-boundary data is
+   *not*: `boundary_config` is a `FjordConfig` field of its own, since the exterior state is a
+   separate hourly file from a separate collection read by a separate pipeline, and either config is
+   nameable without the other. It hung off `NorKystConfig.boundaries` until the day a setup needed an
+   open boundary with no interior forcing and could not have one. The five
    simulation-level supertypes likewise hang off `SimulationConfig`'s `model`,
    `boundary_conditions`, `writers`, `callbacks` and `time_stepping`. A new grid, bathymetry
    source, forcing dataset, river dataset, open-boundary dataset or atmosphere dataset is
@@ -174,10 +181,10 @@ modules, in `include` order from `src/FjordSim.jl`:
    `compute_faces` and NetCDF/JLD2 helpers.
 
 4. **Plotting** (`src/Plotting.jl`) — `plot_bathymetry(grid, bottom_height, config)`,
-   `plot_forcing(grid, config)`, `plot_boundaries(edge, config)` and `plot_atmosphere(config)`, all
+   `plot_forcing(grid, config)`, `plot_boundaries(config)` and `plot_atmosphere(config)`, all
    dispatching on the config *supertypes* so a new source inherits them, writing to
-   `plot_path(config)`. `plot_boundaries` takes the edge because a boundary file's variables are
-   named for their side, so it cannot know which of them to read without being told; it draws two
+   `plot_path(config)`. `plot_boundaries` reads its edge from the config, because a boundary file's
+   variables are named for their side and it has to know which of them to read; it draws two
    panel shapes, a section for a full-depth variable and a line for a surface one. Shares
    `default_figure_size` and `plot_axes`. It is included *before* the pipelines rather than after
    them because each pipeline's setup-level driver plots as its last step, and `Plotting` itself
@@ -308,8 +315,8 @@ modules, in `include` order from `src/FjordSim.jl`:
    `forcing_time_steps(config)` completed by `daily_time_steps` to a gap-free daily axis, then
    extended to the run's `coverage` window by `pad_time_steps` →
    `forcing_source_grid(config, filepath)` → land mask from `peripheral_node` (so it matches the
-   model, including `PartialCellBottom` and the velocity-face wall convention), with the open
-   `open_edge` row restored → source mask filled from the nearest valid cell (`SourceFill`)
+   model, including `PartialCellBottom` and the velocity-face wall convention), with the open edge's
+   velocity face row restored → source mask filled from the nearest valid cell (`SourceFill`)
    → one trilinear `Oceananigans.Fields.interpolate` per target cell in a `launch!` kernel,
    against the source subset expressed as a `RectilinearGrid` in projected meters
    (`ProjectedSourceGrid`, `source_field_grid`) → **zero** lambdas → streaming NetCDF write. Only the
@@ -328,9 +335,16 @@ modules, in `include` order from `src/FjordSim.jl`:
    If a run turns out to need it, the fix is a viscosity sponge through the closure, not a
    reinstated tracer band fighting the boundary nudging.
 
-   `relaxation_edge` was renamed **`open_edge`** in the same move — a field named for a relaxation
+   `relaxation_edge` was renamed **`open_edge`**, since plural **`open_edges`**, in the same move — a field named for a relaxation
    that no longer happens there was exactly the defect this change set out to fix — and
-   `validate_relaxation_edge` became `validate_open_edge`. `LATERAL_EDGES` is now stated once, here,
+   `validate_relaxation_edge` became `validate_open_edge`. The field itself has since left this config
+   entirely: which edges are open is a property of the domain and its exterior data, not of a forcing
+   dataset, so they live on the `AbstractBoundaryDataConfig` and reach `prepare_forcing` as its
+   `edges` keyword. A setup naming no boundary config passes `nothing`, `water_mask` restores no face
+   row, and every lateral boundary is a closed wall — which is the right reading, since with no
+   exterior state there is nothing to read at that row. A domain in the open ocean names all four and
+   gets every face row back; `lateral_edges` normalizes one `Symbol`, a collection or `nothing` to one
+   shape, so restoring none, one or four rows is the same loop. `LATERAL_EDGES` is now stated once, here,
    and imported by `BoundaryConditions`; the two modules previously held identical copies under
    different names with identical error strings. `open_boundary_water!` is now four `Val{edge}`
    methods rather than a four-branch `if`.
@@ -378,7 +392,7 @@ modules, in `include` order from `src/FjordSim.jl`:
    why they require `prepare_bathymetry` to have run.
 
    `norkyst.jl` holds `NorKystConfig <: AbstractForcingConfig` (THREDDS endpoints, variables,
-   years, output names, the open edge), `forcing_monthly_filename`, the three hook methods, and
+   years, output names), `forcing_monthly_filename`, the three hook methods, and
    the NorKyst download: list the THREDDS catalog → open the month's OPeNDAP datasets → subset to
    the target grid's lon/lat box (`subset_ranges`, `NorKystSubset`) → write one combined monthly
    NetCDF.
@@ -390,18 +404,49 @@ modules, in `include` order from `src/FjordSim.jl`:
    regional subset it either never terminates or silently writes zeros.
 
    `rivers.jl` (generic core) and `of800_rivers.jl` (dataset adapter) are included into the same
-   `Forcing` module and hold the rivers step, which runs *after* `prepare_forcing`.
+   `Forcing` module and hold the rivers step, which runs *after* `prepare_forcing` unless the river
+   config is `standalone`.
    `add_rivers(target_grid, config::AbstractForcingConfig)` dispatches on `config.rivers` — a
    `nothing` river config is a no-op, so a setup opts in by naming one. The pipeline:
-   `river_locations(rivers)` → snap each outlet to a grid cell (`river_cells`) → river values
-   for the forcing file's own time axis (`river_series`) → copy the forcing file to
-   `river_forcing_path(rivers)` → patch the copy's surface level (`write_rivers`). The original
-   forcing file is never modified, so the step is re-runnable without redoing `forcing_prepare`.
+   `river_forcing_times` → `river_locations(rivers)` → snap each outlet to a grid cell
+   (`river_cells`) → river values for that time axis (`river_series`) → get the base file → patch its
+   surface level (`write_rivers`).
+
+   ### `standalone`
+
+   The base file is where the river config's `standalone` decides. `false` copies the prepared forcing
+   to `river_forcing_path(rivers)` and patches the copy, taking the time axis from it: the original is
+   never modified, so the step is re-runnable without redoing `prepare_forcing`, and a missing prepared
+   forcing is an error naming the step that produces it. `true` writes the file from scratch
+   (`create_river_forcing_file`), carrying **only** rivers — so a setup can have rivers with no
+   interior forcing at all, no NorKyst download and no regrid.
+
+   It is opt-in rather than inferred from whether `forcing.nc` happens to exist, because the two
+   failure modes are not symmetric: a setup that meant to prepare forcing and forgot gets an error
+   naming the step, where an inferred fallback would have silently run a whole year forcing-free. A
+   `standalone` config never copies either, even when a prepared forcing is there — copying it would
+   pull interior forcing into a run that asked for none.
+
+   Three things about the standalone file are load-bearing. Its **time axis** comes from the run window
+   (`coverage`, hence a `simulation_config`) rather than from a prepared file, daily, anchored at
+   `start_date` and extended past `start_date + stop_time` so `validate_time_coverage` accepts it;
+   daily because `river_series` matches records by *calendar date*, so a finer axis would only ask for
+   the same record repeatedly. Its **variables** are whatever `river_series` returns, since there is
+   nothing else in the file. And only its **surface level** is written — `NaN32` values and zero
+   lambdas, the level `write_rivers` patches — with the levels below left unwritten and read back as
+   the file's `_FillValue`, which is inert twice over: a non-finite value becomes the `-999.0` sentinel
+   every branch of `ForcingFromFile` gates on with `value > -990`, and a non-finite lambda fails each of
+   `λ > 1`, `λ < -1` and `-1 < λ < 1`. That is the same treatment dry cells already get in a prepared
+   file, and it keeps the write to a fraction of a full 4D one.
+
+   The file carries a `rivers_only` global attribute so it states what it is, and
+   `Simulations.forcing_state` refuses it: `FromForcing` initial conditions would otherwise start a run
+   from `T = S = 0` everywhere, silently, since `finite_slab` zeroes every non-finite cell.
 
    Rivers enter as **relaxation, not as a mass flux**: each river cell gets its value and
    `λ = 1 / relaxation_timescale` (1 hour by default) at the surface level for every time step,
-   which lands in the existing `|λ| < 1` regime — no new forcing term or λ convention. A river
-   cell inside the boundary relaxation band overrides that band's λ. Outlets are located by
+   which lands in the existing `|λ| < 1` regime — no new forcing term or λ convention. Outlets are
+   located by
    independent nearest-node lookups in longitude and latitude, then moved to the nearest
    *coastal* water cell — water with at least one land neighbour, so a river cannot be injected
    into open water. An outlet outside the grid, or with no coastal cell within `search_radius`,
@@ -412,9 +457,14 @@ modules, in `include` order from `src/FjordSim.jl`:
 
    `boundaries.jl` (generic core) and `norkyst_boundaries.jl` (dataset adapter) are included into
    the same `Forcing` module and hold the **open-boundary data** step, which is what makes the
-   lateral boundary open at all. `prepare_boundaries(target_grid, edge, config)` dispatches on
-   `config.rivers`' sibling, `config.boundaries` — a `nothing` boundary config is a no-op, so a
-   setup opts in by naming one, exactly like rivers. The pipeline mirrors `prepare_forcing`:
+   lateral boundary open at all. `prepare_boundaries(target_grid, config)` dispatches on
+   `FjordConfig`'s own `boundary_config` — a `nothing` boundary config is a no-op, so a setup opts in
+   by naming one, the way it opts into rivers, but on a `FjordConfig` field rather than inside the
+   forcing config. It says nothing about forcing in either direction: a setup can have an open
+   boundary with no interior forcing, or interior forcing with closed walls. The edges are
+   `open_edges(config)`, read from the config that states them rather than passed beside it, where the
+   two could disagree, and the whole per-variable build below runs once per edge into one file. The
+   pipeline mirrors `prepare_forcing`:
    `boundary_variable_names` → `boundary_time_steps` completed by `hourly_time_steps` and padded by
    `pad_time_steps` → `boundary_source_grid` → the edge slice of `water_mask` →
    `SourceFill` → the same trilinear kernel → `write_boundaries_file`.
@@ -428,13 +478,15 @@ modules, in `include` order from `src/FjordSim.jl`:
    the streaming write, the padding, `forcing_date_range`, the rivers copy loop, plotting and the
    test fixture — the same second-axis problem the atmosphere pipeline was built to avoid.
 
-   Every variable is named for its side — `south_T`, `south_eta`, … — so a second open edge is a set
-   of new variables in the same file rather than a new file or a format change, and one time axis
-   serves all of them. All six spatial dimensions are defined in every boundary file, each variable
+   Every variable is named for its side — `south_T`, `west_T`, … — which is how several open edges live
+   in one file: `prepare_boundaries` loops over `open_edges(config)` and writes every side's variables
+   into the same file, on one time axis, with no format change. A domain in the open ocean naming all
+   four therefore has one boundary file with four sides in it, not four files. All six spatial dimensions are defined in every boundary file, each variable
    using the two it needs. Layout, fixed by the read side: a full-depth variable is
    `(along, Nz, time)`, a surface one `(along, time)`; the along-boundary dimension is staggered with
    the variable (`south_u` and `south_ubar` on `Nx_faces`); `Float32`, `NaN` on land, CF-encoded
-   `time`, and an `open_edge` global attribute so the file states its own side. **No `_lambda`
+   `time`, and an `open_edge` global attribute — a comma-separated list — so the file states its own
+   sides. **No `_lambda`
    twins** — this is boundary data, and the nudging timescales belong to the boundary *condition*.
 
    Three things about it are load-bearing.
@@ -461,9 +513,14 @@ modules, in `include` order from `src/FjordSim.jl`:
    the halo at both bottom corners. The fill takes the nearest finite value along the boundary, which
    is what `SourceFill` and `daily_time_steps` already choose, and zero for a wholly dry line.
 
-   The read side is `boundary_series(config, grid, edge, reference_date)` → a `NamedTuple` of
-   **reduced `FieldTimeSeries`** keyed by the *bare* names (`:T`, `:eta`, …), so the same call serves
-   a second edge and no boundary condition spells a side into a variable name. The reduced locations
+   The read side is `boundary_series(config, grid, reference_date)` → a `NamedTuple` keyed by **edge**,
+   whose entries are `NamedTuple`s of **reduced `FieldTimeSeries`** keyed by the *bare* names
+   (`(; south = (; T, eta, …), west = …)`). Keyed by edge because a domain may be open on several, and
+   by bare name inside because the side is already the outer key — so no boundary condition spells a
+   side into a variable name, and the group a scheme consumes is the same shape whichever edge it came
+   from. `validate_boundary_file_edges` checks the file states every side the setup opens, so a setup
+   that has since opened another edge is told to re-run the step rather than failing on a missing
+   variable. The reduced locations
    are exactly the flavours `Oceananigans.BoundaryConditions.getbc` accepts as a boundary condition —
    `XZFTS` (`{LX, Nothing, LZ}`) for a south or north edge, `YZFTS` for west or east — which is why
    `BoundaryConditions` can pass a series straight through with no discrete-form wrapper. `Cyclical()`
@@ -522,17 +579,20 @@ modules, in `include` order from `src/FjordSim.jl`:
    and swapping a drag law should not mean restating the surface. `top_bottom_boundary_conditions`
    remains as the one-line merge of both, which is the shape the tests assert against.
 
-   ### `OpenLateralBoundaryFromForcing`
+   ### `OpenLateralBoundaryFromData`
 
    The third piece, and the one this module exists for. It puts a **genuinely open** boundary on the
-   forcing config's `open_edge`, with every exterior value read from the prepared boundary file.
+   edge the setup's `boundary_config` names, with every exterior value read from the prepared boundary
+   file.
 
-   Its predecessor was called `OpenLateralBoundary` and was **not open**: it put
+   The first version was called `OpenLateralBoundary` and was **not open**: it put
    `NormalFlowBoundaryCondition(nothing)` on the normal velocity, and `getbc` of `nothing` is
    `zero(grid)` — a closed wall. Only the tracers there were open. So the fjord's one connection to
    the Skagerrak passed heat and salt but no water, and the interior relaxation band was left to fake
-   the exchange. The rename says where the values come from, which is the other half of what the old
-   name got wrong.
+   the exchange. The first rename, to `OpenLateralBoundaryFromForcing`, said where the values came
+   from, which is the other half of what that name got wrong; the second, to `…FromData`, says it
+   *correctly* — they are a separate file from a separate collection read by a separate pipeline, and
+   they were never forcing.
 
    That was not an oversight while Oceananigans was at 0.110.13. A data-driven open velocity boundary
    was unusable with `SplitExplicitFreeSurface` there: the barotropic halo fills passed no `clock` and
@@ -544,8 +604,10 @@ modules, in `include` order from `src/FjordSim.jl`:
    0.110.15** (PR #5351) closes all three and adds the scheme set below, which is why the
    `[compat]`-free Oceananigans dependency must not be resolved back below it.
 
-   Four groups, each its own generic function with one method per `Val{edge}` and a catch-all that
-   raises — never an `if edge === :south` chain. For a south edge:
+   Four groups **per open edge**, each its own generic function with one method per `Val{edge}` and a
+   catch-all that raises — never an `if edge === :south` chain. `open_edge_boundary_conditions` merges
+   one edge's four, and `boundary_condition_sides` `mapreduce`s that over `open_edges(boundary_config)`
+   with the same `recursive_merge`. For a south edge:
 
    | group | field | condition | scheme |
    |---|---|---|---|
@@ -558,7 +620,17 @@ modules, in `include` order from `src/FjordSim.jl`:
    opens the boundary; `NormalRadiation` is Orlanski (1976) with Marchesiello et al. (2001) nudging —
    radiate outgoing signals at the locally diagnosed phase speed, nudge towards the data on inflow.
 
-   Four things about this are load-bearing.
+   Five things about this are load-bearing.
+
+   **The merge across edges composes rather than collides.** On a domain open to the south and the
+   west, `u` picks up a *tangential* condition at `.south` and a *normal* one at `.west`, and each
+   tracer picks up both sides — different leaves of the same nested tuple, which is exactly what
+   `recursive_merge` is for. A region in the open ocean naming all four edges needs nothing extra
+   here or in Oceananigans, which pairs its Chapman condition onto *every* side carrying a
+   gravity-wave transport condition. The one place two edges genuinely meet is a **corner** cell,
+   written by both edges' radiation conditions; which of them fills it is Oceananigans' halo-fill
+   order, not anything stated here, and it is the part of a multi-edge run to watch rather than to
+   assume.
 
    **`η` is not stated here at all.** Oceananigans pairs a `SurfaceWaveRadiation` (Chapman 1985)
    condition onto every side where `U` or `V` carries a gravity-wave condition
@@ -598,6 +670,14 @@ modules, in `include` order from `src/FjordSim.jl`:
    `QuadraticBottomDrag` and any out-of-tree config that carries its own exterior state implement the
    shorter signature and never see it. That is what keeps `examples/oslofjorden.jl` — which
    implements the five-argument hook — working untouched.
+
+   The **fourth** argument is the setup's `boundary_config`, and was the *forcing* config while the
+   boundary dataset and the open edge both hung off that one. `OpenLateralBoundaryFromData` is the only
+   built-in piece that reads it, for `open_edges`. The arity did not change, so a piece that ignores the
+   argument is unaffected — both other built-ins, and `examples/oslofjorden.jl`'s
+   `RadiatingLateralBoundary`, which carries its own edge. A piece that *reads* it now receives an
+   `AbstractBoundaryDataConfig` or `nothing`, which is a change no `MethodError` would have caught, so
+   it is stated here and in the hook tables.
 
    The two hooks have **different names on purpose**: one name returning a nested named tuple for a
    piece and a materialized one for a set would be two shapes behind one name. The per-piece hook is
@@ -715,7 +795,7 @@ modules, in `include` order from `src/FjordSim.jl`:
     `simulation_architecture` resolves it by reusing `interpolation_architecture`'s `Val` methods.
 
     `model_tracers(model)` is a hook rather than a field read because `build_simulation` needs the
-    tracer list before the model exists: `simulation_forcing`, `OpenLateralBoundaryFromForcing` and
+    tracer list before the model exists: `simulation_forcing`, `OpenLateralBoundaryFromData` and
     `resolve_initial_conditions` each build one thing per tracer.
 
     No field has a default anywhere in this stack, deliberately, which is the one place these configs
@@ -725,16 +805,19 @@ modules, in `include` order from `src/FjordSim.jl`:
     Three things are deliberately *not* fields, because they are already stated elsewhere and a
     second copy could only disagree: the forcing file (`simulation_forcing_path` takes the
     rivers-augmented copy when the forcing config names rivers, the plain prepared file
-    otherwise), the open boundary (`OpenLateralBoundaryFromForcing` puts its schemes on the edge the
-    forcing config's `open_edge` names, and reads its exterior state from the boundary dataset
-    hanging off the same config), and the atmosphere (the `prescribed_atmosphere` and
+    otherwise), the open boundary (`OpenLateralBoundaryFromData` puts its schemes on the edge
+    `config.boundary_config` names, and reads its exterior state from that same config's prepared
+    file), and the atmosphere (the `prescribed_atmosphere` and
     `prescribed_radiation` hooks on `config.atmosphere_config`).
 
-    `build_simulation` reads the boundary series once, with `boundary_series(boundary_data_config(…),
-    grid, open_edge(…), start_date)`, and hands it to `field_boundary_conditions` as its sixth
-    argument — the same shape as `forcing`, and for the same reason: this is the one place
-    `start_date` is known, so it is the one place a time axis can be zeroed at it. `open_edge` and
-    `boundary_data_config` are one-liners with `::Nothing` methods, like every other field read there.
+    `build_simulation` reads the boundary series once, with
+    `boundary_series(config.boundary_config, grid, start_date)`, and hands it to
+    `field_boundary_conditions` as its sixth argument — the same shape as `forcing`, and for the same
+    reason: this is the one place `start_date` is known, so it is the one place a time axis can be
+    zeroed at it. Both the config and the edge come straight off `FjordConfig` now; the
+    `boundary_data_config` and `open_edge` one-liners that used to reach through the forcing config are
+    gone, and `open_edges` is a `Configs` accessor on the boundary config instead, returning a
+    `Vector{Symbol}` — empty for a setup that names none, so every consumer iterates.
 
     `start_date` is the exception to that list, and it is a field precisely *because* it cannot be
     derived. Every prepared file carries its own first record, and each reader used to zero its own
@@ -1078,10 +1161,15 @@ Rivers — `AbstractRiverConfig`, consumed by `add_rivers`:
 | `download_rivers(config)` | only if it downloads | none |
 | `river_search_radius(config)` → cells to search for a coastal cell | no | `config.search_radius` |
 
+Its `standalone` field decides whether `add_rivers` patches a copy of the prepared forcing or writes a
+river-only file of its own; see the `Forcing` section. A `standalone` config needs the setup to name a
+`simulation_config`, since the file's time axis comes from the run window.
+
 A river config is not a `FjordConfig` field — it goes in the forcing config's `rivers` field,
-`nothing` for a setup with no rivers. A variable `river_series` returns that the forcing file
-does not carry is skipped with a warning, so one river dataset can serve setups that prepare
-different variables.
+`nothing` for a setup with no rivers, because rivers are written into the forcing file itself. A
+variable `river_series` returns that the forcing file does not carry is skipped with a warning, so one
+river dataset can serve setups that prepare different variables — vacuously so for a `standalone`
+config, whose file carries exactly what `river_series` returned.
 
 Open-boundary data — `AbstractBoundaryDataConfig`, consumed by `prepare_boundaries`:
 
@@ -1090,18 +1178,31 @@ Open-boundary data — `AbstractBoundaryDataConfig`, consumed by `prepare_bounda
 | `boundary_time_steps(config)` → `Vector{SourceRecord}` | yes | none |
 | `boundary_source_grid(config, filepath)` → source grid | yes | none |
 | `boundary_variable_names(config)` → `Dict` source name => FjordSim name | yes | none |
-| `download_boundaries(target_grid, edge, config)` | only if it downloads | none |
+| `download_boundaries(target_grid, config)` | only if it downloads; reads its edges with `open_edges(config)`, and subsets the box `boundary_domain` derives from them | none |
 | `boundary_date_range(config)` → `(first, last)` `DateTime`s | no | reads `ds["time"]` from the prepared NetCDF |
 
-Like a river config, this is not a `FjordConfig` field — it goes in the forcing config's
-`boundaries` field, `nothing` for a setup whose lateral boundary is not data-driven. The edge itself
-is *not* a field of it: that is the forcing config's `open_edge`, stated once, and passed to
-`download_boundaries` and `prepare_boundaries` as an argument. Not to be confused with
-`AbstractBoundaryConditionConfig`, which is the scheme rather than the data.
+Unlike a river config, this **is** a `FjordConfig` field, `boundary_config`, `nothing` for a setup
+whose lateral boundary is not data-driven. It hung off the forcing config's `boundaries` field until a
+setup needed an open boundary with no interior forcing; the exterior state was always its own hourly
+file from its own collection read by its own pipeline, and either config is nameable without the other.
+
+The edges **are** a field of it, `open_edges`, read through the `open_edges` accessor and stated nowhere
+else. Write one `Symbol` or a collection of them — a domain in the open ocean names all four — and the
+built-in config's keyword constructor normalizes either to a `Vector{Symbol}` with `lateral_edges`, so
+every consumer iterates one shape rather than branching on a scalar. The three pipeline entry points
+take the config and read the edges off it rather than taking both, which is what keeps them from
+disagreeing; `prepare_forcing` takes them as an `edges` keyword, since a forcing dataset has no
+business naming them, and `nothing` there means a closed domain. Not to be
+confused with `AbstractBoundaryConditionConfig`, which is the scheme rather than the data.
 
 `prepare_boundaries` reuses the forcing core on a one-cell-thick target slab, so a boundary source on
 a regular projected grid inherits `source_field_grid`, `projected_target_nodes`, `SourceFill` and the
-interpolation kernel unchanged, exactly as a forcing source does. What the prepared file's variables
+interpolation kernel unchanged, exactly as a forcing source does. It loops the whole per-variable build
+over the config's edges and writes them all into one file, so neither hook above becomes per-edge — the
+cost of that is the download: `boundary_domain` returns the bounding box of the edges' bands, which for
+two opposite edges is the whole domain plus the margin, so a multi-edge download is the full box at
+hourly cadence and its interior is fetched and never read. Per-edge downloads are the optimization, at
+the price of `boundary_time_steps` and `boundary_source_grid` becoming per-edge. What the prepared file's variables
 are *named* and *shaped* is not a hook — `boundary_variable_name`, `boundary_dimension_names` and
 `boundary_location` fix it, because the read side does.
 
@@ -1146,8 +1247,8 @@ the one hardcoded `Callback(progress, TimeInterval(...))` fired.
 | Supertype | Field | Required hooks |
 |---|---|---|
 | `AbstractCoupledSimulationConfig` | `model` | `coupled_simulation(model, grid; forcing, boundary_conditions, initial_conditions, atmosphere, radiation, stop_time, initial_time_step)`, `model_tracers(model)` |
-| `AbstractBoundaryConditionSetConfig` | `boundary_conditions` | `field_boundary_conditions(config, grid, forcing, forcing_config, tracers, boundaries)` |
-| `AbstractBoundaryConditionConfig` | the pieces inside the set | `boundary_condition_sides(config, grid, forcing, forcing_config, tracers[, boundaries])` — implement the six-argument form only if the piece reads the prepared open-boundary state; the five-argument one is reached through a forwarding fallback |
+| `AbstractBoundaryConditionSetConfig` | `boundary_conditions` | `field_boundary_conditions(config, grid, forcing, boundary_config, tracers, boundaries)` |
+| `AbstractBoundaryConditionConfig` | the pieces inside the set | `boundary_condition_sides(config, grid, forcing, boundary_config, tracers[, boundaries])` — implement the six-argument form only if the piece reads the prepared open-boundary state; the five-argument one is reached through a forwarding fallback. The fourth argument was the *forcing* config before the open edge moved, so a piece that reads it needs checking |
 | `AbstractCallbackConfig` | `callbacks` (a tuple) | `attach_callback!(simulation, callback, config)` |
 | `AbstractWriterConfig` | `writers` (a tuple) | `attach_writer!(simulation, writer, config, loop)`; optionally `checkpoint_trait`, `output_path_trait`, both defaulting to the negative |
 | `AbstractTimeSteppingConfig` | `time_stepping` | `attach_time_stepping!(simulation, config)`, `initial_time_step(config)` |
@@ -1201,10 +1302,11 @@ each setup carries its own copy of the ~176 MB series file. The same goes for th
 `NorKystBoundariesConfig`, and there it is not merely tidiness: the downloaded band is derived from
 *that* setup's own open edge, and Drammensfjord's southern edge is 20 km north of Oslofjord's, so the
 two bands are different data. A setup wanting no rivers or no boundary data leaves the
-field unnamed so it defaults to `nothing`, making that step a no-op; because `rivers` and
-`boundaries` are type
-parameters of `NorKystConfig`, that is a construction-time choice and cannot be undone on an existing
-instance. `atmosphere_config` and `simulation_config` default to `nothing` the same way, making both
+field unnamed so it defaults to `nothing`, making that step a no-op; because `rivers` is a type
+parameter of `NorKystConfig` and `boundary_config` one of `FjordConfig`, that is a construction-time
+choice in both cases and cannot be undone on an existing
+instance. `forcing_config`, `atmosphere_config` and `simulation_config` default to `nothing` the same
+way, making both
 atmosphere steps and `run_simulation` no-ops — though both built-in setups name all three.
 
 The simulation config is rooted separately, at `~/FjordSim_results/<fjord>/` rather than under
@@ -1312,7 +1414,10 @@ forcings.
 - Bathymetry convention: `h < 0` = below sea level (bottom height), `h >= 0` = land.
 - Data files default to `~/FjordSim_data/<fjord>/` and results to `~/FjordSim_results/<fjord>/`,
   the latter from the simulation config's `results_root`.
-- Open-boundary convention: the domain is open on exactly one edge, named once by the forcing
-  config's `open_edge`. Everything that acts on it dispatches on `Val(edge)`; the prepared boundary
-  file names every variable for its side (`south_T`), so a second open edge would be new variables in
-  the same file rather than a format change.
+- Open-boundary convention: the domain is open on any subset of its four lateral edges — none, one,
+  or all four for a region in the open ocean — named once by the boundary data config's `open_edges`
+  and read through the `open_edges` accessor as a `Vector{Symbol}`, empty for a setup naming no
+  boundary config, whose lateral boundaries are then all closed walls. Everything that acts on an edge
+  dispatches on `Val(edge)` and every consumer *iterates*, so the four edges are independent; the
+  prepared boundary file names every variable for its side (`south_T`), which is how they all fit in
+  one file on one time axis.

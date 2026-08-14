@@ -43,6 +43,13 @@ overrides `data_root` for that entry only.
 - `output_directory`: Name of the directory the monthly downloads are written to. Required.
 - `output_file`: Name of the prepared boundary NetCDF written by `prepare_boundaries`.
 - `plot_file`: Name of the diagnostic boundary plot.
+- `open_edges`: Lateral boundaries the domain is open on, each one of `:south`, `:north`, `:west` or
+  `:east`. Write one `Symbol` for a single edge or a collection for several — a domain in the open
+  ocean names all four — and the constructor normalizes either to a `Vector{Symbol}`. Required, and
+  stated only here: the download subsets a band along each, `prepare_boundaries` regrids onto each and
+  writes them all into one file, `water_mask` unmasks each edge's velocity face row for both this
+  pipeline and the interior forcing's, and the open lateral boundary condition puts its schemes on
+  every one of them.
 - `margin`: Degrees of latitude/longitude the download reaches past the boundary row, on both
   sides. Must leave room for the source cells the bilinear interpolation reads around the row —
   NorKyst's spacing is 800 m, so a few hundredths of a degree. Kept small because the download is
@@ -55,17 +62,59 @@ overrides `data_root` for that entry only.
 - `parameters`: Source variable names to extract. Required.
 - `years`: Calendar years to download. Required.
 """
-Base.@kwdef mutable struct NorKystBoundariesConfig <: AbstractBoundaryDataConfig
+mutable struct NorKystBoundariesConfig <: AbstractBoundaryDataConfig
     data_root::String
     output_directory::String
-    output_file::String = "boundaries.nc"
-    plot_file::String = "boundaries.png"
-    margin::Float64 = 0.05
-    architecture::Symbol = :auto
-    catalog_url::String = NORKYST_HOURLY_CATALOG_URL
-    opendap_url::String = NORKYST_HOURLY_OPENDAP_URL
+    output_file::String
+    plot_file::String
+    open_edges::Vector{Symbol}
+    margin::Float64
+    architecture::Symbol
+    catalog_url::String
+    opendap_url::String
     parameters::Vector{String}
     years::Vector{Int}
+end
+
+# A hand-written keyword constructor rather than `Base.@kwdef`, so `open_edges` may be written as one
+# `Symbol` or as a collection of them and is normalized here: `lateral_edges` validates each edge and
+# rejects a repeat, and every consumer then iterates one shape. `@kwdef` would `convert` instead, and
+# `convert(Vector{Symbol}, :south)` has no method.
+function NorKystBoundariesConfig(;
+    data_root,
+    output_directory,
+    output_file = "boundaries.nc",
+    plot_file = "boundaries.png",
+    open_edges,
+    margin = 0.05,
+    architecture = :auto,
+    catalog_url = NORKYST_HOURLY_CATALOG_URL,
+    opendap_url = NORKYST_HOURLY_OPENDAP_URL,
+    parameters,
+    years,
+)
+    edges = lateral_edges(open_edges)
+    isempty(edges) && throw(
+        ArgumentError(
+            "NorKystBoundariesConfig names no `open_edges`. A boundary dataset exists to supply the " *
+            "exterior state along at least one open edge; a closed domain names no boundary config " *
+            "at all.",
+        ),
+    )
+
+    return NorKystBoundariesConfig(
+        data_root,
+        output_directory,
+        output_file,
+        plot_file,
+        edges,
+        Float64(margin),
+        architecture,
+        catalog_url,
+        opendap_url,
+        parameters,
+        years,
+    )
 end
 
 """
@@ -143,22 +192,25 @@ end
 # --- Download ---
 
 """
-    download_boundaries(target_grid, edge, config::NorKystBoundariesConfig)
+    download_boundaries(target_grid, config::NorKystBoundariesConfig)
 
 Download the hourly NorKyst-800m months covering `config.years`, each combined into one NetCDF file
-in `boundary_data_directory(config)` subset to a `config.margin`-wide lon/lat band along `edge` of
-`target_grid`. A month whose file already exists is skipped, so an interrupted download resumes.
+in `boundary_data_directory(config)` subset to the box `boundary_domain` derives from
+`open_edges(config)` and `target_grid`. A month whose file already exists is skipped, so an interrupted
+download resumes.
 
-The band, rather than the whole domain box, is what keeps an hourly download affordable — see
-`boundary_domain`.
+For a single open edge that box is a `config.margin`-wide band along the edge, which is what keeps an
+hourly download affordable. For several it is their bounding box, which for opposite edges is the whole
+domain — see `boundary_domain` for why it stays one box.
 """
-function download_boundaries(target_grid, edge, config::NorKystBoundariesConfig)
+function download_boundaries(target_grid, config::NorKystBoundariesConfig)
     output_directory = boundary_data_directory(config)
     mkpath(output_directory)
 
-    longitude, latitude = boundary_domain(Val(validate_open_edge(edge)), target_grid, config.margin)
-    @info "Downloading hourly NorKyst-800m years $(join(config.years, ", ")) along the :$edge " *
-          "boundary to $output_directory"
+    edges = open_edges(config)
+    longitude, latitude = boundary_domain(edges, target_grid, config.margin)
+    @info "Downloading hourly NorKyst-800m years $(join(config.years, ", ")) along the " *
+          "$(join(edges, ", ")) boundary to $output_directory"
     @info "  Band: longitude $longitude, latitude $latitude"
 
     files = list_opendap_files(catalog_url = config.catalog_url)

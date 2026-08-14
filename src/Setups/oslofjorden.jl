@@ -65,27 +65,36 @@ function oslofjorden()
             output_directory = "norkyst",
             output_file      = "forcing.nc",
             plot_file        = "forcing.png",
-            open_edge        = :south,
             architecture     = :auto,
             parameters       = ["temperature", "salinity", "u_eastward", "v_northward"],
             years            = [2020],
             rivers           = OF800RiversConfig(data_root = data_root),
-            # The exterior state along the open southern edge, from the *hourly* NorKyst
-            # collection: a Flather boundary compares the model's own η against the exterior one,
-            # and the daily means above have the tide averaged out of them. Only the boundary row
-            # is prepared at that cadence, so the file is a few hundred MB.
-            boundaries       = NorKystBoundariesConfig(
-                data_root        = data_root,
-                output_directory = "norkyst_hourly",
-                output_file      = "boundaries.nc",
-                plot_file        = "boundaries.png",
-                margin           = 0.05,
-                architecture     = :auto,
-                parameters       = [
-                    "temperature", "salinity", "u_eastward", "v_northward", "zeta", "ubar", "vbar",
-                ],
-                years            = [2020],
-            ),
+        ),
+        # The exterior state along the open southern edge, from the *hourly* NorKyst collection: a
+        # Flather boundary compares the model's own η against the exterior one, and the daily means
+        # the forcing config reads have the tide averaged out of them. Only the boundary row is
+        # prepared at that cadence, so the file is a few hundred MB.
+        #
+        # A `FjordConfig` field of its own, independent of the forcing above: this is a separate
+        # file from a separate collection read by a separate pipeline, and it is what states the open
+        # edge — for the boundary steps, for the forcing land mask, and for the boundary condition.
+        # Overloads boundary_time_steps, boundary_source_grid, boundary_variable_names and
+        # download_boundaries.
+        boundary_config = NorKystBoundariesConfig(
+            data_root        = data_root,
+            output_directory = "norkyst_hourly",
+            output_file      = "boundaries.nc",
+            plot_file        = "boundaries.png",
+            # One `Symbol` for one open edge; a collection for several — a region in the open
+            # ocean writes `(:south, :north, :west, :east)` and gets one boundary file with four
+            # sides in it. Oslofjord connects to the Skagerrak through its southern edge alone.
+            open_edges       = :south,
+            margin           = 0.05,
+            architecture     = :auto,
+            parameters       = [
+                "temperature", "salinity", "u_eastward", "v_northward", "zeta", "ubar", "vbar",
+            ],
+            years            = [2020],
         ),
         # Overloads atmosphere_time_steps, atmosphere_source_grid, atmosphere_variable_names,
         # download_atmosphere, prescribed_atmosphere and prescribed_radiation — the hooks
@@ -129,16 +138,15 @@ function oslofjorden()
             # MergedBoundaryConditions overloads field_boundary_conditions; each piece inside it
             # overloads boundary_condition_sides. Air-sea fluxes and quadratic bottom drag are
             # separate pieces, so either can be swapped alone, plus the genuinely open southern
-            # edge — which edge comes from the forcing config, and the exterior state from the
-            # boundary dataset hanging off it. Dropping it would close the domain; argument order is
-            # merge precedence.
+            # edge — which edge, and whose exterior state, come from `boundary_config` above.
+            # Dropping it would close the domain; argument order is merge precedence.
             #
             # The two timescales are Marchesiello et al. (2001): nudge hard towards the data on
             # inflow, let radiation do the work on outflow.
             boundary_conditions = MergedBoundaryConditions(
                 AirSeaFluxes(),
                 QuadraticBottomDrag(coefficient = 0.003),
-                OpenLateralBoundaryFromForcing(
+                OpenLateralBoundaryFromData(
                     inflow_timescale  = 1day,
                     outflow_timescale = 360days,
                 ),
@@ -181,7 +189,7 @@ function oslofjorden()
             # spacing bound. That is what lets the window be a round year instead of being pinned
             # to whichever instant the forcing happened to start at.
             start_date         = DateTime(2020, 1, 1),
-            stop_time          = 366days,
+            stop_time          = 60days,  # 366days,
             # One pass. Raise it to spin the deep basins up on the same forcing year, carrying the
             # state over; each repetition writes its own `_loopNN` file.
             loops              = 1,

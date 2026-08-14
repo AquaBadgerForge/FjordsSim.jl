@@ -33,6 +33,7 @@ using ..Configs:
     boundary_data_directory,
     coverage_window,
     domain_grid,
+    open_edges,
     simulation_grid
 using ..Plotting: plot_forcing, plot_boundaries
 
@@ -57,6 +58,7 @@ export forcing_from_file,
     OF800RiversConfig,
     LATERAL_EDGES,
     validate_open_edge,
+    lateral_edges,
     download_boundaries,
     prepare_boundaries,
     boundary_series,
@@ -388,10 +390,10 @@ The four lateral boundaries a regional domain can be open on, in the order every
 lists them.
 
 Defined here rather than in `BoundaryConditions` because that module is included after this one and
-both need it: `validate_open_edge` checks a forcing config's `open_edge` before any regridding, and
-every `Val{edge}` dispatch in the boundary conditions falls back to an `ArgumentError` naming this
-tuple. There used to be one copy per module, with identical contents, an identical membership test
-and an identical error string.
+both need it: `validate_open_edge` checks each edge a boundary data config names before any
+regridding, and every `Val{edge}` dispatch in the boundary conditions falls back to an
+`ArgumentError` naming this tuple. There used to be one copy per module, with identical contents, an
+identical membership test and an identical error string.
 """
 const LATERAL_EDGES = (:south, :north, :west, :east)
 # Longest run of missing days interpolated without a separate warning, matching the default of
@@ -502,6 +504,26 @@ function validate_open_edge(edge)
     edge in LATERAL_EDGES ||
         throw(ArgumentError("open_edge must be one of $LATERAL_EDGES, got :$edge"))
     return edge
+end
+
+"""
+    lateral_edges(edges)
+
+Normalize whatever a caller names its open edges as into a validated `Vector{Symbol}`: one `Symbol`,
+an iterable of them, or `nothing` for none.
+
+Every consumer iterates, so a domain open on one edge, on all four, or on none is the same code path
+rather than a scalar case and a plural one. Duplicates are rejected — a repeated edge would prepare
+and write the same variables twice, and mean nothing the second time.
+"""
+lateral_edges(::Nothing) = Symbol[]
+lateral_edges(edge::Symbol) = [validate_open_edge(edge)]
+
+function lateral_edges(edges)
+    normalized = Symbol[validate_open_edge(edge) for edge in edges]
+    allunique(normalized) ||
+        throw(ArgumentError("open_edges names an edge more than once: $normalized"))
+    return normalized
 end
 
 """
@@ -661,7 +683,7 @@ and only the finished slab comes back for each write, so a GPU run keeps the sam
 memory profile.
 
 Relaxation lambdas are written as **zero everywhere**. The interior sponge band this file used to
-carry along `open_edge` is gone: the open lateral boundary now nudges towards hourly exterior data at
+carry along the open edge is gone: the open lateral boundary now nudges towards hourly exterior data at
 the boundary itself (`NormalRadiation`, `GravityWaveRadiation`), and a band relaxing the same
 variables a few cells inside would fight it. `add_rivers` writes the only nonzero lambdas the file
 ever carries, so the `*_lambda` variables exist for that step and for
@@ -685,10 +707,17 @@ interpolating against a `RectilinearGrid` in projected meters; see `source_field
 axis is padded to reach both ends by replicating the nearest step; `nothing` prepares exactly the
 downloaded range. See `pad_time_steps`.
 
+# The open edges
+`edges` are the lateral boundaries the domain is open on, from the setup's open-boundary data config,
+or `nothing` for a setup that names none and is therefore closed all round. They reach `water_mask`,
+which unmasks each of those edges' velocity face rows so the prepared values are not dropped exactly
+where an open boundary reads them. A keyword rather than a field of `config`, because which edges are
+open is a property of the domain and its boundary data, not of the forcing dataset.
+
 # Returns
 A named tuple with `output_file`, `times` and `variables` (the written variable names).
 """
-function prepare_forcing(target_grid, config::AbstractForcingConfig; coverage = nothing)
+function prepare_forcing(target_grid, config::AbstractForcingConfig; coverage = nothing, edges = nothing)
     architecture = interpolation_architecture(config)
     variable_names = forcing_variable_names(config)
     source_names = [name for name in config.parameters if haskey(variable_names, name)]
@@ -697,15 +726,14 @@ function prepare_forcing(target_grid, config::AbstractForcingConfig; coverage = 
         "Known $(nameof(typeof(config))) variables: $(sort(collect(keys(variable_names)))).",
     )
 
-    validate_open_edge(config.open_edge)
-
     steps = pad_time_steps(daily_time_steps(forcing_time_steps(config)), coverage)
     reference_file = first(steps).lower.filepath
     source = forcing_source_grid(config, reference_file)
     @info "Preparing forcing from $(length(unique(step -> step.lower.filepath, steps))) file(s), " *
           "$(length(steps)) time steps: $(first(steps).date) to $(last(steps).date)"
 
-    variables = [prepared_variable(name, target_grid, source, reference_file, config) for name in source_names]
+    variables =
+        [prepared_variable(name, target_grid, source, reference_file, config, edges) for name in source_names]
 
     output_file = forcing_path(config)
     @info "Writing forcing file to $output_file, interpolating on $(summary(architecture))"
@@ -715,7 +743,7 @@ function prepare_forcing(target_grid, config::AbstractForcingConfig; coverage = 
     return (; output_file, times = [step.date for step in steps], variables = [variable.name for variable in variables])
 end
 
-prepare_forcing(target_grid, ::Nothing; coverage = nothing) = nothing
+prepare_forcing(target_grid, ::Nothing; coverage = nothing, edges = nothing) = nothing
 
 """
     prepare_forcing(config::FjordConfig)
@@ -731,6 +759,8 @@ interpolation kernel runs, and building the masks needs scalar access to the bat
 
 The coverage window comes from the setup's simulation config, so the prepared file spans the run
 the setup describes; a setup naming no simulation config gets `nothing` and the downloaded range.
+The open edges come from the setup's boundary config, so the mask leaves those edges' velocity faces
+where the open boundary needs them; a setup naming no boundary data is closed all round.
 
 # Returns
 The `prepare_forcing(target_grid, config)` named tuple with `plot_file` added.
@@ -749,6 +779,7 @@ function prepare_forcing(config::FjordConfig)
         grid,
         config.forcing_config;
         coverage = coverage_window(config.simulation_config),
+        edges = open_edges(config.boundary_config),
     )
     plot_file = plot_forcing(grid, config.forcing_config)
 
@@ -900,7 +931,7 @@ function forcing_record_spacing(steps)
 end
 
 """
-    water_mask(target_grid, LX, LY, edge)
+    water_mask(target_grid, LX, LY, edges)
 
 Water flag per cell of `target_grid` at the location `(LX, LY, Center)`, taken from
 `Oceananigans.Grids.peripheral_node` so that it is by construction the same predicate the model
@@ -908,9 +939,25 @@ uses. That covers the staggering: a velocity face is peripheral when either trac
 separates is inactive, and `PartialCellBottom` decides "inactive" with its own
 `minimum_fractional_cell_height` rather than a hand-rolled cell-center test.
 
-`edge` names the open lateral boundary, whose outermost face row `open_boundary_water!` restores.
+`edges` names the open lateral boundaries, whose outermost face rows `open_boundary_water!` restores —
+one `Symbol`, a collection of them, or `nothing`. A setup naming no open-boundary data restores none:
+with no exterior state there is nothing to read at those rows, so every lateral boundary is a closed
+wall and the peripheral mask stands as it is. A domain in the open ocean names all four and gets every
+face row back.
+
+Only the component staggered across a given edge is affected, so the four restores are independent and
+their order does not matter — `u` is touched by `:west` and `:east`, `v` by `:south` and `:north`, and
+a tracer by none of them.
 """
-function water_mask(target_grid, LX, LY, edge)
+function water_mask(target_grid, LX, LY, edges)
+    mask = peripheral_water_mask(target_grid, LX, LY)
+    for edge in lateral_edges(edges)
+        open_boundary_water!(mask, target_grid, LX, LY, Val(edge))
+    end
+    return mask
+end
+
+function peripheral_water_mask(target_grid, LX, LY)
     Nx, Ny, Nz = size(target_grid)
     nx = LX === Face ? Nx + 1 : Nx
     ny = LY === Face ? Ny + 1 : Ny
@@ -920,7 +967,7 @@ function water_mask(target_grid, LX, LY, edge)
         mask[i, j, k] = !peripheral_node(i, j, k, target_grid, LX(), LY(), Center())
     end
 
-    return open_boundary_water!(mask, target_grid, LX, LY, Val(validate_open_edge(edge)))
+    return mask
 end
 
 """
@@ -988,17 +1035,17 @@ function forcing_dimension_names(name)
 end
 
 """
-    prepared_variable(source_name, target_grid, source, filepath, config)
+    prepared_variable(source_name, target_grid, source, filepath, config, edges)
 
 Build the mask, projected target nodes, source fill and lambdas for one source variable at its
-target location.
+target location. `edges` are the open lateral boundaries, or `nothing` for a closed domain.
 """
-function prepared_variable(source_name, target_grid, source, filepath, config::AbstractForcingConfig)
+function prepared_variable(source_name, target_grid, source, filepath, config::AbstractForcingConfig, edges)
     name = forcing_variable_names(config)[source_name]
     LX, LY, LZ = data_location(Symbol(name))
     @info "Preparing target nodes and source fill for $source_name -> $name"
 
-    mask = water_mask(target_grid, LX, LY, config.open_edge)
+    mask = water_mask(target_grid, LX, LY, edges)
     longitude = Array(λnodes(target_grid, LX()))
     latitude = Array(φnodes(target_grid, LY()))
     size(mask)[1:2] == (length(longitude), length(latitude)) || error(
@@ -1398,7 +1445,7 @@ function write_forcing_file(filepath, target_grid, variables, steps, source, arc
 
     ds = NCDataset(filepath, "c")
     try
-        define_forcing_dimensions!(ds, target_grid, steps)
+        define_forcing_dimensions!(ds, target_grid, [step.date for step in steps])
         for variable in variables
             # One horizontal level of one time step per chunk. Both this writer and
             # `load_from_netcdf` touch exactly one time index at a time, so a chunk spanning
@@ -1458,11 +1505,15 @@ function write_forcing_file(filepath, target_grid, variables, steps, source, arc
 end
 
 """
-    define_forcing_dimensions!(ds, target_grid, steps)
+    define_forcing_dimensions!(ds, target_grid, dates)
 
-Define the dimensions and coordinate variables `forcing_from_file` checks against the grid.
+Define the dimensions and coordinate variables `forcing_from_file` checks against the grid, on the
+time axis `dates`.
+
+Takes the dates rather than the `ForcingTimeStep`s they come from, because `create_river_forcing_file`
+writes this same layout for a file that has no source records behind it.
 """
-function define_forcing_dimensions!(ds, target_grid, steps)
+function define_forcing_dimensions!(ds, target_grid, dates)
     coordinates = (
         "Nx" => Array(λnodes(target_grid, Center())),
         "Ny" => Array(φnodes(target_grid, Center())),
@@ -1475,12 +1526,12 @@ function define_forcing_dimensions!(ds, target_grid, steps)
     for (name, values) in coordinates
         defDim(ds, name, length(values))
     end
-    defDim(ds, "time", length(steps))
+    defDim(ds, "time", length(dates))
 
     for (name, values) in coordinates
         defVar(ds, name, Float64, (name,))[:] = values
     end
-    defVar(ds, "time", [step.date for step in steps], ("time",))
+    defVar(ds, "time", collect(dates), ("time",))
 
     return ds
 end

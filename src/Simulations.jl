@@ -47,7 +47,12 @@ using ..Configs:
 using ..Utils: progress, cell_advection_timescale_coupled_model
 using ..Atmospheres: prescribed_atmosphere, prescribed_radiation, atmosphere_date_range
 using ..Forcing:
-    simulation_forcing, forcing_date_range, interpolation_architecture, boundary_series, boundary_date_range
+    simulation_forcing,
+    forcing_date_range,
+    interpolation_architecture,
+    boundary_series,
+    boundary_date_range,
+    RIVERS_ONLY_ATTRIBUTE
 using ..BoundaryConditions: field_boundary_conditions
 
 """
@@ -239,7 +244,7 @@ extra_kwargs(model::CoupledHydrostaticSimulation, slot::Symbol) =
 The tracer names a coupled-model config carries.
 
 A hook rather than a field read, because `build_simulation` needs them long before the model exists:
-`simulation_forcing` builds one term per tracer, `OpenLateralBoundaryFromForcing` opens one lateral
+`simulation_forcing` builds one term per tracer, `OpenLateralBoundaryFromData` opens one lateral
 condition per tracer, and `resolve_initial_conditions` reads one state variable per tracer. All three ask the model
 config what it simulates rather than being told a second time.
 """
@@ -590,6 +595,15 @@ function resolve_initial_conditions(initial_conditions::FromForcing, grid, forci
     return forcing_state(forcing_file, grid, date, model_tracers(config.model))
 end
 
+# There is no forcing file because the setup names no forcing config at all — `resolve_forcing_file`
+# returns `nothing` for one. Stated here rather than left to fail inside `NCDataset(nothing)` after
+# the grid has been built.
+resolve_initial_conditions(::FromForcing, grid, ::Nothing, config) = error(
+    "Initial conditions are `FromForcing`, but this setup names no `forcing_config`, so there is no " *
+    "prepared forcing file to read a state from. Name one, give `initial_conditions` a `NamedTuple` " *
+    "of constants, or start from a previous run's snapshot with `FromResults`.",
+)
+
 function resolve_initial_conditions(initial_conditions::FromResults, grid, forcing_file, config)
     filepath = results_state_path(initial_conditions, config)
     isfile(filepath) || error("Results file $filepath does not exist.")
@@ -614,9 +628,19 @@ results_state_path(initial_conditions::FromResults, config) =
 The state variables a prepared forcing file holds at `date`.
 
 The `_lambda` twins are relaxation rates rather than state, so only the bare names are read.
+
+A file `add_rivers` wrote in `standalone` mode is refused: it carries river values at a handful of
+cells and nothing anywhere else, so every other cell would come back as a zero from `finite_slab` and
+the run would start from `T = S = 0` across the whole domain with nothing reported. It says so in its
+own `rivers_only` attribute.
 """
 function forcing_state(filepath, grid, date, tracers)
     return NCDataset(filepath) do ds
+        haskey(ds.attrib, RIVERS_ONLY_ATTRIBUTE) && error(
+            "Forcing file $filepath carries only rivers, so it holds no ocean state to start from — " *
+            "every cell outside a river mouth is empty. Give `initial_conditions` a `NamedTuple` of " *
+            "constants, or start from a previous run's snapshot with `FromResults`.",
+        )
         validate_state_dimensions(filepath, ds, grid, ("Nx", "Ny", "Nz"))
         dates = ds["time"][:]
         index = findfirst(==(date), dates)
@@ -766,23 +790,6 @@ function resolve_forcing_file(forcing_config::AbstractForcingConfig)
     )
     return forcing_file
 end
-
-"""
-    boundary_data_config(forcing_config)
-    open_edge(forcing_config)
-
-The open-boundary dataset a forcing config names and the edge it sits on, or `nothing` and `nothing`
-for a setup naming no forcing at all.
-
-Two one-liners rather than reaching into `config.forcing_config.boundaries` at the call site, because
-`build_simulation` has to work for a `forcing_config` of `nothing` and every other field read there
-already goes through a `::Nothing` method.
-"""
-boundary_data_config(::Nothing) = nothing
-boundary_data_config(forcing_config::AbstractForcingConfig) = forcing_config.boundaries
-
-open_edge(::Nothing) = nothing
-open_edge(forcing_config::AbstractForcingConfig) = forcing_config.open_edge
 
 """
     validate_time_coverage(label, range, start_date, stop_time, remedy)
@@ -1231,7 +1238,7 @@ function build_simulation(config::FjordConfig)
     )
     validate_time_coverage(
         "open-boundary data",
-        boundary_date_range(boundary_data_config(config.forcing_config)),
+        boundary_date_range(config.boundary_config),
         start_date,
         stop_time,
         "prepare more years of open-boundary data",
@@ -1254,12 +1261,7 @@ function build_simulation(config::FjordConfig)
     # forcing and the atmosphere. Read here rather than inside the boundary config for exactly that
     # reason: this is the one place `start_date` is known, and a config that opened the file itself
     # would need telling that instant a second time.
-    boundaries = boundary_series(
-        boundary_data_config(config.forcing_config),
-        grid,
-        open_edge(config.forcing_config),
-        start_date,
-    )
+    boundaries = boundary_series(config.boundary_config, grid, start_date)
     # Named `model_boundary_conditions` rather than `boundary_conditions`, which is the hook each
     # piece of it was built by: assigning to that name here would make it a local and shadow the
     # function for the rest of this body.
@@ -1267,7 +1269,7 @@ function build_simulation(config::FjordConfig)
         simulation_config.boundary_conditions,
         grid,
         forcing,
-        config.forcing_config,
+        config.boundary_config,
         tracers,
         boundaries,
     )
