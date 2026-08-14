@@ -298,8 +298,8 @@ test_snapshot_writer(;
     overwrite_existing = true,
 ) = SnapshotWriter(; name, output_file, variables, interval, overwrite_existing)
 
-test_checkpoint_writer(; interval = 30days, overwrite_existing = true, cleanup = true) =
-    CheckpointWriter(; interval, overwrite_existing, cleanup)
+test_checkpoint_writer(; interval = 30days, cleanup = true) =
+    CheckpointWriter(; interval, cleanup)
 
 test_time_stepping(;
     initial_time_step = 1second,

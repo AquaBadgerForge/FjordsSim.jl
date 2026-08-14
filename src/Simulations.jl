@@ -291,7 +291,7 @@ function SnapshotWriter(; name, output_file, variables, interval, overwrite_exis
 end
 
 """
-    CheckpointWriter(; interval, overwrite_existing, cleanup)
+    CheckpointWriter(; interval, cleanup)
 
 A JLD2 checkpoint of the coupled model's prognostic state, on a `TimeInterval` schedule.
 
@@ -304,14 +304,19 @@ docstring's warning that objects containing functions cannot be serialized does 
 `ForcingFromFile`, its `FieldTimeSeries` backend and the `FreshwaterExchange` in the tracer top
 boundary conditions are all outside that state. CATKE's diffusivities and its `e` tracer are inside
 it, which is why a checkpoint is a few hundred MB on a real grid and why `cleanup` exists.
+
+`cleanup` is the field that decides how many of them survive, since a checkpoint's filename carries
+the iteration and every fire writes a new one: `true` deletes all but the newest after each write.
+There is deliberately no `overwrite_existing` twin of the snapshot writer's. `Checkpointer` accepts
+one, but never reads it — `write_output!` opens `jldopen(path, "w")` regardless — so naming it here
+would advertise a choice the run does not have.
 """
 struct CheckpointWriter <: AbstractWriterConfig
     interval::Float64
-    overwrite_existing::Bool
     cleanup::Bool
 end
 
-function CheckpointWriter(; interval, overwrite_existing, cleanup)
+function CheckpointWriter(; interval, cleanup)
     interval > 0 || throw(
         ArgumentError(
             "A checkpoint writer's `interval` must be positive, got $interval. A setup that wants " *
@@ -319,7 +324,7 @@ function CheckpointWriter(; interval, overwrite_existing, cleanup)
         ),
     )
 
-    return CheckpointWriter(Float64(interval), Bool(overwrite_existing), Bool(cleanup))
+    return CheckpointWriter(Float64(interval), Bool(cleanup))
 end
 
 """
@@ -1080,6 +1085,9 @@ checkpointer in `simulation.output_writers`.
 
 Replaced rather than closed and popped, unlike the snapshot writer: a `Checkpointer` holds no open
 file handle, and its schedule is rebuilt with it.
+
+`Checkpointer`'s `overwrite_existing` is left at its default, since it is a field the writer stores
+and never reads — see `CheckpointWriter`.
 """
 function attach_writer!(simulation, writer::CheckpointWriter, config::AbstractSimulationConfig, loop)
     simulation.output_writers[:checkpointer] = Checkpointer(
@@ -1087,7 +1095,6 @@ function attach_writer!(simulation, writer::CheckpointWriter, config::AbstractSi
         schedule = TimeInterval(writer.interval),
         dir = config.results_root,
         prefix = checkpoint_prefix(loop),
-        overwrite_existing = writer.overwrite_existing,
         cleanup = writer.cleanup,
     )
 

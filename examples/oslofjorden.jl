@@ -279,7 +279,7 @@ FjordConfig(
                 interval           = 1hour,
                 overwrite_existing = true,
             ),
-            CheckpointWriter(interval = 30days, overwrite_existing = true, cleanup = true),
+            CheckpointWriter(interval = 30days, cleanup = true),
         ),
         time_stepping = AdaptiveTimeStep(
             initial_time_step    = 1second,

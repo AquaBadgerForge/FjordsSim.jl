@@ -1072,7 +1072,9 @@ modules, in `include` order from `src/FjordSim.jl`:
     not find — the checkpoints of the one before it. Three things follow, and each fails silently.
     Checkpoints are shared per `results_root`, so there is **one resumable run per results directory**:
     a second launch overwrites the first's (`Checkpointer.write_output!` opens `jldopen(path, "w")`
-    whatever `overwrite_existing` says, and `cleanup = true` prunes the rest). A `pickup` therefore
+    whatever `overwrite_existing` says — which is why `CheckpointWriter` does not name that keyword at
+    all, `Checkpointer` storing it and never reading it — and `cleanup = true` prunes the rest,
+    a filename carrying the iteration meaning every fire writes a new file). A `pickup` therefore
     resumes whatever state is there, even one written under a different `start_date`. And the snapshots
     *are* per launch, so a resumed run's file starts at the resume point and the records before it stay
     in the previous launch's file — which is why the snapshot `attach_writer!` does not suppress

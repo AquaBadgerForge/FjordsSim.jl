@@ -164,7 +164,7 @@ function oslofjorden()
                     interval           = 1hour,
                     overwrite_existing = true,
                 ),
-                CheckpointWriter(interval = 30days, overwrite_existing = true, cleanup = true),
+                CheckpointWriter(interval = 30days, cleanup = true),
             ),
             # Overloads attach_callback! — what the run reports while it runs. `report` is the
             # function itself, so a model whose tracers omit :T (which `progress` reads) names its
@@ -190,7 +190,7 @@ function oslofjorden()
             # spacing bound. That is what lets the window be a round year instead of being pinned
             # to whichever instant the forcing happened to start at.
             start_date         = DateTime(2020, 1, 1),
-            stop_time          = 60days,  # 366days,
+            stop_time          = 366days,
             # One pass. Raise it to spin the deep basins up on the same forcing year, carrying the
             # state over; each repetition writes its own `_loopNN` file.
             loops              = 1,
