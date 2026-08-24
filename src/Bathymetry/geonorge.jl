@@ -80,6 +80,22 @@ across fjords.
   A floor alone is not enough, and on its own makes a second problem: lifting a sliver to a
   constant depth in much deeper water leaves a shallow *spike*, which destabilizes its neighbours
   the same way. Pair it with `spike_ratio`.
+- `max_island_cells`: `fill_small_islands` threshold — every 4-connected patch of land of at most
+  this many cells that does not touch the domain edge is flooded to the mean depth of the sea
+  around it. `0` disables the stage, leaving the single-cell case `fill_isolated_land_cells`
+  already handles as the only one treated.
+
+  This is the dual of `close_narrow_passages`: an unresolved *land* island instead of an unresolved
+  water channel, closing the same kind of circulation loop. Flow splits around the rock and the head
+  difference between its two ends drives a loop whose arms are each a few cells wide. On
+  `oslofjorden` the domain velocity maximum — 2.67 m s⁻¹, near uniform over the whole water column —
+  sat on the circulation around a three-cell, one-cell-wide island at i = 83, j = 104-106, and 46 of
+  that bathymetry's 85 land components are interior clusters of 2 to 6 cells, 153 cells in all.
+  Neither `spike_ratio` nor `max_slope_factor` sees them, for the same reason neither sees a narrow
+  passage: the defect is geometry, not depth contrast.
+
+  A patch touching the domain edge is kept whatever its size, since land continuing outside the
+  domain may have only a few cells inside it.
 - `close_narrow_passages`: Run `remove_narrow_passages`, which turns every one-cell-wide sea passage
   whose removal leaves both of its sides connected into land. `false` disables the stage.
 
@@ -97,6 +113,24 @@ across fjords.
 - `spike_ratio`: `fill_shallow_spikes` threshold — a sea cell shallower than this fraction of its
   neighbours' median depth is replaced by that median. `0.0` disables despiking. This is what
   removes the interpolation spikes, and the ones `minimum_depth` itself creates.
+- `minimum_cell_fraction`: `snap_partial_bottom_cells` threshold, and it must equal the
+  `minimum_fractional_cell_height` the grid gives `PartialCellBottom` — `0.2`, Oceananigans'
+  default, for the grids `Grids.jl` builds. `0.0` disables the stage.
+
+  Where a sounding lies just below a vertical face, `PartialCellBottom` will not make the bottom
+  cell thinner than that fraction of its layer: it pushes the bottom *down* instead, so the column
+  ends somewhere the sounding never was and the cell holds a fraction of the water its neighbours
+  do. Any tracer flux into such a cell moves its concentration violently, and because it reaches
+  into a layer its neighbours may not reach at all it can be nearly cut off horizontally too. This
+  stage raises the sounding to the face above instead, ending the column one layer higher.
+
+  On `oslofjorden` this was the worst remaining defect and it sat on the *open southern boundary*:
+  soundings of 51.3 m and 54.5 m against a layer spanning 50 to 75 m, floored to fractions of 0.052
+  and 0.179, with one and two lateral neighbours because the columns beside them stop a layer
+  higher. Salinity there ran from 33 to 65 psu and temperature from 5 to 28 °C in four and a half
+  days while the boundary file asked for 33.2 psu and 8.1 °C. Refining `z_faces` does not help —
+  a finer grid gives the seabed more faces to cross, and the count of laterally isolated bottom
+  cells rises rather than falls.
 - `max_slope_factor`: `limit_bottom_slope` limit on the Beckmann–Haidvogel slope parameter
   `r = |d₁ - d₂| / (d₁ + d₂)` between adjacent sea cells. `0.0` disables slope limiting. Despiking
   handles the one-cell artifacts; this bounds what is left, including real topography. Lower is
@@ -125,8 +159,10 @@ Base.@kwdef mutable struct DybdedataConfig <: AbstractBathymetryConfig
     interpolation_passes::Int = 1
     major_basins::Int = 1
     minimum_depth::Float64 = 0.0
+    max_island_cells::Int = 0
     close_narrow_passages::Bool = false
     spike_ratio::Float64 = 0.0
+    minimum_cell_fraction::Float64 = 0.0
     max_slope_factor::Float64 = 0.0
     geonorge_cache::Bool = true
     regrid_cache::Bool = true
@@ -174,8 +210,10 @@ The `smooth_bathymetry_gaps!` options this setup configures.
 `limit_bottom_slope` must not undo the floor while flattening a slope.
 """
 smoothing_options(config::DybdedataConfig) = (;
+    max_island_cells = config.max_island_cells,
     close_narrow_passages = config.close_narrow_passages,
     spike_ratio = config.spike_ratio,
+    minimum_cell_fraction = config.minimum_cell_fraction,
     max_slope_factor = config.max_slope_factor,
     minimum_depth = config.minimum_depth,
 )

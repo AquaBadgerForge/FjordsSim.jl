@@ -20,7 +20,13 @@ using Oceananigans.BoundaryConditions:
 using Oceananigans.Units: Time
 using Oceananigans.Fields: ZeroField
 using Oceananigans.Grids: column_depthᶜᶠᵃ, column_depthᶠᶜᵃ
-using NumericalEarth.Oceans: u_quadratic_bottom_drag, v_quadratic_bottom_drag, build_tracer_top_bc
+using Oceananigans.ImmersedBoundaries: ImmersedBoundaryCondition
+using NumericalEarth.Oceans:
+    u_quadratic_bottom_drag,
+    v_quadratic_bottom_drag,
+    u_immersed_bottom_drag,
+    v_immersed_bottom_drag,
+    build_tracer_top_bc
 using ..Configs: AbstractBoundaryConditionConfig, AbstractBoundaryConditionSetConfig, open_edges
 using ..Forcing: LATERAL_EDGES
 using ..Utils: recursive_merge
@@ -66,9 +72,21 @@ end
 
 Quadratic drag on `u` and `v` at the bottom, at the given dimensionless drag `coefficient`.
 
-Needs neither the grid nor the forcing — `u_quadratic_bottom_drag` and `v_quadratic_bottom_drag` are
-discrete-form functions taking the coefficient as their parameter — which is exactly why it is
-separable from the surface half.
+Needs neither the grid nor the forcing — all four of `u_quadratic_bottom_drag`,
+`v_quadratic_bottom_drag`, `u_immersed_bottom_drag` and `v_immersed_bottom_drag` are discrete-form
+functions taking the coefficient as their parameter — which is exactly why it is separable from the
+surface half.
+
+**Both halves are required, and the `bottom` one alone does nothing on a fjord.** A `bottom` condition
+acts at the *underlying* grid's floor, and `u_quadratic_bottom_drag` hardcodes that level's index,
+reading `Φ.u[i, j, 1]`. On an `ImmersedBoundaryGrid` whose deepest column stops short of `k = 1` —
+which every one of these setups is, `z_faces` reaching well below the deepest sounding so no column is
+clipped — that cell is immersed in the entire domain and the flux is discarded. The seabed the fjord
+actually has is the *immersed* boundary, and it takes an `ImmersedBoundaryCondition` to put a stress
+on it; without one, Oceananigans' default there is free slip and the water column slides over the bed.
+
+Only `bottom` inside the `ImmersedBoundaryCondition`, matching what NumericalEarth's own
+`ocean_simulation` builds: immersed side walls stay free-slip, which is a separate choice.
 """
 quadratic_bottom_drag_boundary_conditions(coefficient) = (
     u = (
@@ -77,12 +95,26 @@ quadratic_bottom_drag_boundary_conditions(coefficient) = (
             discrete_form = true,
             parameters = coefficient,
         ),
+        immersed = ImmersedBoundaryCondition(
+            bottom = FluxBoundaryCondition(
+                u_immersed_bottom_drag,
+                discrete_form = true,
+                parameters = coefficient,
+            ),
+        ),
     ),
     v = (
         bottom = FluxBoundaryCondition(
             v_quadratic_bottom_drag,
             discrete_form = true,
             parameters = coefficient,
+        ),
+        immersed = ImmersedBoundaryCondition(
+            bottom = FluxBoundaryCondition(
+                v_immersed_bottom_drag,
+                discrete_form = true,
+                parameters = coefficient,
+            ),
         ),
     ),
 )
@@ -434,6 +466,9 @@ Quadratic drag on `u` and `v` at the bottom.
 
 `coefficient` is the dimensionless drag coefficient the discrete-form drag functions take as their
 parameter.
+
+Contributes a condition on the *immersed* seabed as well as on the underlying grid's floor, which is
+what makes it act at all on a fjord — see `quadratic_bottom_drag_boundary_conditions`.
 """
 Base.@kwdef struct QuadraticBottomDrag <: AbstractBoundaryConditionConfig
     coefficient::Float64

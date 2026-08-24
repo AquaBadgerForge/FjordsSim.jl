@@ -198,17 +198,29 @@ modules, in `include` order from `src/FjordSim.jl`:
    with `smoothing_options(config)` → `write_bathymetry_file`. The core also owns the smoothing
    kernels and the `center_coordinates`/`expand_domain`/`vertical_faces` domain helpers.
 
-   `smooth_bathymetry_gaps!` runs four stages. The topological cleanup every source gets
-   (diagonal-pair fills, isolated sea/land cells), then three stages a source opts into through
-   `smoothing_options`, each skipped when its parameter is `false` or zero:
-   `remove_narrow_passages`, `fill_shallow_spikes` and `limit_bottom_slope`.
+   `smooth_bathymetry_gaps!` runs six stages. The topological cleanup every source gets
+   (diagonal-pair fills, isolated sea/land cells), then five stages a source opts into through
+   `smoothing_options`, each skipped when its parameter is `false` or zero: `fill_small_islands`,
+   `remove_narrow_passages`, `fill_shallow_spikes`, `snap_partial_bottom_cells` and
+   `limit_bottom_slope`.
 
    The order is forced. The topological pass first, because checkerboard noise would skew the
-   neighbour medians. Then `remove_narrow_passages`, because it is the only stage that changes the
-   *land mask*: run after either of the others, the cells it is about to turn into land would already
-   have contributed to a neighbour median and to a slope pair. Then despiking before slope limiting,
-   because a spike is exactly the one-cell feature slope limiting would smear into its neighbours
-   instead of removing.
+   neighbour medians. Then the two stages that change the *land mask*, before the two that change
+   depths: run the other way round, the cells they are about to turn into land or water would already
+   have contributed to a neighbour median and to a slope pair. Of those two, `fill_small_islands`
+   runs first — flooding an island only widens water and so can never create a passage, while closing
+   a passage adds land exactly where a spurious loop closes, which is where these islands live, and
+   can bridge one to the mainland where the size test will never see it again. Then despiking before
+   slope limiting, because a spike is exactly the one-cell feature slope limiting would smear into
+   its neighbours instead of removing. `snap_partial_bottom_cells` goes between those two — after
+   despiking, which moves a cell to its neighbours' median depth without regard for where the
+   vertical faces are, and before slope limiting, which should keep the last word on smoothness. That
+   choice costs a few re-created slivers (178 of 9907 on `oslofjorden`, none on the open boundary);
+   snapping last instead removes every one but pushes the steepest slope parameter from 0.500 to
+   0.560, undoing the limit the stage before it just enforced.
+
+   Unlike a passage closure, a flood leaves no stub and so needs no cleanup rounds after it: every
+   neighbour of a flooded component is sea by maximality, so no flooded cell borders land.
 
    `fill_shallow_spikes` and `limit_bottom_slope` exist because `PartialCellBottom` bounds how *thin*
    a cell may be but says nothing about
@@ -262,6 +274,111 @@ modules, in `include` order from `src/FjordSim.jl`:
    `wet_component` is the flood fill it tests with, hand-rolled rather than
    `ImageMorphology.label_components` (which `NumericalEarth.remove_minor_basins!` uses): that package
    reaches FjordSim only transitively, and one breadth-first walk is all this needs.
+
+   ### `fill_small_islands`
+
+   The dual of the stage above, and the one the *land* mask needs. `remove_narrow_passages` bounds
+   the width of a water channel; this bounds the size of a land obstruction, which closes the same
+   kind of loop with the phases swapped. Flow splits around a rock a few cells across, so the head
+   difference between its two ends is worked out around a closed loop whose arms are each a handful
+   of cells wide. Nothing about the flow such an island obstructs is resolved by one cell of it, so
+   keeping it buys no fidelity.
+
+   It floods every 4-connected patch of land of at most `max_island_cells` cells that does not touch
+   the domain edge, setting the whole patch to the mean depth of the sea orthogonally adjacent to it.
+
+   On `oslofjorden` this was the domain's velocity maximum: 2.67 m s⁻¹, near uniform over the water
+   column (2.28 m s⁻¹ at k = 18 falling to 1.35 at k = 14), circulating around a **three-cell,
+   one-cell-wide island** at i = 83, j = 104–106 — 10.485°E, 59.184°N, near Horten. A six-cell
+   one-cell-wide ridge sits beside it at i = 84–86, j = 99–102 and forms the same pinch. Of that
+   bathymetry's 85 land components, 46 are interior clusters of 2 to 6 cells, 153 cells in all, and
+   60 are of 10 cells or fewer. `max_island_cells = 6` takes all 46.
+
+   Four things about the stage are load-bearing.
+
+   **`fill_isolated_land_cells` is its `max_cells = 1` case**, and cannot be stretched to cover the
+   rest: it needs a land cell's four neighbours all wet, and every cell of a three-cell ridge has a
+   land neighbour, so it fires on none of them. Neither `fill_shallow_spikes` nor `limit_bottom_slope`
+   sees them either, for the same reason neither sees a narrow passage — both bound depth *contrast*,
+   and an island agrees with its surroundings. It is its *presence* that is wrong.
+
+   **A component touching the domain edge is kept**, whatever its size, because land continuing
+   outside the domain may have only a few cells inside it and flooding those would open the domain
+   into water that is not there. This is the component-wise form of the `2:Nx-1, 2:Ny-1` bound the
+   single-cell stages use.
+
+   **The patch gets one flat depth.** A cell in the middle of a 2x3 patch has no sea neighbour of its
+   own, and a flat floor over a patch this small is what slope limiting would produce anyway. A sea
+   cell touching the patch on two sides contributes twice, which weights the mean by contact length.
+   For a single cell the value is exactly what `fill_isolated_land_cells` computes.
+
+   **No cleanup pass follows, and none is needed.** Every neighbour of a flooded component is sea by
+   maximality — a land neighbour would be part of the component — so no flooded cell borders land and
+   neither isolated-cell stage has anything new to fire on. Flooding cannot manufacture a narrow
+   passage either: it only turns land into sea, so the land-neighbour count of any sea cell can only
+   fall, and the passage predicate needs it to rise. Measured on the `oslofjorden` field, flooding at
+   `max_island_cells = 6` leaves the one-cell passage count unchanged at 18.
+
+   The order matters concretely here: applied *after* the two depth stages the flood leaves
+   `max r = 0.70` and two new spikes, where in its actual position `fill_shallow_spikes` and
+   `limit_bottom_slope` clean up behind it.
+
+   `land_component!` is the walk it uses, the land counterpart of `wet_component` and deliberately a
+   second function rather than a predicate parameter on the first. That one answers a connectivity
+   question about a single candidate, takes a `blocked` cell for it and returns a full-domain mask;
+   this one is swept over the whole field, so it needs a `visited` buffer shared across components —
+   what makes the sweep walk every land cell exactly once — and the membership list itself, which is
+   what the caller measures against the threshold. Generalising `wet_component` to take an external
+   buffer *and* a predicate *and* return a vector would leave nothing of it.
+
+   ### `snap_partial_bottom_cells`
+
+   The one stage that knows about the *vertical* grid, and the fix for the worst defect the open
+   boundary had.
+
+   `PartialCellBottom` will not make a bottom cell thinner than `minimum_fractional_cell_height`
+   times its layer — its kernel takes `min(z⁺ - ϵ Δz, zb)`, pushing the bottom *down* until the cell
+   is exactly that thick. So a sounding lying just below a face does not produce a thin cell; it
+   produces a cell of exactly `ϵ Δz` whose floor is somewhere the sounding never was. This stage
+   moves the bottom the other way, up to the face, ending the column one layer higher and leaving
+   every surviving bottom cell a full one. `minimum_cell_fraction` must be the *same* number the grid
+   hands `PartialCellBottom` — 0.2, Oceananigans' default, for the grids `Grids.jl` builds.
+
+   Such a cell is dangerous out of proportion to its size, and for **tracers** rather than for
+   momentum, which is what distinguishes it from the `minimum_depth` sliver problem. It holds a
+   fraction of the water its neighbours do, so any flux into it moves its concentration a long way;
+   and because it reaches into a layer its neighbours may not reach at all, it can be nearly cut off
+   horizontally too.
+
+   On `oslofjorden`, after the islands were flooded, this was the domain's remaining pathology and it
+   sat on the **open southern boundary**. Soundings of 51.3 m and 54.5 m at i = 38–39, j = 1–2 against
+   a layer spanning −75 to −50 m, floored to fractional heights of 0.052 and 0.179, with one and two
+   lateral neighbours at their own level because the columns beside them (44.1 m, 48.5 m) stop a whole
+   layer higher. Salinity there climbed 33 → 65 psu and temperature 5 → 28 °C over four and a half
+   days, while the prepared boundary file was asking for 33.2 psu and 8.1 °C and the cell was
+   inflowing 70% of the time — so the nudging was active the whole way and simply could not keep up.
+   Domain-wide the tracer overshoots were six times over-represented in bottom cells with at most one
+   lateral neighbour (25% of offenders against 4% of columns).
+
+   Three things about it are load-bearing.
+
+   **Refining `z_faces` is not the fix**, though it is the obvious guess. A finer vertical grid gives
+   the seabed more faces to cross, so laterally isolated bottom cells become *more* common, not less —
+   measured, 165 on the 18-level grid against 235 to 280 on stretched 20 to 24-level ones. It is the
+   sliver that has to go, not the layer that has to shrink. (The vertical grid is still poorly
+   allocated on its own terms — k = 1 and k = 2 are never wet against a deepest sounding of 395.1 m,
+   and 55% of columns are shallower than 50 m — but that is a separate argument.)
+
+   **It snaps up, not down.** Down is what the model already does silently, by up to 3.7 m at the
+   cells above, and it keeps the sliver. Up ends the column at a face, which also rejoins it to the
+   level its neighbours are already on: the three runaway columns all land on exactly 50.0 m, where
+   the 44.1 m and 48.5 m columns beside them already were. The price is water volume — 0.95% of the
+   domain, median 1.85 m per affected column, 10 m at worst in the 50 m layers where 1% of columns
+   live.
+
+   **Two guards keep it total.** A column is left alone when the face above is the surface, or when
+   snapping to it would breach `minimum_depth`, so the stage can never dry a cell out or undercut the
+   floor; such a column keeps its sliver and is floored as before. On `oslofjorden` neither fires.
 
    `geonorge.jl` holds `DybdedataConfig <: AbstractBathymetryConfig` and the Geonorge Sjøkart
    Dybdedata implementation of the two hooks: derive the native region from the target grid
@@ -661,6 +778,34 @@ modules, in `include` order from `src/FjordSim.jl`:
    `TopBottomFluxes`, fused behind `top_bottom_boundary_conditions` — but they share no computation,
    and swapping a drag law should not mean restating the surface. `top_bottom_boundary_conditions`
    remains as the one-line merge of both, which is the shape the tests assert against.
+
+   ### `QuadraticBottomDrag` needs both halves
+
+   The drag contributes **two** conditions per velocity component: a `bottom` one and an `immersed`
+   one, an `ImmersedBoundaryCondition` wrapping `u_immersed_bottom_drag`. The second is the one that
+   does anything on a fjord, and the config produced no drag at all until it was added.
+
+   A `bottom` condition acts at the *underlying* grid's floor, and `u_quadratic_bottom_drag` hardcodes
+   that level's index — it reads `Φ.u[i, j, 1]`. These setups give `z_faces` a deepest face well below
+   the deepest sounding so no column is clipped, which means level `k = 1` is immersed across the whole
+   domain and the flux is discarded: on `oslofjorden` the deepest of 43 398 wet columns is 395.1 m
+   against a floor at −450 m, so not one cell of `k = 1` is wet. The seabed a fjord actually has is the
+   *immersed* boundary, where Oceananigans' default is free slip.
+
+   The symptom was a domain with **no momentum sink below the surface**. Barotropic circulation had
+   nothing to spin it down: a closed circulation around a one-cell-wide land ridge near Horten
+   (i = 83, j = 104:106) ratcheted from 0 to 2957 m² s⁻¹ over four simulated days without once
+   changing sign, driving a depth-uniform 2.84 m s⁻¹ jet through the two-cell channel beside it and
+   collapsing the adaptive time step from 15.5 s to 3.1 s. It kept accelerating after the storm that
+   started it had passed — the wind was down to 2.4 m s⁻¹ and the pressure back to 1025 hPa when the
+   jet peaked — which is what distinguished it from the wind-driven hotspots elsewhere in the domain,
+   all of which decayed. With drag acting, the spin-down time there is H/(C_d·u) ≈ 22 minutes.
+
+   NumericalEarth's own `ocean_simulation` builds both halves
+   (`Oceans/ocean_simulation.jl`), but `coupled_simulation` assembles `HydrostaticFreeSurfaceModel`
+   directly and so inherits neither — which is why this had to be stated here. Only `bottom` goes
+   inside the `ImmersedBoundaryCondition`, matching NumericalEarth: immersed *side* walls stay
+   free-slip, which is a separate choice and a separate change.
 
    ### `OpenLateralBoundaryFromData`
 
@@ -1223,7 +1368,7 @@ Bathymetry — `AbstractBathymetryConfig`, consumed by `prepare_bathymetry`:
 |---|---|---|
 | `bathymetry_dataset(target_grid, config)` → NumericalEarth dataset | yes | none |
 | `regrid_options(config)` → NamedTuple for `regrid_bathymetry` | no | `(;)` |
-| `smoothing_options(config)` → NamedTuple for `smooth_bathymetry_gaps!` — `close_narrow_passages`, `spike_ratio`, `max_slope_factor`, `minimum_depth` | no | `(;)`, leaving only the topological cleanup |
+| `smoothing_options(config)` → NamedTuple for `smooth_bathymetry_gaps!` — `max_island_cells`, `close_narrow_passages`, `spike_ratio`, `minimum_cell_fraction`, `max_slope_factor`, `minimum_depth` | no | `(;)`, leaving only the topological cleanup |
 
 Forcing — `AbstractForcingConfig`, consumed by `prepare_forcing`:
 

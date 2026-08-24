@@ -205,6 +205,17 @@ include("utilities.jl")
                 @test !isnothing(getproperty(boundary_conditions, name).top)
             end
 
+            # Each velocity also gets a stress on the *immersed* seabed, which is the half that
+            # actually acts on a fjord: a `bottom` condition applies at the underlying grid's floor,
+            # and `u_quadratic_bottom_drag` reads `Φ.u[i, j, 1]` there. This fixture is itself a case
+            # in point — its bottom sits at -10 m with faces at -20, -10 and 0, so level k = 1 is
+            # immersed and the `bottom` condition alone would put drag nowhere at all.
+            for name in (:u, :v)
+                immersed = getproperty(boundary_conditions, name).immersed
+                @test immersed isa ImmersedBoundaryCondition
+                @test !isnothing(immersed.bottom)
+            end
+
             # The tracer top conditions must carry a freshwater exchange NumericalEarth can read back
             # out of them: `net_fluxes` pulls the volume flux and its heat content straight from the
             # boundary condition, so a bare FluxBoundaryCondition raises a MethodError as soon as the
@@ -380,13 +391,13 @@ include("utilities.jl")
                 QuadraticBottomDrag(coefficient = 0.003), grid, forcing, boundaries_config, (:T, :S),
             )
             @test Set(keys(drag)) == Set((:u, :v))
-            @test keys(drag.u) == (:bottom,)
+            @test Set(keys(drag.u)) == Set((:bottom, :immersed))
 
             # Together they are still exactly what `top_bottom_boundary_conditions` returns, which
             # is what the "boundary condition signatures" testset asserts the shape of.
             both = FjordSim.recursive_merge(surface, drag)
             @test Set(keys(both)) == Set((:u, :v, :T, :S))
-            @test Set(keys(both.u)) == Set((:top, :bottom))
+            @test Set(keys(both.u)) == Set((:top, :bottom, :immersed))
             @test keys(both.T) == (:top,)
 
             # The open edge merges four groups into one contribution — normal velocity, tangential
@@ -1404,6 +1415,95 @@ end
         ]
         @test remove_narrow_passages(wide) == wide
 
+        fill_small_islands = FjordSim.Bathymetry.fill_small_islands
+
+        # The dual of the canal: a three-cell, one-cell-wide *island* in mid-channel, the geometry
+        # that carried the Oslofjord domain velocity maximum. Flow splits around it and closes a loop
+        # just as a one-cell passage does, and one cell resolves nothing about that flow.
+        # `fill_isolated_land_cells` cannot take it — every cell of it has a land neighbour, so none
+        # has the four wet ones that stage needs.
+        island = [
+            -9.0 -9.0 -9.0 -9.0 -9.0 -9.0 -9.0
+            -9.0 -9.0 -9.0 -9.0 -9.0 -9.0 -9.0
+            -9.0 -9.0 -9.0  0.0 -9.0 -9.0 -9.0
+            -9.0 -9.0 -9.0  0.0 -9.0 -9.0 -9.0
+            -9.0 -9.0 -9.0  0.0 -9.0 -9.0 -9.0
+            -9.0 -9.0 -9.0 -9.0 -9.0 -9.0 -9.0
+            -9.0 -9.0 -9.0 -9.0 -9.0 -9.0 -9.0
+        ]
+        @test fill_isolated_land_cells(island) == island
+        @test fill_small_islands(island; max_cells = 3) == fill(-9.0, 7, 7)
+
+        # The threshold is a hard one, and `0` — the default — disables the stage outright.
+        @test fill_small_islands(island; max_cells = 2) == island
+        @test fill_small_islands(island; max_cells = 0) == island
+
+        # The patch takes one depth, the mean over the sea cells around it. For a single cell that is
+        # exactly what `fill_isolated_land_cells` computes, which is the sense in which this stage
+        # generalizes it from one cell to `max_cells`.
+        uneven = [
+            -2.0 -4.0 -2.0
+            -6.0  0.0 -8.0
+            -2.0 -4.0 -2.0
+        ]
+        @test fill_small_islands(uneven; max_cells = 1)[2, 2] == -5.5  # mean(-4, -6, -8, -4)
+        @test fill_small_islands(uneven; max_cells = 1) == fill_isolated_land_cells(uneven)
+
+        # Size is measured per component: the three-cell island goes and the six-cell reef beside it
+        # stays. And the result needs no cleanup pass — every neighbour of a flooded patch is sea, so
+        # nothing new is isolated either way.
+        reef = [
+            -9.0 -9.0 -9.0 -9.0 -9.0 -9.0 -9.0
+            -9.0  0.0 -9.0 -9.0  0.0  0.0 -9.0
+            -9.0  0.0 -9.0 -9.0  0.0  0.0 -9.0
+            -9.0  0.0 -9.0 -9.0  0.0  0.0 -9.0
+            -9.0 -9.0 -9.0 -9.0 -9.0 -9.0 -9.0
+        ]
+        patched = fill_small_islands(reef; max_cells = 3)
+        @test all(<(0), patched[:, 2])                # the three-cell island is flooded
+        @test patched[2:4, 5:6] == reef[2:4, 5:6]     # the six-cell reef is kept whole
+        @test count(>=(0), patched) == 6
+        @test fill_isolated_land_cells(remove_isolated_sea_cells(patched)) == patched
+
+        # A patch of the very same size on the domain edge is kept whatever the threshold: land that
+        # continues outside the domain can have only a few cells inside it, and flooding them would
+        # open the domain into water that is not there.
+        shore = [
+             0.0  0.0 -9.0 -9.0 -9.0
+             0.0 -9.0 -9.0 -9.0 -9.0
+            -9.0 -9.0 -9.0 -9.0 -9.0
+        ]
+        @test fill_small_islands(shore; max_cells = 10) == shore
+
+        snap_partial_bottom_cells = FjordSim.Bathymetry.snap_partial_bottom_cells
+
+        # `PartialCellBottom` will not make a bottom cell thinner than `minimum_cell_fraction` of its
+        # layer; it pushes the bottom *down* until the cell is that thick, so a sounding just below a
+        # face gives a cell whose floor is somewhere the sounding never was, holding a fraction of the
+        # water its neighbours hold. This stage moves the bottom up to the face instead, ending the
+        # column a layer higher. These faces are the 25 m layer that produced the Oslofjord runaway.
+        faces = [-100.0, -75.0, -50.0, -25.0, -10.0, 0.0]
+        soundings = [-51.31 -54.49 -57.72 -44.05]
+        snapped = snap_partial_bottom_cells(soundings, faces; minimum_cell_fraction = 0.2)
+        @test snapped[1] == -50.0   # fraction 0.052, raised to the face
+        @test snapped[2] == -50.0   # fraction 0.180, raised
+        @test snapped[3] == -57.72  # fraction 0.309, left alone
+        @test snapped[4] == -44.05  # fraction 0.762, left alone
+
+        # Land is never touched, and `0` disables the stage.
+        mixed = [-51.31 0.0 5.0]
+        @test snap_partial_bottom_cells(mixed, faces; minimum_cell_fraction = 0.2)[2:3] == [0.0, 5.0]
+        @test snap_partial_bottom_cells(soundings, faces; minimum_cell_fraction = 0.0) == soundings
+
+        # Two guards, so the stage can never dry a cell out or undercut the depth floor. A sliver in
+        # the topmost layer would snap to z = 0, and one in the layer above `minimum_depth` would snap
+        # through it; both keep their sliver instead and are floored by `PartialCellBottom` as before.
+        guarded = [-1.5 -26.0]
+        @test snap_partial_bottom_cells(guarded, faces; minimum_cell_fraction = 0.2) == [-1.5 -25.0]
+        @test snap_partial_bottom_cells(
+            guarded, faces; minimum_cell_fraction = 0.2, minimum_depth = 30.0,
+        ) == guarded
+
         fill_shallow_spikes = FjordSim.Bathymetry.fill_shallow_spikes
         limit_bottom_slope = FjordSim.Bathymetry.limit_bottom_slope
 
@@ -1466,19 +1566,25 @@ end
         # here rather than on the built-in setups', whose numbers are a per-fjord choice.
         smoothing_options = FjordSim.Bathymetry.smoothing_options
         @test smoothing_options(test_bathymetry_config()) == (
+            max_island_cells = 0,
             close_narrow_passages = false,
             spike_ratio = 0.0,
+            minimum_cell_fraction = 0.0,
             max_slope_factor = 0.0,
             minimum_depth = 0.0,
         )
         @test smoothing_options(test_bathymetry_config(
+            max_island_cells = 6,
             close_narrow_passages = true,
             spike_ratio = 0.5,
+            minimum_cell_fraction = 0.2,
             max_slope_factor = 0.4,
             minimum_depth = 2.0,
         )) == (
+            max_island_cells = 6,
             close_narrow_passages = true,
             spike_ratio = 0.5,
+            minimum_cell_fraction = 0.2,
             max_slope_factor = 0.4,
             minimum_depth = 2.0,
         )
@@ -1542,6 +1648,20 @@ end
         )
         open_canal = Array(interior(canal_field, :, :, 1))
         @test open_canal[4, 4] == -9.0f0  # despiked to its neighbours' depth, still wet
+
+        # The island stage is wired in and is opt-in the same way. Left at its default the whole
+        # pipeline leaves the island standing, which is what keeps every source that configures
+        # nothing unchanged: the topological cleanup cannot take it, because
+        # `fill_isolated_land_cells` only ever fires on a single cell.
+        island_field = Field{Center, Center, Nothing}(canal_grid)
+
+        set!(island_field, Float32.(island))
+        FjordSim.Bathymetry.smooth_bathymetry_gaps!(island_field)
+        @test Array(interior(island_field, :, :, 1)) == Float32.(island)
+
+        set!(island_field, Float32.(island))
+        FjordSim.Bathymetry.smooth_bathymetry_gaps!(island_field; max_island_cells = 3)
+        @test all(<(0), Array(interior(island_field, :, :, 1)))
     end
 
     @testset "point sampling" begin

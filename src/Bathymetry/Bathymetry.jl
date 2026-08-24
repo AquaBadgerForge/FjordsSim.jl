@@ -193,36 +193,55 @@ function write_bathymetry_file(filepath::String, target_grid, bottom_height)
 end
 
 """
-    smooth_bathymetry_gaps!(bottom_height; close_narrow_passages = false, spike_ratio = 0,
-                            max_slope_factor = 0, minimum_depth = 0)
+    smooth_bathymetry_gaps!(bottom_height; max_island_cells = 0, close_narrow_passages = false,
+                            spike_ratio = 0, minimum_cell_fraction = 0, max_slope_factor = 0,
+                            minimum_depth = 0)
 
-Clean up the regridded bathymetry in place, in four stages.
+Clean up the regridded bathymetry in place, in six stages.
 
 First the topological pass every source gets: one diagonal-pair fill, then
 `BATHYMETRY_GAP_FILL_PASSES` rounds of isolated sea/land cell cleanup, following the fixed cleanup
 used for the Oslofjord ROMS-based bathymetry. This removes the checkerboard noise that would
-otherwise skew the neighbor medians the next stage takes.
+otherwise skew the neighbor medians a later stage takes.
 
-Then three optional stages, each skipped when its parameter is `false` or zero so a source that
-configures none keeps exactly the behavior above: `remove_narrow_passages` with
-`close_narrow_passages`, `fill_shallow_spikes` with `spike_ratio`, and `limit_bottom_slope` with
+Then five optional stages, each skipped when its parameter is `false` or zero so a source that
+configures none keeps exactly the behavior above: `fill_small_islands` with `max_island_cells`,
+`remove_narrow_passages` with `close_narrow_passages`, `fill_shallow_spikes` with `spike_ratio`,
+`snap_partial_bottom_cells` with `minimum_cell_fraction`, and `limit_bottom_slope` with
 `max_slope_factor` and `minimum_depth`.
 
-The order of the three is forced. `remove_narrow_passages` runs first because it is the only stage
-that changes the *land mask*: run after either of the others, the cells it is about to turn into
-land would already have contributed to a neighbor median and to a slope pair. Despiking then
-precedes slope limiting, because a spike is precisely the kind of one-cell feature that slope
-limiting would otherwise smear into its neighbors instead of removing.
+The order of the five is forced. The two stages that change the *land mask* run before the two that
+change depths: run the other way round, the cells they are about to turn into land or water would
+already have contributed to a neighbor median and to a slope pair. Of the two land-mask stages,
+`fill_small_islands` runs first, because flooding an island only ever widens water and so cannot
+create a passage, while closing a passage adds land exactly where a spurious loop closes — which is
+where these islands live — and can bridge one to the mainland, hiding it from the size test for
+good. Despiking then precedes slope limiting, because a spike is precisely the kind of one-cell
+feature that slope limiting would otherwise smear into its neighbors instead of removing.
+
+`snap_partial_bottom_cells` sits between those two: after despiking, which moves a cell to its
+neighbours' median depth with no regard for where the vertical faces are, and *before* slope
+limiting rather than last, because slope limiting is what leaves the field smooth and should keep
+the last word. The cost of that choice is that slope limiting re-creates a few of the slivers the
+snap just removed — on `oslofjorden`, 178 of 9907, none of them on the open boundary. Running the
+snap last instead removes every one but pushes the steepest slope parameter from 0.500 to 0.560,
+silently undoing the limit the stage before it had just enforced, which is the worse trade.
 
 Closing a passage leaves a dead-end stub behind — the cell on the far side of it now has three land
 neighbors — so the isolated-cell cleanup loop runs again afterwards. That loop cannot re-open a
 closed passage: a passage cell has two land neighbors by definition and they stay land, so
 `fill_isolated_land_cells`, which needs all four neighbors wet, can never fire on it.
+
+Flooding an island needs no such cleanup, which is why it has none: every neighbour of a flooded
+component is sea by maximality, so no flooded cell borders land and neither isolated-cell stage has
+anything new to fire on.
 """
 function smooth_bathymetry_gaps!(
     bottom_height;
+    max_island_cells = 0,
     close_narrow_passages = false,
     spike_ratio = 0,
+    minimum_cell_fraction = 0,
     max_slope_factor = 0,
     minimum_depth = 0,
 )
@@ -232,6 +251,12 @@ function smooth_bathymetry_gaps!(
     h = fill_secondary_diagonal_pairs(fill_diagonal_pairs(h))
     for _ = 1:BATHYMETRY_GAP_FILL_PASSES
         h = fill_isolated_land_cells(remove_isolated_sea_cells(h))
+    end
+
+    if max_island_cells > 0
+        wet_before = count(<(0), h)
+        h = fill_small_islands(h; max_cells = max_island_cells)
+        @info "Flooded $(count(<(0), h) - wet_before) cells of interior land islands of $max_island_cells cells or fewer"
     end
 
     if close_narrow_passages
@@ -244,6 +269,14 @@ function smooth_bathymetry_gaps!(
     end
 
     spike_ratio > 0 && (h = fill_shallow_spikes(h; ratio = spike_ratio))
+
+    if minimum_cell_fraction > 0
+        z_faces = vertical_faces(bottom_height.grid)
+        snapped = snap_partial_bottom_cells(h, z_faces; minimum_cell_fraction, minimum_depth)
+        @info "Raised $(count(!=(0), snapped - h)) columns off a bottom cell thinner than $minimum_cell_fraction of its layer"
+        h = snapped
+    end
+
     max_slope_factor > 0 && (h = limit_bottom_slope(h; max_slope_factor, minimum_depth))
 
     set!(bottom_height, h)
@@ -347,6 +380,64 @@ function limit_bottom_slope(
     end
 
     return map((original, d) -> isnan(d) ? original : -d, h, depth)
+end
+
+"""
+    snap_partial_bottom_cells(h, z_faces; minimum_cell_fraction, minimum_depth = 0)
+
+Raise every wet column whose bottom partial cell would be thinner than `minimum_cell_fraction` of
+its layer to the vertical face above, so the sliver is never created.
+
+`PartialCellBottom` refuses to make a bottom cell thinner than `minimum_fractional_cell_height`
+times the layer thickness: its kernel takes `min(z⁺ - ϵ Δz, zb)`, pushing the bottom *down* until
+the cell is exactly that thick. So a sounding lying just below a face does not give a thin cell —
+it gives a cell of exactly `ϵ Δz` whose floor is somewhere the sounding never was. This stage moves
+the bottom the other way instead, up to the face, which ends the column one layer higher and leaves
+every remaining bottom cell a full one. `minimum_cell_fraction` must therefore be the *same* number
+the grid gives `PartialCellBottom` — 0.2, Oceananigans' default, for the grids `Grids.jl` builds.
+
+Such a cell is dangerous out of proportion to its size, and for tracers rather than for momentum.
+It holds a fraction of the water its neighbours do, so any flux into it moves its concentration by a
+large amount, and because it reaches into a layer its neighbours may not reach at all it can be
+nearly cut off horizontally as well. On `oslofjorden` the two worst were at the *open southern
+boundary*: soundings of 51.3 m and 54.5 m against a layer spanning 50 to 75 m, floored to fractions
+of 0.052 and 0.179, with one and two lateral neighbours at their own level because the columns
+beside them (44.1 m, 48.5 m) stop a whole layer higher. Salinity there climbed from 33 to 65 psu and
+temperature from 5 to 28 °C over four and a half days, while the prepared boundary file was asking
+for 33.2 psu and 8.1 °C and the cell was inflowing 70% of the time — the nudging was active
+throughout and simply could not keep up. Across the domain the tracer overshoots were six times
+over-represented in bottom cells with at most one lateral neighbour.
+
+Refining `z_faces` is the obvious alternative and it does not work: a finer grid gives the seabed
+more faces to cross, so the count of laterally isolated bottom cells *rises* — measured, 165 for the
+18-level grid against 235 to 280 for stretched 20 to 24-level ones. It is the sliver that has to go,
+not the layer that has to shrink.
+
+Two guards. A column is left alone when the face above is the surface or when snapping to it would
+breach `minimum_depth`, so the stage never dries a cell out or undercuts the depth floor; such a
+column keeps its sliver and `PartialCellBottom` floors it as before. On `oslofjorden` neither guard
+fires.
+"""
+function snap_partial_bottom_cells(h, z_faces; minimum_cell_fraction, minimum_depth = 0)
+    snapped = copy(h)
+    Nz = length(z_faces) - 1
+    Nx, Ny = size(h)
+
+    for i = 1:Nx, j = 1:Ny
+        h[i, j] < 0 || continue
+
+        layer = findlast(face -> face <= h[i, j], z_faces)
+        (layer === nothing || layer > Nz) && continue
+
+        face_above = z_faces[layer+1]
+        fraction = (face_above - h[i, j]) / (face_above - z_faces[layer])
+        fraction < minimum_cell_fraction || continue
+        (face_above < 0 && -face_above >= minimum_depth) || continue
+
+        snapped[i, j] = oftype(h[i, j], face_above)
+    end
+
+    return snapped
 end
 
 """
@@ -518,6 +609,114 @@ function fill_isolated_land_cells(h)
             if west < 0 && north < 0 && east < 0 && south < 0
                 filled[i, j] = (west + north + east + south) / 4
             end
+        end
+    end
+
+    return filled
+end
+
+"""
+    land_component!(visited, h, seed)
+
+The land cells (`h >= 0`) reachable from `seed` by north/south/east/west steps, as a vector of
+`(i, j)`, marking each of them in `visited`.
+
+The companion of `wet_component` for the other phase, kept separate rather than folded into it:
+that one answers a connectivity question about one candidate cell, takes a `blocked` cell for it
+and returns a full-domain mask, while this one is swept over the whole field. So it needs a
+`visited` buffer shared across components — the thing that makes the sweep walk every land cell
+exactly once, whatever the component count — and the membership list itself, which is what the
+caller fills and measures.
+"""
+function land_component!(visited, h, seed)
+    Nx, Ny = size(h)
+    visited[seed...] = true
+    cells = [seed]
+    stack = [seed]
+
+    while !isempty(stack)
+        i, j = pop!(stack)
+        for (di, dj) in ((1, 0), (-1, 0), (0, 1), (0, -1))
+            ii, jj = i + di, j + dj
+            (1 <= ii <= Nx && 1 <= jj <= Ny) || continue
+            (visited[ii, jj] || h[ii, jj] < 0) && continue
+            visited[ii, jj] = true
+            push!(cells, (ii, jj))
+            push!(stack, (ii, jj))
+        end
+    end
+
+    return cells
+end
+
+"""
+    fill_small_islands(h; max_cells)
+
+Flood every 4-connected patch of land (`h >= 0`) of at most `max_cells` cells that does not touch
+the domain edge, filling all of its cells with the mean depth of the sea around it.
+
+This is the dual of `remove_narrow_passages` — an unresolved *land* island rather than an
+unresolved water channel — and it destabilizes a run the same way. Flow splits around a rock a few
+cells across, so the head difference between its two ends is worked out around a closed loop whose
+arms are each a handful of cells wide: the same loop geometry, drawn by the land instead of by the
+water. Nothing about the flow such an island obstructs is resolved by one cell of it, so keeping it
+buys no fidelity.
+
+On `oslofjorden` the domain's velocity maximum — 2.67 m s⁻¹, near uniform over the whole water
+column — sat on the circulation around a three-cell, one-cell-wide island at i = 83, j = 104-106.
+Of that bathymetry's 85 land components, 46 are interior clusters of 2 to 6 cells, 153 cells in
+all. Neither `fill_shallow_spikes` nor `limit_bottom_slope` can see them, for the same reason
+neither sees a narrow passage: both bound depth *contrast*, and the defect is geometry.
+
+`fill_isolated_land_cells` is the `max_cells = 1` case of this and runs on every source; this
+generalizes it to the clusters that survive it. A three-cell ridge survives because every one of
+its cells has a land neighbour, so none of them has the four wet neighbours that stage needs.
+
+A component touching the domain edge is kept whatever its size, because land continuing outside the
+domain may have only a few cells inside it, and flooding those would open the domain into water
+that is not there. This is the component-wise form of the `2:Nx-1, 2:Ny-1` bound the single-cell
+stages use.
+
+The patch gets one depth, the mean over the sea cells orthogonally adjacent to it: a cell in the
+middle of a 2x3 patch has no sea neighbour of its own, and a flat floor over a patch this small is
+what slope limiting would produce anyway. A sea cell touching the patch on two sides counts twice,
+weighting the mean by contact length. For a single cell this is exactly the value
+`fill_isolated_land_cells` computes.
+
+No cleanup pass is needed afterwards. Every neighbour of a flooded component is sea — a land
+neighbour would by maximality be part of the component — so no flooded cell borders land, and
+neither `remove_isolated_sea_cells` nor `fill_isolated_land_cells` has anything new to fire on.
+Flooding cannot create a one-cell-wide passage either: it only ever turns land into sea, so the
+count of land neighbours of any sea cell can only fall, and the passage predicate needs it to rise.
+"""
+function fill_small_islands(h; max_cells)
+    filled = copy(h)
+    Nx, Ny = size(h)
+    visited = falses(Nx, Ny)
+
+    for i = 1:Nx, j = 1:Ny
+        (h[i, j] >= 0 && !visited[i, j]) || continue
+
+        # Walked in full even when it is far over the limit: stopping early would leave the rest of
+        # the mainland unvisited, and the remainder would then be picked up as small components of
+        # its own and flooded.
+        cells = land_component!(visited, h, (i, j))
+        length(cells) <= max_cells || continue
+        any(cell -> cell[1] in (1, Nx) || cell[2] in (1, Ny), cells) && continue
+
+        depths = eltype(h)[]
+        for (ci, cj) in cells, (di, dj) in ((1, 0), (-1, 0), (0, 1), (0, -1))
+            ii, jj = ci + di, cj + dj
+            (1 <= ii <= Nx && 1 <= jj <= Ny) || continue
+            h[ii, jj] < 0 && push!(depths, h[ii, jj])
+        end
+        # An interior component always has one, since every neighbour of it is in-domain sea; the
+        # guard keeps the helper total for any other input.
+        isempty(depths) && continue
+
+        island_depth = mean(depths)
+        for cell in cells
+            filled[cell...] = island_depth
         end
     end
 
