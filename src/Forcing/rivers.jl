@@ -75,19 +75,52 @@ land on one. Defaults to `config.search_radius`.
 river_search_radius(config::AbstractRiverConfig) = config.search_radius
 
 """
-    coastal_water_mask(target_grid)
+    river_minimum_levels(config)
 
-Surface-level water mask of `target_grid`, as an `(i, j)` matrix. Built from the same `water_mask`
-that `prepare_forcing` uses, so "water" means exactly what it means when the forcing file is written,
-including `PartialCellBottom` cells.
+How many wet levels a column must have before `add_rivers` will put an outlet in it. Defaults to
+`0`, which accepts any water cell and is what the placement did before this hook existed.
+
+Unlike `river_search_radius` just above, the fallback does **not** read a field of the same name.
+That one is essential to placement and every river config has always had to state it; this one is an
+opt-in refinement, so a config written before it existed — or one that simply does not care — must
+keep working rather than meeting a `FieldError` from inside `add_rivers`. A config that wants the
+rule overloads this hook, as `OF800RiversConfig` does.
+
+A river is written into the *surface* level alone, so the column beneath it is what has to carry
+the exchange the freshening drives. Give it one cell and it cannot: the fresh surface cell sets up
+an estuarine circulation, and the salty inflow at depth concentrates in the single cell below
+instead of spreading through a column. On `oslofjorden` the four outlets that landed on the
+`minimum_depth` floor — two 1 m cells — held 32 to 64 psu below a surface cell at 0, while all
+fifteen outlets with four levels or more stayed between 29 and 35. Column salt was conserved
+throughout, so nothing was created; the column simply could not resolve the redistribution.
+
+This is the depth counterpart of the rule `is_coastal_cell` already applies: a river may not enter
+open water, and it may not enter a column too shallow to carry it either.
+"""
+river_minimum_levels(::AbstractRiverConfig) = 0
+
+"""
+    coastal_water_mask(target_grid, minimum_levels)
+
+Surface-level water mask of `target_grid`, as an `(i, j)` matrix, with every column of fewer than
+`minimum_levels` wet cells masked out. Built from the same `water_mask` that `prepare_forcing`
+uses, so "water" means exactly what it means when the forcing file is written, including
+`PartialCellBottom` cells.
+
+Masking the shallow columns out of the mask itself, rather than testing depth separately, is what
+keeps `is_coastal_cell` and `nearest_coastal_cell` unchanged: a column too shallow to carry a river
+simply counts as shore for this purpose, so the nearest acceptable cell is by construction both
+coastal and deep enough. `minimum_levels` of `0` or `1` masks nothing.
 
 The open edge does not enter: this asks for the tracer location, and every `open_boundary_water!`
 method returns the mask untouched unless the location is staggered across its own edge. A river
 enters at a tracer cell, so the edge could only ever have been a no-op here.
 """
-function coastal_water_mask(target_grid)
+function coastal_water_mask(target_grid, minimum_levels)
     mask = water_mask(target_grid, Center, Center, nothing)
-    return mask[:, :, size(mask, 3)]
+    surface = mask[:, :, size(mask, 3)]
+    levels = dropdims(sum(mask; dims = 3); dims = 3)
+    return surface .& (levels .>= minimum_levels)
 end
 
 """
@@ -143,18 +176,18 @@ function nearest_coastal_cell(mask, i, j, radius)
 end
 
 """
-    river_cells(target_grid, locations, radius)
+    river_cells(target_grid, locations, radius, minimum_levels)
 
 Snap each `RiverLocation` to the coastal water cell that will carry it. An outlet is located by
 independent nearest-node lookups in longitude and latitude, then moved to the nearest coastal
-water cell within `radius`.
+water cell of at least `minimum_levels` wet levels within `radius`.
 
-Outlets outside the grid, and outlets with no coastal cell in reach, are dropped with a
+Outlets outside the grid, and outlets with no such cell in reach, are dropped with a
 warning — writing a river into a land cell would be silently lost when the model reads the
 forcing back.
 """
-function river_cells(target_grid, locations, radius)
-    mask = coastal_water_mask(target_grid)
+function river_cells(target_grid, locations, radius, minimum_levels)
+    mask = coastal_water_mask(target_grid, minimum_levels)
     longitudes = Array(λnodes(target_grid, Center()))
     latitudes = Array(φnodes(target_grid, Center()))
 
@@ -173,7 +206,8 @@ function river_cells(target_grid, locations, radius)
 
         nearest = nearest_coastal_cell(mask, i, j, radius)
         if isnothing(nearest)
-            @warn "Skipping $label: no coastal water cell within $radius cells of ($i, $j)"
+            @warn "Skipping $label: no coastal water cell of at least $minimum_levels levels " *
+                  "within $radius cells of ($i, $j)"
             continue
         end
 
@@ -248,7 +282,9 @@ function add_rivers(
     times = river_forcing_times(rivers, forcing_file, coverage)
 
     locations = river_locations(rivers)
-    cells = river_cells(target_grid, locations, river_search_radius(rivers))
+    cells = river_cells(
+        target_grid, locations, river_search_radius(rivers), river_minimum_levels(rivers),
+    )
     isempty(cells) && error("None of the $(length(locations)) river outlets landed on the grid.")
 
     report_river_cells(cells)

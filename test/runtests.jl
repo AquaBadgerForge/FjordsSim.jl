@@ -56,6 +56,7 @@ include("utilities.jl")
             :river_locations,
             :river_series,
             :river_search_radius,
+            :river_minimum_levels,
             :boundary_time_steps,
             :boundary_source_grid,
             :boundary_variable_names,
@@ -2446,7 +2447,7 @@ end
             (; grid) = land_column_test_grid(joinpath(tmp, "bathymetry.nc"))
 
             # The mask comes from the same water_mask prepare_forcing uses, taken at the surface.
-            mask = coastal_water_mask(grid)
+            mask = coastal_water_mask(grid, 0)
             @test size(mask) == (5, 4)
             @test !mask[2, 1]
             @test mask[1, 1]
@@ -2462,7 +2463,7 @@ end
                 FjordSim.Forcing.RiverLocation(2, "open water", longitudes[4], latitudes[2]),
                 FjordSim.Forcing.RiverLocation(3, "outside", 20.0, latitudes[2]),
             ]
-            cells = river_cells(grid, locations, 10)
+            cells = river_cells(grid, locations, 10, 0)
             @test length(cells) == 2
             @test [cell.location.id for cell in cells] == [1, 2]
             @test (cells[1].i, cells[1].j, cells[1].distance) == (1, 2, 1.0)
@@ -2472,10 +2473,26 @@ end
             # An outlet sitting exactly on the outermost node counts as outside, matching the
             # reference's strict bounds test.
             edge = FjordSim.Forcing.RiverLocation(4, "on the edge", longitudes[1], latitudes[2])
-            @test isempty(river_cells(grid, [edge], 10))
+            @test isempty(river_cells(grid, [edge], 10, 0))
 
             # With no reach, the on-land outlet is dropped too rather than written into land.
-            @test isempty(river_cells(grid, [locations[1]], 0))
+            @test isempty(river_cells(grid, [locations[1]], 0, 0))
+
+            # A river is relaxed into the surface level alone, so the column beneath it is what has
+            # to carry the exchange that freshening drives — one cell cannot, and runs to 64 psu.
+            # `minimum_levels` masks the too-shallow columns out of the coastal mask itself, which
+            # is why `is_coastal_cell` and `nearest_coastal_cell` need no depth argument: a column
+            # the river cannot enter simply counts as shore.
+            levels = dropdims(
+                sum(FjordSim.Forcing.water_mask(grid, Center, Center, nothing); dims = 3); dims = 3,
+            )
+            @test coastal_water_mask(grid, 0) == coastal_water_mask(grid, 1)
+            @test all(coastal_water_mask(grid, maximum(levels)) .<= coastal_water_mask(grid, 0))
+            @test !any(coastal_water_mask(grid, maximum(levels) + 1))
+
+            # Demanding more levels than any column has drops every outlet rather than placing one
+            # in a column that cannot carry it.
+            @test isempty(river_cells(grid, locations, 10, maximum(levels) + 1))
         end
     end
 

@@ -614,8 +614,25 @@ modules, in `include` order from `src/FjordSim.jl`:
    located by
    independent nearest-node lookups in longitude and latitude, then moved to the nearest
    *coastal* water cell — water with at least one land neighbour, so a river cannot be injected
-   into open water. An outlet outside the grid, or with no coastal cell within `search_radius`,
-   is dropped with a warning rather than written into land. The water mask comes from the same
+   into open water — of at least `minimum_levels` wet levels, so it cannot be injected into a column
+   too shallow to carry it either. An outlet outside the grid, or with no such cell within
+   `search_radius`, is dropped with a warning rather than written into land.
+
+   That depth rule exists because the river is written into the **surface level alone**, so the
+   column *beneath* it is what carries the exchange the freshening drives — and one cell cannot. The
+   fresh surface cell sets up an estuarine circulation, and the salty inflow at depth concentrates in
+   the single cell below instead of spreading through a column. On `oslofjorden` four outlets had
+   snapped onto the 2 m `minimum_depth` floor, a column of two 1 m cells, and held 32 to 64 psu under
+   a surface cell relaxed to 0, while all fifteen outlets with four levels or more stayed between 29
+   and 35. Column salt was conserved throughout — nothing was created, the column simply could not
+   resolve the redistribution — and it oscillated rather than diverging, which is what distinguishes
+   it from the open-boundary runaway `snap_partial_bottom_cells` fixes. All four had a four-to-six
+   level coastal cell within three cells, so `minimum_levels = 4` moves them ~500 m and no further.
+
+   `minimum_levels` is applied by masking the too-shallow columns out of `coastal_water_mask` itself
+   rather than by a separate depth test, which is what keeps `is_coastal_cell` and
+   `nearest_coastal_cell` unchanged: a column a river cannot enter simply counts as shore for this
+   purpose, so the nearest acceptable cell is by construction both coastal and deep enough. The water mask comes from the same
    `water_mask` that `prepare_forcing` uses, so "water" means the same thing in both.
    `write_rivers` reads, patches and writes back whole surface slabs because the file is
    chunked one horizontal slab per `(level, time)`.
@@ -1390,6 +1407,7 @@ Rivers — `AbstractRiverConfig`, consumed by `add_rivers`:
 | `river_series(config, times)` → `Dict` FjordSim name => `(river, time)` matrix | yes | none |
 | `download_rivers(config)` | only if it downloads | none |
 | `river_search_radius(config)` → cells to search for a coastal cell | no | `config.search_radius` |
+| `river_minimum_levels(config)` → wet levels a column must have to receive an outlet | no | `0`, accepting any water cell. Unlike `river_search_radius` the fallback reads no field, so a river config written before the hook existed keeps working; `OF800RiversConfig` overloads it |
 
 Its `standalone` field decides whether `add_rivers` patches a copy of the prepared forcing or writes a
 river-only file of its own; see the `Forcing` section. A `standalone` config needs the setup to name a

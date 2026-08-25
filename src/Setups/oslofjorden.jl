@@ -71,7 +71,13 @@ function oslofjorden()
             architecture     = :auto,
             parameters       = ["temperature", "salinity", "u_eastward", "v_northward"],
             years            = [2020],
-            rivers           = OF800RiversConfig(data_root = data_root),
+            rivers           = OF800RiversConfig(
+                data_root = data_root,
+                # A river is relaxed into the surface level alone, so the column under it has to
+                # carry the exchange that freshening drives. Four outlets had snapped onto the
+                # 2 m `minimum_depth` floor — two 1 m cells — and ran to 64 psu underneath.
+                minimum_levels = 4,
+            ),
         ),
         # The exterior state along the open southern edge, from the *hourly* NorKyst collection: a
         # Flather boundary compares the model's own η against the exterior one, and the daily means
@@ -163,7 +169,7 @@ function oslofjorden()
                     name               = :ocean,
                     output_file        = "snapshots_ocean.nc",
                     variables          = (:T, :S, :u, :v),
-                    interval           = 1hour,
+                    interval           = 3hour,
                     overwrite_existing = true,
                 ),
                 CheckpointWriter(interval = 30days, cleanup = true),
@@ -175,7 +181,7 @@ function oslofjorden()
             # Overloads attach_time_stepping! and initial_time_step.
             time_stepping = AdaptiveTimeStep(
                 initial_time_step    = 1second,
-                cfl                  = 0.1,
+                cfl                  = 0.3,
                 max_time_step        = 3minutes,
                 max_time_step_change = 1.01,
             ),
@@ -183,7 +189,7 @@ function oslofjorden()
             # column: every tracer the model names plus u and v, whichever of them the forcing
             # file carries. A literal NamedTuple (`(T = 5.0, S = 33.0)`) still works, and
             # `FromResults("snapshots_ocean_<tag>.nc")` continues from a previous run instead.
-            initial_conditions = (T = 5.0, S = 33.0),
+            initial_conditions = FromForcing(),  # (T = 5.0, S = 33.0),
             # The whole calendar year 2020, which is a leap year — so 366 days from midnight on
             # 1 January lands exactly on midnight a year later. Neither prepared file has a record
             # at either end natively (NorKyst's are daily at 12:00, NORA3's hourly from 00:00 to

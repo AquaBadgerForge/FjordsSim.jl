@@ -66,6 +66,7 @@ export
     river_locations,
     river_series,
     river_search_radius,
+    river_minimum_levels,
     boundary_time_steps,
     boundary_source_grid,
     boundary_variable_names,

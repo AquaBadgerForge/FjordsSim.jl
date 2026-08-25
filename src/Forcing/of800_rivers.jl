@@ -36,6 +36,15 @@ ROMS river forcing NetCDF.
   the source does not carry. River salinity is 0 by definition of fresh water.
 - `relaxation_timescale`: seconds; the river cells relax this fast toward the river values.
 - `search_radius`: how far to look for a coastal water cell, in grid cells.
+- `minimum_levels`: how many wet levels a column must have before an outlet may be placed in it.
+  `0` accepts any water cell, which is what the placement did before.
+
+  A river is relaxed into the *surface* level alone, so the column beneath it is what carries the
+  exchange the freshening drives, and one cell cannot. On `oslofjorden` the four outlets that landed
+  on the `minimum_depth` floor — a column of two 1 m cells — ran to 32 and 64 psu in the cell below a
+  surface cell held at 0, while all fifteen outlets with four levels or more stayed between 29 and
+  35 psu. Column salt stayed conserved, so this is a redistribution the column cannot resolve rather
+  than anything being created. See `river_minimum_levels`.
 - `standalone`: whether `add_rivers` writes a forcing file carrying only rivers rather than patching
   a copy of the prepared interior forcing. `false` by default, so the step keeps needing
   `prepare_forcing` unless a setup says otherwise.
@@ -51,8 +60,17 @@ Base.@kwdef mutable struct OF800RiversConfig <: AbstractRiverConfig
     constants::Dict{String,Float64} = Dict("S" => 0.0)
     relaxation_timescale::Float64 = 3600.0
     search_radius::Int = 10
+    minimum_levels::Int = 0
     standalone::Bool = false
 end
+
+"""
+    river_minimum_levels(config::OF800RiversConfig)
+
+The wet-level floor for outlet placement, from `config.minimum_levels`. See the generic
+`river_minimum_levels` for why the supertype fallback is a plain `0` rather than this field read.
+"""
+river_minimum_levels(config::OF800RiversConfig) = config.minimum_levels
 
 """
     river_locations_path(config)
