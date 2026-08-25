@@ -25,9 +25,14 @@ function oslofjorden()
     data_root = joinpath(homedir(), "FjordSim_data", "oslofjorden")
     FT = Oceananigans.defaults.FloatType
 
-    # FjordConfig overload entry points like run_simulation(), download_forcing(), etc.
+    # FjordConfig is what the driver-level generics (run_simulation(), download_forcing(), etc.)
+    # dispatch on — one method per subcommand, shared by every setup. Each driver then calls the
+    # finer-grained hooks the nested configs below overload.
     return FjordConfig(
-        # Overloads LatitudeLongitudeGrid(architecture, config) — the one grid hook.
+        # EvenGrid overloads the two grid hooks — domain_grid(config, architecture), which every
+        # prepare_* pipeline calls, and simulation_grid(config, bathymetry_file, architecture),
+        # which build_simulation reads the model grid through — both dispatching on this config's
+        # type. Implemented here by wrapping LatitudeLongitudeGrid / ImmersedBoundaryGrid.
         grid_config = EvenGrid(
             size      = (240, 520, 18),
             halo      = (7, 7, 7),
@@ -38,8 +43,9 @@ function oslofjorden()
                 -75.0, -50.0, -25.0, -15.0, -10.0, -7.5, -5.0, -3.0, -2.0, -1.0, 0.0,
             ],
         ),
-        # Overloads bathymetry_dataset (required), regrid_options and smoothing_options (both
-        # optional) — the hooks prepare_bathymetry dispatches on.
+        # DybdedataConfig overloads bathymetry_dataset (required), plus regrid_options and
+        # smoothing_options (both optional) — hooks prepare_bathymetry calls, dispatching on this
+        # config's type.
         bathymetry_config = DybdedataConfig(
             data_root             = data_root,
             output_file           = "bathymetry.nc",
@@ -59,10 +65,11 @@ function oslofjorden()
             geonorge_cache        = true,
             regrid_cache          = false,
         ),
-        # Overloads forcing_time_steps, forcing_source_grid, forcing_variable_names and
-        # download_forcing (required) — the hooks prepare_forcing and download_forcing dispatch
-        # on. simulation_forcing is left at its default, since this is the FjordSim NetCDF
-        # forcing contract build_simulation already reads.
+        # NorKystConfig overloads forcing_time_steps, forcing_source_grid and
+        # forcing_variable_names — hooks prepare_forcing calls — plus download_forcing itself,
+        # which the driver-level download_forcing(config::FjordConfig) dispatches straight to.
+        # All dispatch on this config's type. simulation_forcing is left at its default, since
+        # this is the FjordSim NetCDF forcing contract build_simulation already reads.
         forcing_config = NorKystConfig(
             data_root        = data_root,
             output_directory = "norkyst",
@@ -73,6 +80,11 @@ function oslofjorden()
             years            = [2020],
             rivers           = OF800RiversConfig(
                 data_root = data_root,
+                # OF800RiversConfig overloads river_locations, river_series and download_rivers
+                # (all required, hooks add_rivers and download_rivers call), plus
+                # river_minimum_levels (optional — the unoverloaded default is 0, accepting any
+                # water cell). All dispatch on this config's type.
+                #
                 # A river is relaxed into the surface level alone, so the column under it has to
                 # carry the exchange that freshening drives. Four outlets had snapped onto the
                 # 2 m `minimum_depth` floor — two 1 m cells — and ran to 64 psu underneath.
@@ -87,8 +99,9 @@ function oslofjorden()
         # A `FjordConfig` field of its own, independent of the forcing above: this is a separate
         # file from a separate collection read by a separate pipeline, and it is what states the open
         # edge — for the boundary steps, for the forcing land mask, and for the boundary condition.
-        # Overloads boundary_time_steps, boundary_source_grid, boundary_variable_names and
-        # download_boundaries.
+        # NorKystBoundariesConfig overloads boundary_time_steps, boundary_source_grid,
+        # boundary_variable_names (all required) and download_boundaries — hooks
+        # prepare_boundaries and download_boundaries call, dispatching on this config's type.
         boundary_config = NorKystBoundariesConfig(
             data_root        = data_root,
             output_directory = "norkyst_hourly",
@@ -105,9 +118,11 @@ function oslofjorden()
             ],
             years            = [2020],
         ),
-        # Overloads atmosphere_time_steps, atmosphere_source_grid, atmosphere_variable_names,
-        # download_atmosphere, prescribed_atmosphere and prescribed_radiation — the hooks
-        # prepare_atmosphere, download_atmosphere and build_simulation dispatch on.
+        # NORA3Config overloads atmosphere_time_steps, atmosphere_source_grid and
+        # atmosphere_variable_names — hooks prepare_atmosphere calls — plus download_atmosphere
+        # (called by the driver-level download_atmosphere) and prescribed_atmosphere /
+        # prescribed_radiation (called directly by build_simulation, since the setup is
+        # simulated). All dispatch on this config's type.
         atmosphere_config = NORA3Config(
             data_root        = data_root,
             output_directory = "nora3",
@@ -122,8 +137,8 @@ function oslofjorden()
         simulation_config = SimulationConfig(
             results_root       = joinpath(homedir(), "FjordSim_results", "oslofjorden"),
             architecture       = :auto,
-            # Overloads coupled_simulation and model_tracers — the model hooks build_simulation
-            # dispatches on.
+            # CoupledHydrostaticSimulation overloads coupled_simulation and model_tracers — the
+            # model hooks build_simulation calls, dispatching on this config's type.
             model              = CoupledHydrostaticSimulation(
                 buoyancy           = SeawaterBuoyancy(FT, equation_of_state = TEOS10EquationOfState(FT)),
                 closure            = (
