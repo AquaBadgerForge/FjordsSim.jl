@@ -80,6 +80,21 @@ across fjords.
   A floor alone is not enough, and on its own makes a second problem: lifting a sliver to a
   constant depth in much deeper water leaves a shallow *spike*, which destabilizes its neighbours
   the same way. Pair it with `spike_ratio`.
+- `open_boundary_land_cells`: `clear_open_boundary_land` width — every land cell within this many
+  rows of an *open* lateral boundary is flooded to the mean depth of the water reaching it. `0`
+  disables the stage, and so does a setup that names no boundary data config, since it then has no
+  open edge.
+
+  A coastline running into an open boundary is the worst place in the domain for one. The boundary
+  condition there is already reconciling a radiation scheme against a prescribed exterior state
+  within a cell or two, and a headland in the boundary row splits the prescribed inflow around an
+  obstacle the exterior dataset never saw. Clearing a band leaves the open edge the clean channel
+  every open-boundary scheme is derived for.
+
+  The price is that the newly wet cells have no exterior profile of their own and are filled along
+  the boundary by `FjordSim.Forcing.fill_boundary_gaps!`, so keep this small — a few cells, not a
+  few tens. On `oslofjorden` the southern band is nearly clear already and `5` moves seven cells,
+  none of them in the boundary row itself.
 - `max_island_cells`: `fill_small_islands` threshold — every 4-connected patch of land of at most
   this many cells that does not touch the domain edge is flooded to the mean depth of the sea
   around it. `0` disables the stage, leaving the single-cell case `fill_isolated_land_cells`
@@ -159,6 +174,7 @@ Base.@kwdef mutable struct DybdedataConfig <: AbstractBathymetryConfig
     interpolation_passes::Int = 1
     major_basins::Int = 1
     minimum_depth::Float64 = 0.0
+    open_boundary_land_cells::Int = 0
     max_island_cells::Int = 0
     close_narrow_passages::Bool = false
     spike_ratio::Float64 = 0.0
@@ -210,6 +226,7 @@ The `smooth_bathymetry_gaps!` options this setup configures.
 `limit_bottom_slope` must not undo the floor while flattening a slope.
 """
 smoothing_options(config::DybdedataConfig) = (;
+    open_boundary_land_cells = config.open_boundary_land_cells,
     max_island_cells = config.max_island_cells,
     close_narrow_passages = config.close_narrow_passages,
     spike_ratio = config.spike_ratio,

@@ -65,6 +65,27 @@ building its whole time axis from it. No download step is affected; all three pr
 regrids.
 `loops` is not part of the window, so changing it re-runs nothing.
 
+### Changing `z_faces` or the grid `size`
+
+Also a data change, and a larger one. `z_faces` is written into `bathymetry.nc`, and
+`simulation_grid` reads the *file* rather than the config — so a config edit alone changes nothing
+about the run, and every 3D prepared file was regridded onto the old geometry. Re-run, in this order:
+
+```bash
+julia --project -m FjordSim prepare_bathymetry  --config oslofjorden   # rewrites bathymetry.nc
+julia --project -m FjordSim prepare_forcing     --config oslofjorden   # rewrites forcing.nc
+julia --project -m FjordSim add_rivers          --config oslofjorden   # re-copies forcing_rivers.nc
+julia --project -m FjordSim prepare_boundaries  --config oslofjorden   # rewrites boundaries.nc
+```
+
+No download step is affected — all four are pure regrids of data already on disk. `prepare_atmosphere`
+is *not* in the list: the atmosphere is 2D on its own regular lon/lat grid and knows nothing about the
+model's vertical coordinate.
+
+The same list applies to a change in any `bathymetry_config` smoothing knob, since those change the
+land mask that `prepare_forcing` and `prepare_boundaries` build their masks from. See "The vertical
+grid" under Setups for what the current faces are and why.
+
 `-m` is Julia 1.12's package entry point, which is why `Project.toml` has `[compat] julia = "1.12"`.
 The equivalent without `-m` is
 `julia --project -e 'using FjordSim; FjordSim.main(ARGS)' -- prepare_forcing --config oslofjorden`.
@@ -97,8 +118,9 @@ modules, in `include` order from `src/FjordSim.jl`:
    `AbstractBoundaryDataConfig`, `AbstractAtmosphereConfig` and `AbstractSimulationConfig`, plus the
    five the simulation config nests — `AbstractCoupledSimulationConfig`, `AbstractBoundaryConditionSetConfig`,
    `AbstractWriterConfig`, `AbstractCallbackConfig` and `AbstractTimeSteppingConfig` — plus
-   `AbstractBoundaryConditionConfig`, one level further down inside the boundary-condition set, and
-   `FjordConfig`, which holds a
+   `AbstractBoundaryConditionConfig`, `AbstractFreeSurfaceConfig` and `AbstractClosureConfig` — one
+   level further down again, inside the boundary-condition set and inside the coupled-simulation
+   config — and `FjordConfig`, which holds a
    grid, bathymetry, forcing, open-boundary, atmosphere and simulation config (parametrically, so
    every instantiation stays concretely typed). `forcing_config`, `boundary_config`,
    `atmosphere_config` and `simulation_config` all default to
@@ -122,7 +144,15 @@ modules, in `include` order from `src/FjordSim.jl`:
 
    The two grid hooks, `domain_grid` and `simulation_grid`, are also declared here rather than in
    `Grids`, because `Bathymetry`, `Atmospheres` and `Forcing` all call `domain_grid` and are all
-   included before `Grids`.
+   included before `Grids`. `model_closure` is declared here for the same reason and one more: its
+   fallback is the identity, and an identity fallback is only useful if it is the *first* method
+   anyone sees.
+
+   The edge vocabulary lives here too — `LATERAL_EDGES`, `validate_open_edge` and `lateral_edges`,
+   beside the `open_edges` accessor that reads a config's own. Every module that reasons about an
+   edge is included after this one and none of them can see each other: `Bathymetry` clears land
+   along the open ones, `Forcing` restores their velocity face rows and regrids along them, and
+   every `Val{edge}` dispatch in `BoundaryConditions` raises an `ArgumentError` naming the tuple.
 
    The path helpers defined on the supertypes live here too, so a new
    source inherits them without loading the built-in source's module: `bathymetry_path`,
@@ -180,6 +210,16 @@ modules, in `include` order from `src/FjordSim.jl`:
    named tuples, `cell_advection_timescale_coupled_model` for the time-step wizard, plus
    `compute_faces` and NetCDF/JLD2 helpers.
 
+   `progress` takes every reduction on the `Field`, never on `interior(field)`, and that is the whole
+   difference between a useful report and a misleading one. A reduction over a `Field` on an
+   `ImmersedBoundaryGrid` excludes the immersed periphery for free
+   (`Oceananigans.ImmersedBoundaries.NotImmersed`); `interior` hands back a bare array and throws that
+   away. Oceananigans writes `zero(eltype)` into every immersed peripheral tracer cell at the top of
+   each `update_state!`, and most of a fjord grid is land — so the array form reported the land mask
+   as the minimum temperature for the whole of every run, and did it under a label reading
+   `extrema(T)` while printing `(max, min)`. It also keeps the reduction on the GPU instead of
+   indexing a `CuArray` cell by cell.
+
 4. **Plotting** (`src/Plotting.jl`) — `plot_bathymetry(grid, bottom_height, config)`,
    `plot_forcing(grid, config)`, `plot_boundaries(config)` and `plot_atmosphere(config)`, all
    dispatching on the config *supertypes* so a new source inherits them, writing to
@@ -198,29 +238,90 @@ modules, in `include` order from `src/FjordSim.jl`:
    with `smoothing_options(config)` → `write_bathymetry_file`. The core also owns the smoothing
    kernels and the `center_coordinates`/`expand_domain`/`vertical_faces` domain helpers.
 
-   `smooth_bathymetry_gaps!` runs six stages. The topological cleanup every source gets
-   (diagonal-pair fills, isolated sea/land cells), then five stages a source opts into through
-   `smoothing_options`, each skipped when its parameter is `false` or zero: `fill_small_islands`,
-   `remove_narrow_passages`, `fill_shallow_spikes`, `snap_partial_bottom_cells` and
-   `limit_bottom_slope`.
+   `smooth_bathymetry_gaps!` runs seven stages in eight passes — `snap_partial_bottom_cells` runs
+   twice. The topological cleanup every source gets (diagonal-pair fills, isolated sea/land cells),
+   then six stages a source opts into through `smoothing_options`, each skipped when its parameter is
+   `false` or zero:
+   `clear_open_boundary_land`, `fill_small_islands`, `remove_narrow_passages`,
+   `fill_shallow_spikes`, `snap_partial_bottom_cells` and `limit_bottom_slope`.
 
    The order is forced. The topological pass first, because checkerboard noise would skew the
-   neighbour medians. Then the two stages that change the *land mask*, before the two that change
+   neighbour medians. Then `clear_open_boundary_land`, which is the third stage that changes the
+   *land mask* and goes before the other two for the same reason `fill_small_islands` goes before
+   `remove_narrow_passages`: it only turns land into sea, so it can neither manufacture a narrow
+   passage nor strand a cell, while running it first lets the island and passage stages judge the
+   band as it will actually be. A land component straddling the band's inner edge loses its in-band
+   cells there and is then correctly measured — as whatever remains of it — by `fill_small_islands`.
+   It is also the only stage that reads `edges`, and is a no-op for a setup that names none.
+
+   Then the two remaining land-mask stages, before the two that change
    depths: run the other way round, the cells they are about to turn into land or water would already
    have contributed to a neighbour median and to a slope pair. Of those two, `fill_small_islands`
    runs first — flooding an island only widens water and so can never create a passage, while closing
    a passage adds land exactly where a spurious loop closes, which is where these islands live, and
    can bridge one to the mainland where the size test will never see it again. Then despiking before
    slope limiting, because a spike is exactly the one-cell feature slope limiting would smear into
-   its neighbours instead of removing. `snap_partial_bottom_cells` goes between those two — after
-   despiking, which moves a cell to its neighbours' median depth without regard for where the
-   vertical faces are, and before slope limiting, which should keep the last word on smoothness. That
-   choice costs a few re-created slivers (178 of 9907 on `oslofjorden`, none on the open boundary);
-   snapping last instead removes every one but pushes the steepest slope parameter from 0.500 to
-   0.560, undoing the limit the stage before it just enforced.
+   its neighbours instead of removing.
+
+   `snap_partial_bottom_cells` runs **twice**, once each side of slope limiting, and that is not
+   redundancy. It is the only stage that knows where the vertical faces are, and slope limiting moves
+   depths without regard for them, so the limiter is guaranteed to put back slivers the snap removed —
+   the tighter the limit, the more of them. This used to be a single pass before the limiter, on the
+   argument that slope limiting should keep the last word on smoothness, and it cost "a few" slivers:
+   178 of 9907 at `max_slope_factor = 0.5`. At 0.25 on the 24-level grid it costs **2628, six percent
+   of every bottom cell in the domain**, because a tighter limit means the limiter moves far more
+   depth. Snapping again afterwards leaves **none**, and the price is that the second snap breaks the
+   limit it was just handed: the steepest slope goes from 0.250 to 0.307, on 16 pairs out of 84 000.
+   A slope parameter 23 % over target on a handful of pairs is the better trade, and it is still far
+   inside the 0.500 the setup used to accept outright.
+
+   The first snap is not made redundant by the second. It hands the limiter a field already aligned to
+   the faces, so the limiter has less to move and the second snap less to correct; and where the
+   limiter does not run at all (`max_slope_factor = 0`) it is the only one there is.
 
    Unlike a passage closure, a flood leaves no stub and so needs no cleanup rounds after it: every
    neighbour of a flooded component is sea by maximality, so no flooded cell borders land.
+
+   ### `clear_open_boundary_land`
+
+   Floods every land cell within `open_boundary_land_cells` rows of an **open** lateral boundary,
+   giving each the mean depth of its wet neighbours.
+
+   A coastline that runs into an open boundary is the worst place in the domain for one to be. The
+   boundary condition there is already reconciling a radiation scheme against a prescribed exterior
+   state within a cell or two, and a headland poking through the boundary row splits the prescribed
+   inflow around an obstacle the exterior dataset never saw. Clearing a band leaves the open edge the
+   clean, uninterrupted channel every open-boundary scheme is derived for.
+
+   Three things about it are load-bearing.
+
+   **The edges come from `open_edges`, not from a field of the bathymetry config.** They reach
+   `smooth_bathymetry_gaps!` as its `edges` keyword, threaded by
+   `prepare_bathymetry(target_grid, config; edges)` and supplied by
+   `prepare_bathymetry(config::FjordConfig)` from `open_edges(config.boundary_config)` — the same
+   shape, and the same argument, as `prepare_forcing`'s `edges` keyword. Which edges are open is a
+   property of the domain and its exterior data, not of a bathymetry source, and a second statement
+   of them could only disagree. A setup naming no boundary config prepares its bathymetry with every
+   lateral boundary a wall, which is the right reading when there is no exterior state to admit.
+
+   **Depths are assigned by repeated relaxation, not in one pass.** Each round fills the cells that
+   have at least one wet neighbour *now*, so a cell in the middle of a cleared headland inherits from
+   the coast through the cells between it and the band ramps rather than stepping. Each round is
+   computed in full before it is written, so the result does not depend on the order the band is
+   walked. A cell no round can reach stays land, which needs a land component in the band touching
+   nothing wet at all.
+
+   **The price is exterior data.** A newly wet cell has no profile of its own in the prepared
+   boundary file, and `fill_boundary_gaps!` fills it from the nearest wet cell along the boundary —
+   the same treatment a boundary column already gets wherever the model and the source disagree about
+   the coastline. So the trade is a few laterally interpolated columns against a headland in the
+   boundary row, and the width should stay a few cells rather than a few tens. On `oslofjorden` the
+   southern band is nearly clear already: rows 1–5 hold seven land cells, row 1 is entirely water, and
+   `open_boundary_land_cells = 5` moves those seven and changes nothing in the boundary row itself.
+
+   `open_boundary_band` is four `Val{edge}` methods returning the band's index ranges, with a
+   catch-all that raises — the same shape as `open_boundary_water!` in `Forcing`, and never a
+   four-branch `if`.
 
    `fill_shallow_spikes` and `limit_bottom_slope` exist because `PartialCellBottom` bounds how *thin*
    a cell may be but says nothing about
@@ -362,12 +463,16 @@ modules, in `include` order from `src/FjordSim.jl`:
 
    Three things about it are load-bearing.
 
-   **Refining `z_faces` is not the fix**, though it is the obvious guess. A finer vertical grid gives
-   the seabed more faces to cross, so laterally isolated bottom cells become *more* common, not less —
-   measured, 165 on the 18-level grid against 235 to 280 on stretched 20 to 24-level ones. It is the
-   sliver that has to go, not the layer that has to shrink. (The vertical grid is still poorly
-   allocated on its own terms — k = 1 and k = 2 are never wet against a deepest sounding of 395.1 m,
-   and 55% of columns are shallower than 50 m — but that is a separate argument.)
+   **Refining `z_faces` is not the fix for *this*, though it is the obvious guess.** A finer vertical
+   grid gives the seabed more faces to cross, so laterally isolated bottom cells become *more* common,
+   not less — measured, 3.9% of columns on the 18-level grid against 5.5% on the 24-level one that
+   replaced it. It is the sliver that has to go, not the layer that has to shrink, and that is what
+   this stage does.
+
+   The vertical grid was separately and genuinely wrong, and has since been fixed — see "The vertical
+   grid" under Setups. The two are complementary: this stage removes a bottom cell that is too *thin*,
+   the regrading removes one that is too *thick*. Neither substitutes for the other, and the finer
+   grid makes this stage matter slightly more rather than less.
 
    **It snaps up, not down.** Down is what the model already does silently, by up to 3.7 m at the
    cells above, and it keeps the sliver. Up ends the column at a face, which also rejoins it to the
@@ -379,6 +484,21 @@ modules, in `include` order from `src/FjordSim.jl`:
    **Two guards keep it total.** A column is left alone when the face above is the surface, or when
    snapping to it would breach `minimum_depth`, so the stage can never dry a cell out or undercut the
    floor; such a column keeps its sliver and is floored as before. On `oslofjorden` neither fires.
+
+   **It snaps in the file's precision, not the pipeline's**, and that is not a detail. Smoothing runs
+   in the grid's float type — `Float64` — where the snapped value lands on the face exactly; the
+   narrowing to `Float32` happens later, in `write_bathymetry_file`, on a value the stage has stopped
+   looking at. Wherever a face is not representable in `Float32`, that narrowing puts the column back
+   a hair *below* it, and the layer beneath becomes its bottom cell at about 5 × 10⁻⁸ of full
+   thickness — the pipeline writing out, in the worst possible form, the very sliver it removed. Four
+   of `oslofjorden`'s 24 faces are inexact (−10.8, −7.9, −3.7, −2.2) and this hit 1265 columns, 2.9 %
+   of the domain, every one of them at those four. `snap_to_face` rounds *away* from the water so the
+   value survives the round trip, using `BATHYMETRY_ELTYPE` — the one statement of what the file
+   stores, shared with `write_bathymetry_file`. The old 18-level faces were all exactly representable,
+   which is why this never bit before.
+
+   With both the second pass and this fix in place, `PartialCellBottom`'s clamp does not fire anywhere
+   in the finished `oslofjorden` field: zero slivers, against 292 on the 18-level grid.
 
    `geonorge.jl` holds `DybdedataConfig <: AbstractBathymetryConfig` and the Geonorge Sjøkart
    Dybdedata implementation of the two hooks: derive the native region from the target grid
@@ -934,8 +1054,13 @@ modules, in `include` order from `src/FjordSim.jl`:
    which `build_simulation` used to do — shadowed the hook. Renamed, it is exported like every other
    hook, and the old name is gone rather than deprecated.
 
-   `LATERAL_EDGES` now comes from `Forcing`, which is included first; each module used to hold its own
-   copy under a different name with an identical error string.
+   `LATERAL_EDGES` now comes from `Configs`, along with `validate_open_edge` and `lateral_edges`.
+   They lived in `Forcing` while that was the first module needing them, and moved when `Bathymetry` —
+   which is included *before* `Forcing` — gained `clear_open_boundary_land`. `Configs` is the only
+   module every one of them can see, and it already owns `open_edges`, so the edge vocabulary and the
+   accessor that reads a config's edges now sit together. This is the tuple's third home; each of the
+   first two was a per-module copy with identical contents, an identical membership test and an
+   identical error string.
 
    Only `T` and `S` get a top condition, deliberately: NumericalEarth assembles air-sea fluxes for
    heat and salt specifically, so a third tracer has no exchange to write into and no
@@ -1032,7 +1157,94 @@ modules, in `include` order from `src/FjordSim.jl`:
     `free_surface` is itself an `AbstractFreeSurfaceConfig` rather than a bare `Float64` CFL, with
     its own `free_surface(config, grid)` hook — the same reason the model as a whole is a config
     rather than a built object: `SplitExplicitFreeSurface` needs the grid, which does not exist
-    until `coupled_simulation` calls the hook. `coefficient` stays a plain scalar on
+    until `coupled_simulation` calls the hook.
+
+    ### `closure` and `BoundarySponge`
+
+    `closure` holds *either* a pre-built Oceananigans closure — which is what every setup wrote before
+    this existed, and still the usual case — *or* an `AbstractClosureConfig`. Which one it is is
+    resolved by `model_closure(closure, grid, boundary_config)`, whose fallback is the identity, so
+    the two shapes are three methods rather than a branch and nothing that already worked changed.
+    Same pattern as `resolve_initial_conditions`, and for the same reason as `free_surface`: a closure
+    can need what only exists at build time.
+
+    `BoundarySponge` is the built-in one, and it needs *two* such things: the grid, for the domain
+    extent and cell size its ramp is expressed in, and the open edges. It wraps a `base` closure and
+    appends a `HorizontalScalarDiffusivity` whose `ν` and `κ` ramp to zero over `width_cells` inward
+    from every open lateral edge, so it needs no field, no allocation and no architecture — the same
+    coefficient function runs on CPU and GPU.
+
+    It exists because an open lateral boundary radiates as well as admits, and nothing was absorbing
+    what it radiated. On the 2020 `oslofjorden` run the boundary row carried velocities of 0.42 m/s
+    standard deviation and 2.04 m/s peak against 0.13 and 0.43 in the interior, and grid-scale
+    salinity roughness of 2.18 against 0.03 seventy rows in. That accumulated for fifty days in the
+    poorly ventilated near-boundary bottom cells and then ran away: max salinity went 54 → 86 → 192
+    psu over the last thirteen days while the *domain mean* moved by 1 psu, which is what identifies
+    it as redistribution rather than a source. The prepared boundary file was asking for 24–34 psu
+    throughout, so the exterior data was never the problem.
+
+    Four things about it are load-bearing.
+
+    **It is viscous, not a tracer relaxation band.** A band relaxing T and S a few cells inside the
+    domain would fight the open boundary condition, which is nudging the same variables at the
+    boundary towards the same data — which is exactly why the old interior relaxation band was deleted
+    when the open boundary arrived. Viscosity and diffusivity name no target and so cannot disagree
+    with one. This is the sponge that section said would be needed "if a run turns out to need it".
+
+    **The edges are not a field.** They come from `open_edges(boundary_config)`, which is why
+    `coupled_simulation` gained a `boundary_config` keyword — the same argument, for the same reason,
+    that `boundary_condition_sides` already receives. A setup that later opens a second edge sponges
+    both with no second edit, and one naming no boundary config gets `base` back unchanged rather than
+    a sponge of zero strength.
+
+    **The coefficient is bounded by stability, not by taste.** Explicit horizontal diffusion needs
+    `Δt ≤ Δx²/4ν`, which on `oslofjorden`'s 193 m cell is 310 s at `ν = 30` and 155 s at `ν = 60`. A
+    value that pushes that bound under the time-stepping config's `max_time_step` caps the run's time
+    step instead of the CFL doing it. Raise one and check the other.
+
+    **The ramp is `max(0, 1 - d/w)^2`, squared rather than linear**, so its derivative vanishes at the
+    inner end too: a ramp reaching zero with a kink is itself a discontinuity in the momentum equation,
+    which is the sort of thing an open boundary reflects off. `sponge_strength` takes the largest ramp
+    over the four edges with a `1.0`/`0.0` multiplier per edge rather than a branch, so a corner
+    belongs to whichever edge it is nearer and the kernel is one straight-line expression whatever
+    subset the setup opened. A Gaussian `exp(-(d/w)^2)` is the other common choice
+    and is what the reference implementation below uses; the squared ramp is preferred here only
+    because it is compactly supported, so no viscosity leaks into the interior at all.
+
+    **It is a `discrete_form = true` diffusivity, and that is not a style choice.** `ScalarDiffusivity`
+    only threads `parameters` through in its discrete form. Asked for the continuous one it stores the
+    bare function and calls it as `ν(λ, φ, z, t)` — four arguments, `parameters` silently dropped,
+    despite the constructor having accepted them. A parameterized method then never matches, and
+    because the call happens inside a GPU kernel the `MethodError` surfaces as
+    `InvalidIRError: unsupported call to an unknown function (call to jl_f_throw_methoderror)`
+    reported against an unrelated frame in the momentum tendency kernel — eight minutes into a build,
+    naming nothing that would lead you to the closure. The "boundary sponge" testset calls the
+    coefficient back through Oceananigans' own `νᶜᶜᶜ`/`κᶜᶜᶜ` dispatch precisely so that mismatch is a
+    test failure rather than a compile failure an hour into a run.
+
+    ### The restoring sponge, and why this is not one
+
+    The other standard shape is a `Relaxation` forcing over a near-boundary mask, pulling each field
+    towards a prescribed exterior state — NumericalEarth's `DatasetRestoring` is the ready-made
+    version. A regional Arctic configuration built that way nudges `T` and `S` at `1/1day` and `u` and
+    `v` at `1/20minutes` over a Gaussian mask four cells wide: velocities some seventy times harder
+    than tracers, on the reasoning that it is the *momentum* field near the boundary that has to stay
+    matched to what is prescribed.
+
+    That asymmetry agrees with the Oslofjord diagnosis from the other end — the boundary row's velocity
+    was 3–7x the interior's and the tracer extremes followed from it — and is why `viscosity` sits
+    above `diffusivity` here rather than equal to it.
+
+    FjordSim cannot simply adopt the restoring form. A relaxation forcing needs a *target throughout
+    the band*, and the exterior state a setup prepares exists only **at** the boundary row:
+    `boundary_series` returns reduced `FieldTimeSeries`, one cell thick. The only 3D target on the
+    model grid is `forcing.nc`, whose lambdas `prepare_forcing` deliberately writes as zero.
+    Reinstating a band there **for `u` and `v` alone** is the faithful translation, and it escapes the
+    objection that killed the old tracer band — that band fought the open boundary's own nudging of
+    the same tracers towards the same data, and a velocity band touches no tracer. That is the next
+    thing to try if this sponge proves too blunt.
+
+    `coefficient` stays a plain scalar on
     `QuadraticBottomDrag` rather than following the same pattern, because
     `boundary_condition_sides` is already the dispatched hook — there is no second function for it
     to delegate to the way `coupled_simulation` delegates to `free_surface`.
@@ -1212,12 +1424,34 @@ modules, in `include` order from `src/FjordSim.jl`:
 
     `writers` is a tuple of `AbstractWriterConfig`s, and `attach_writers!` just loops over it calling
     `attach_writer!`. Which simulation a writer attaches to is the method's business, not the
-    caller's: a `SnapshotWriter` goes on `simulation.model.ocean`, a `CheckpointWriter` on the coupled
-    simulation, and a `ProgressCallback` on the coupled one too.
+    caller's: a `SnapshotWriter` and a `FieldSnapshotWriter` go on `simulation.model.ocean`, a
+    `CheckpointWriter` on the coupled simulation, and a `ProgressCallback` on the coupled one too.
 
     A `SnapshotWriter`'s `variables` are `Symbol`s resolved by `snapshot_outputs` through
     `Oceananigans.fields(ocean_model)` — velocities, free surface, tracers, auxiliaries — so naming
-    `:w`, `:η` or a biogeochemical tracer is enough to have it written and nothing is enumerated here.
+    `:w` or a biogeochemical tracer is enough to have it written and nothing is enumerated here.
+
+    ### `FieldSnapshotWriter`, and the one field NetCDF will not take
+
+    `FieldSnapshotWriter` is the same idea written to JLD2, and it exists for exactly one reason:
+    **Oceananigans' NetCDF writer cannot emit a `(Center, Center, Nothing)` user output at all.** The
+    free surface `η` asks for a singleton `z_aaf = [0.0]` while the grid's own vertical coordinate
+    already owns that name with the real faces, and `create_spatial_dimensions!` raises rather than
+    reconciling them. Measured on `oslofjorden`: it fails beside the 3D fields, alone in a file of its
+    own, and with `include_grid_metrics = false`. `bottom_height` is the same location and *is*
+    written, because grid metrics take a different code path — which is what identifies this as an
+    upstream defect in the user-output path rather than something a setup can configure around.
+
+    So `η` goes in a second file, and the two writers split by *what a format can hold* rather than by
+    subject: 3D fields in NetCDF, which is what every reader here expects, and z-reduced fields in
+    JLD2, which serializes an array and has no dimension table to collide with. They share
+    `snapshot_outputs` rather than duplicating it — which names a model has, and the error naming the
+    ones it does not, are the same question whatever the format.
+
+    The JLD2 layout is Oceananigans', not FjordSim's: `timeseries/<name>/<iteration>` holds one
+    `Float32` array per record and `timeseries/t/<iteration>` the model time in seconds, with
+    `with_halos = false` so an array is exactly the interior — `(Nx, Ny, 1)` for `η`. No grid is
+    stored, so a reader needs the bathymetry file for geometry.
     A name the model lacks is an **error**, unlike `state_variables` on the read side, which
     intersects and moves on. The asymmetry is deliberate: that function serves two kinds of file whose
     variable sets legitimately differ and which no config named, while here the setup wrote the name
@@ -1385,7 +1619,11 @@ Bathymetry — `AbstractBathymetryConfig`, consumed by `prepare_bathymetry`:
 |---|---|---|
 | `bathymetry_dataset(target_grid, config)` → NumericalEarth dataset | yes | none |
 | `regrid_options(config)` → NamedTuple for `regrid_bathymetry` | no | `(;)` |
-| `smoothing_options(config)` → NamedTuple for `smooth_bathymetry_gaps!` — `max_island_cells`, `close_narrow_passages`, `spike_ratio`, `minimum_cell_fraction`, `max_slope_factor`, `minimum_depth` | no | `(;)`, leaving only the topological cleanup |
+| `smoothing_options(config)` → NamedTuple for `smooth_bathymetry_gaps!` — `open_boundary_land_cells`, `max_island_cells`, `close_narrow_passages`, `spike_ratio`, `minimum_cell_fraction`, `max_slope_factor`, `minimum_depth` | no | `(;)`, leaving only the topological cleanup |
+
+The `edges` keyword `prepare_bathymetry` takes is a pipeline *argument*, not a hook, exactly as
+`prepare_forcing`'s is: the `FjordConfig` driver reads it with `open_edges(config.boundary_config)`
+and every source inherits `clear_open_boundary_land` unchanged.
 
 Forcing — `AbstractForcingConfig`, consumed by `prepare_forcing`:
 
@@ -1495,23 +1733,35 @@ the one hardcoded `Callback(progress, TimeInterval(...))` fired.
 
 | Supertype | Field | Required hooks |
 |---|---|---|
-| `AbstractCoupledSimulationConfig` | `model` | `coupled_simulation(model, grid; forcing, boundary_conditions, initial_conditions, atmosphere, radiation, stop_time, initial_time_step)`, `model_tracers(model)` |
+| `AbstractCoupledSimulationConfig` | `model` | `coupled_simulation(model, grid; forcing, boundary_conditions, initial_conditions, atmosphere, radiation, boundary_config, stop_time, initial_time_step)`, `model_tracers(model)` |
 | `AbstractBoundaryConditionSetConfig` | `boundary_conditions` | `field_boundary_conditions(config, grid, forcing, boundary_config, tracers, boundaries)` |
 | `AbstractBoundaryConditionConfig` | the pieces inside the set | `boundary_condition_sides(config, grid, forcing, boundary_config, tracers[, boundaries])` — implement the six-argument form only if the piece reads the prepared open-boundary state; the five-argument one is reached through a forwarding fallback. The fourth argument was the *forcing* config before the open edge moved, so a piece that reads it needs checking |
 | `AbstractCallbackConfig` | `callbacks` (a tuple) | `attach_callback!(simulation, callback, config)` |
-| `AbstractWriterConfig` | `writers` (a tuple) | `attach_writer!(simulation, writer, config, loop)`; optionally `checkpoint_trait`, `output_path_trait`, both defaulting to the negative |
+| `AbstractWriterConfig` | `writers` (a tuple) | `attach_writer!(simulation, writer, config, loop)`; optionally `checkpoint_trait`, `output_path_trait`, both defaulting to the negative. `SnapshotWriter` (NetCDF), `FieldSnapshotWriter` (JLD2, for z-reduced fields NetCDF rejects) and `CheckpointWriter` are the built-ins |
 | `AbstractTimeSteppingConfig` | `time_stepping` | `attach_time_stepping!(simulation, config)`, `initial_time_step(config)` |
 
 A writer needs an `output_file` field only when its `output_path_trait` is `NamesOutputFile`; on any
 other, `results_path` raises a stated `ArgumentError` rather than failing on a missing field.
 
-`CoupledHydrostaticSimulation`, the built-in `AbstractCoupledSimulationConfig`, nests one further
-supertype of its own: `free_surface` is an `AbstractFreeSurfaceConfig`, required hook
-`free_surface(config, grid)` → the free-surface object `coupled_simulation` passes to
-`HydrostaticFreeSurfaceModel`. It is not one of the rows above — those are what `SimulationConfig`
-itself nests — but the same reasoning applies one level down: a different free surface is a new
+`CoupledHydrostaticSimulation`, the built-in `AbstractCoupledSimulationConfig`, can nest two further
+supertypes of its own. Neither is one of the rows above — those are what `SimulationConfig` itself
+nests — but the same reasoning applies one level down: a different free surface or closure is a new
 subtype and a new method, not an edit to `coupled_simulation`.
-`FjordSim.Simulations.SplitExplicitFreeSurfaceConfig` is the built-in implementation.
+
+| Supertype | Field | Required hook | Built-in |
+|---|---|---|---|
+| `AbstractFreeSurfaceConfig` | `free_surface` | `free_surface(config, grid)` → the free-surface object `coupled_simulation` passes to `HydrostaticFreeSurfaceModel` | `SplitExplicitFreeSurfaceConfig` |
+| `AbstractClosureConfig` | `closure` | `model_closure(config, grid, boundary_config)` → the closure, or tuple of closures, it passes | `BoundarySponge` |
+
+The two differ in one way that matters. `free_surface` is *always* a config — there is nothing else
+it could hold. `closure` holds a config **or** a pre-built Oceananigans closure, and usually the
+latter; `model_closure`'s fallback is the identity, so the two shapes are resolved by dispatch and a
+setup naming a plain closure needs no change and never sees the hook. Same pattern as
+`initial_conditions` and `resolve_initial_conditions`.
+
+`model_closure` takes `boundary_config` as well as the grid because a closure may act on the open
+edges, which are stated only on the `AbstractBoundaryDataConfig`. That is why `coupled_simulation`
+carries `boundary_config` too.
 
 `CoupledHydrostaticSimulation` also carries `extra_kwargs`, which is not a hook but the reason a
 setup rarely needs a *new* `AbstractCoupledSimulationConfig` subtype: it splats one `NamedTuple` per
@@ -1565,6 +1815,77 @@ of all of them — `extra_kwargs = (;)` included — because each is a scientifi
 fjord and a default would let the next
 setup silently inherit it. Adding a field to any of them therefore breaks every setup until each
 names it, which is the intent.
+
+### The vertical grid
+
+`oslofjorden`'s `z_faces` are a geometric stretch — ratio 1.25, capped at 33.5 m — from a 1 m surface
+cell to a deepest face at −400 m, 24 levels. They replaced a hand-written 18-level set running to
+−450 m in 25 m and 50 m steps, and the numbers are worth keeping because the replacement was measured
+against the actual bathymetry rather than chosen:
+
+| | 18 levels, to −450 m | 24 levels, to −400 m |
+|---|---|---|
+| median thickness of the layer holding a column's floor | **25.0 m** | **9.0 m** |
+| columns floored in a layer thicker than 20 m | **61.0 %** | **24.0 %** |
+| largest ratio between adjacent layers | 2.50 | 1.33 |
+| levels that are never wet | 1 | 0 |
+| median wet levels per column | 9 | 11 |
+| bottom cells thinner than 0.4 of their layer | 20.9 % | 20.3 % |
+| bottom cells `PartialCellBottom` has to clamp (true slivers) | 292 | **0** |
+
+The old grid's failure was the first row. A 25 m bottom cell is the entire near-bottom water column
+of that site in one cell, with no vertical structure in it, and that is precisely where the 2020
+run's tracer extremes sat: 96 % of the temperature offenders and 67 % of the salinity offenders were
+in a bottom cell, and those were overwhelmingly at k = 9 and k = 10, the two 25 m layers. The first
+layer, −450 to −400 m, held no water at all against a deepest sounding of 395.1 m, and `grid.Lz`
+feeds `sqrt(g·Lz)` in `SplitExplicitFreeSurface`, so the unused depth was also buying a shorter
+barotropic substep for nothing.
+
+Three things to know before changing it.
+
+**−400 m is deliberate headroom, not a coincidence.** The deepest sounding is 395.1 m, and
+`limit_bottom_slope` can only make the deepest column *shallower* (it is the deeper half of every
+pair it corrects), so the margin cannot close. A sounding below the deepest face is not an error —
+`snap_partial_bottom_cells` skips it and `PartialCellBottom` clips it — so the basin would simply be
+silently truncated.
+
+**More levels is not free, and not monotonically better.** A finer grid gives the seabed more faces
+to cross, so laterally isolated bottom cells rise from 3.9 % to 5.5 % of columns — see
+`snap_partial_bottom_cells`, which is what handles them. A 28-level ratio-1.20 variant scores better
+still (median floor layer 8.4 m, *no* column floored in a layer over 30 m) at 56 % more cells than
+the original rather than 33 %; it is the option to reach for if the deep basins still look
+under-resolved.
+
+**Changing it is a data change.** `z_faces` is written into `bathymetry.nc`, and `simulation_grid`
+reads the file rather than the config — so the run silently uses whatever the file holds. Every 3D
+prepared file is regridded onto that grid, so re-run `prepare_bathymetry` → `prepare_forcing` →
+`add_rivers` → `prepare_boundaries`. No download step is affected. The atmosphere is 2D and is not.
+
+### The 2020 diagnosis
+
+Several of `oslofjorden()`'s current values are there because of one run, and are commented in the
+setup file with the number that justifies them. Collected here so the reasoning is not spread across
+six comments:
+
+- **`BoundarySponge`** on `closure` — the open boundary radiated noise nothing absorbed. See
+  "`closure` and `BoundarySponge`" under Simulations.
+- **`tracer_advection = WENO()`**, a scalar rather than `(T = WENO(), S = WENO())` — Oceananigans
+  gives any tracer a `NamedTuple` omits the `Centered()` default, and CATKE contributes an `e` the
+  setup never names, so `e` was being advected by an unbounded centered scheme. A scalar covers
+  whatever the closure adds, now and later. This is the shape NumericalEarth's own `ocean_simulation`
+  uses.
+- **`inflow_timescale = 3hours`**, down from `1day` — at the ~10 s steps the run actually takes, a
+  one-day timescale relaxes by 1.2 × 10⁻⁴ per step against an advective rate into the boundary cell
+  of ~2.5 × 10⁻³ s⁻¹. Two hundred times weaker than what it was competing with. Both timescales are
+  tuning knobs; too strong an inflow nudge over-constrains an open boundary and reflects.
+- **`max_slope_factor = 0.25`**, down from `0.5` — measured on this bathymetry, the Drøbak sill goes
+  from 65.2 m to 64.6 m, the deepest point is untouched and water volume changes by 0.000 %, while
+  adjacent pairs steeper than r = 0.3 go from 4620 to none. The standing worry that a tight limit
+  flattens a genuine sill does not survive contact with this domain.
+- **`max_island_cells = 6`, unchanged and deliberately so** — every remaining interior land component
+  is 7 cells or larger with a minimum width of 2 to 4 cells and bounding boxes like 4×8 and 5×4.
+  Those are compact skerries, not the one-cell ridges the stage exists to remove, and raising the
+  threshold would delete real topography.
 
 `start_date` and `stop_time` also decide what the prepare steps write, since both pad their time
 axes to that window — so changing either is a data change, not just a run change. See "Changing

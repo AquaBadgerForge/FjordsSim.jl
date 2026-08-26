@@ -517,7 +517,7 @@ function write_prepared_boundaries(
     land = nothing,
 )
     Nx, Ny, Nz = size
-    open_edges = FjordSim.Forcing.lateral_edges(edges)
+    open_edges = FjordSim.Configs.lateral_edges(edges)
 
     NCDataset(filepath, "c") do ds
         for (name, length) in (

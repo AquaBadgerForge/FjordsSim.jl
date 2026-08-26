@@ -18,7 +18,14 @@ using Statistics: mean, median
 
 using NumericalEarth.DataWrangling: Metadatum, metadata_path
 
-using ..Configs: AbstractBathymetryConfig, FjordConfig, bathymetry_path, domain_grid
+using ..Configs:
+    AbstractBathymetryConfig,
+    FjordConfig,
+    bathymetry_path,
+    domain_grid,
+    open_edges,
+    lateral_edges,
+    LATERAL_EDGES
 using ..Plotting: plot_bathymetry
 
 # Matches the fixed loop count and neighbor threshold used in the Oslofjord notebook's
@@ -28,9 +35,18 @@ const ISOLATED_SEA_CELL_LAND_SIDES = 3
 # A spike needs neighbors to be compared against; two is the minimum that gives a meaningful
 # median and keeps single-cell inlets, which have one wet neighbor, out of it.
 const SPIKE_MIN_WET_NEIGHBOURS = 2
-# `limit_bottom_slope` converges in tens of passes at the slope factors a fjord needs; the cap
-# only exists so a pathological input cannot spin forever.
-const SLOPE_LIMIT_MAX_PASSES = 400
+# `limit_bottom_slope` reaches its target in tens of passes at the slope factors a fjord needs, but
+# its exact convergence test can keep sweeping after that (see the function), so the cap is what
+# stops it in practice and is set high enough that the extra sweeps are affordable.
+const SLOPE_LIMIT_MAX_PASSES = 1000
+# How far above `max_slope_factor` the achieved slope may sit before it is a real failure rather than
+# `Float32` rounding on a pair the limiter has driven exactly onto the limit.
+const SLOPE_LIMIT_TOLERANCE = 1e-3
+# The element type `write_bathymetry_file` stores bottom heights as, and therefore the precision the
+# simulation actually runs on: `Grids.ImmersedBoundaryGrid` reads the file back and immerses what it
+# finds there. Stated once because `snap_partial_bottom_cells` has to reason in it — see
+# `snap_to_face` — and a snap that only holds in the pipeline's own precision does not hold.
+const BATHYMETRY_ELTYPE = Float32
 # NumericalEarth bathymetry regridding constructs a native grid with halo = (10, 10, 1).
 # Keep a generated raw dataset comfortably larger than that minimum.
 const MIN_NATIVE_BATHYMETRY_SIZE = 24
@@ -81,10 +97,15 @@ Regrid the bathymetry source described by `config` onto `target_grid` with
 The source enters only through `bathymetry_dataset(target_grid, config)`; regridding options
 come from `regrid_options(config)`, with `regrid_kw...` overriding them per call.
 
+`edges` names the domain's open lateral boundaries, and reaches `smooth_bathymetry_gaps!` for the
+one stage that acts on them. It is a keyword rather than a field of the bathymetry config for the
+same reason `prepare_forcing` takes one: which edges are open is a property of the domain and its
+exterior data, not of a bathymetry source. `nothing` means none, and that stage is then a no-op.
+
 # Returns
 A named tuple with `dataset`, `raw_file`, `output_file`, and `bottom_height`.
 """
-function prepare_bathymetry(target_grid, config::AbstractBathymetryConfig; regrid_kw...)
+function prepare_bathymetry(target_grid, config::AbstractBathymetryConfig; edges = nothing, regrid_kw...)
     dataset = bathymetry_dataset(target_grid, config)
     metadata = Metadatum(:bottom_height; dataset)
 
@@ -94,7 +115,7 @@ function prepare_bathymetry(target_grid, config::AbstractBathymetryConfig; regri
 
     output_file = bathymetry_path(config)
     @info "Smoothing small-scale bathymetry gaps"
-    smooth_bathymetry_gaps!(bottom_height; smoothing_options(config)...)
+    smooth_bathymetry_gaps!(bottom_height; smoothing_options(config)..., edges)
     @info "Writing processed bathymetry file to $output_file"
     write_bathymetry_file(output_file, target_grid, bottom_height)
     @info "Finished preparing bathymetry"
@@ -113,6 +134,10 @@ grid is built on the CPU because that is what the rest of the preparation pipeli
 `bathymetry_path`'s directory is created here since this is the first step of a setup and nothing
 has written into `data_root` yet.
 
+The open edges come from `open_edges(config.boundary_config)` — the one place a setup states them —
+so a setup naming no boundary data config prepares its bathymetry with every lateral boundary
+treated as a wall, which is the right reading when there is no exterior state to admit.
+
 # Returns
 The `prepare_bathymetry(target_grid, config)` named tuple with `plot_file` added.
 """
@@ -121,7 +146,7 @@ function prepare_bathymetry(config::FjordConfig)
     mkpath(dirname(bathymetry_path(config.bathymetry_config)))
     print_grid_extents(grid)
 
-    result = prepare_bathymetry(grid, config.bathymetry_config)
+    result = prepare_bathymetry(grid, config.bathymetry_config; edges = open_edges(config.boundary_config))
     plot_file = plot_bathymetry(grid, result.bottom_height, config.bathymetry_config)
 
     @info "Raw bathymetry saved to $(result.raw_file)"
@@ -179,7 +204,7 @@ function write_bathymetry_file(filepath::String, target_grid, bottom_height)
         longitude_variable = defVar(ds, "lon", Float64, ("lon",))
         latitude_variable = defVar(ds, "lat", Float64, ("lat",))
         z_faces_variable = defVar(ds, "z_faces", Float64, ("zf",))
-        bottom_height_variable = defVar(ds, "h", Float32, ("lon", "lat"))
+        bottom_height_variable = defVar(ds, "h", BATHYMETRY_ELTYPE, ("lon", "lat"))
 
         longitude_variable[:] = longitude
         latitude_variable[:] = latitude
@@ -193,24 +218,35 @@ function write_bathymetry_file(filepath::String, target_grid, bottom_height)
 end
 
 """
-    smooth_bathymetry_gaps!(bottom_height; max_island_cells = 0, close_narrow_passages = false,
-                            spike_ratio = 0, minimum_cell_fraction = 0, max_slope_factor = 0,
-                            minimum_depth = 0)
+    smooth_bathymetry_gaps!(bottom_height; open_boundary_land_cells = 0, max_island_cells = 0,
+                            close_narrow_passages = false, spike_ratio = 0,
+                            minimum_cell_fraction = 0, max_slope_factor = 0, minimum_depth = 0,
+                            edges = nothing)
 
-Clean up the regridded bathymetry in place, in six stages.
+Clean up the regridded bathymetry in place, in seven stages.
 
 First the topological pass every source gets: one diagonal-pair fill, then
 `BATHYMETRY_GAP_FILL_PASSES` rounds of isolated sea/land cell cleanup, following the fixed cleanup
 used for the Oslofjord ROMS-based bathymetry. This removes the checkerboard noise that would
 otherwise skew the neighbor medians a later stage takes.
 
-Then five optional stages, each skipped when its parameter is `false` or zero so a source that
-configures none keeps exactly the behavior above: `fill_small_islands` with `max_island_cells`,
+Then six optional stages — seven runs, since `snap_partial_bottom_cells` runs once each side of
+slope limiting — each skipped when its parameter is `false` or zero so a source that configures none
+keeps exactly the behavior above: `clear_open_boundary_land` with
+`open_boundary_land_cells` and `edges`, `fill_small_islands` with `max_island_cells`,
 `remove_narrow_passages` with `close_narrow_passages`, `fill_shallow_spikes` with `spike_ratio`,
 `snap_partial_bottom_cells` with `minimum_cell_fraction`, and `limit_bottom_slope` with
 `max_slope_factor` and `minimum_depth`.
 
-The order of the five is forced. The two stages that change the *land mask* run before the two that
+`clear_open_boundary_land` is first of the six, and belongs there for the same reason
+`fill_small_islands` precedes `remove_narrow_passages`: it only ever turns land into sea, so it can
+neither manufacture a narrow passage nor strand a cell, while running it first lets the island and
+passage stages judge the band as it will actually be. A land component straddling the band's inner
+edge loses its in-band cells here and is then correctly measured — as whatever is left of it — by
+`fill_small_islands`. It is also the only stage that reads `edges`, and it is a no-op when the setup
+names none.
+
+The order of the remaining five is forced. The two stages that change the *land mask* run before the two that
 change depths: run the other way round, the cells they are about to turn into land or water would
 already have contributed to a neighbor median and to a slope pair. Of the two land-mask stages,
 `fill_small_islands` runs first, because flooding an island only ever widens water and so cannot
@@ -219,13 +255,19 @@ where these islands live — and can bridge one to the mainland, hiding it from 
 good. Despiking then precedes slope limiting, because a spike is precisely the kind of one-cell
 feature that slope limiting would otherwise smear into its neighbors instead of removing.
 
-`snap_partial_bottom_cells` sits between those two: after despiking, which moves a cell to its
-neighbours' median depth with no regard for where the vertical faces are, and *before* slope
-limiting rather than last, because slope limiting is what leaves the field smooth and should keep
-the last word. The cost of that choice is that slope limiting re-creates a few of the slivers the
-snap just removed — on `oslofjorden`, 178 of 9907, none of them on the open boundary. Running the
-snap last instead removes every one but pushes the steepest slope parameter from 0.500 to 0.560,
-silently undoing the limit the stage before it had just enforced, which is the worse trade.
+`snap_partial_bottom_cells` runs **twice**, once each side of slope limiting, and that is not
+redundancy. It is the only stage that knows where the vertical faces are, and slope limiting moves
+depths without regard for them, so the limiter is guaranteed to put back slivers the snap removed —
+the tighter the limit, the more of them. Measured on `oslofjorden` at `max_slope_factor = 0.25`, one
+snap before the limiter leaves 2628 slivers (6.0% of bottom cells) in the finished field; snapping
+again afterwards leaves **none**. The price is that the second snap breaks the limit it was just
+handed: the steepest slope goes from 0.250 to 0.307, on 16 pairs out of 84 000. That is the whole
+trade — a slope parameter 23% over its target on a handful of pairs, against six percent of the
+domain's bottom cells being slivers.
+
+The first snap is not made redundant by the second. It hands the limiter a field already aligned to
+the faces, so the limiter has less to move and the second snap has less to correct; and where the
+limiter does not run at all (`max_slope_factor = 0`) it is the only one there is.
 
 Closing a passage leaves a dead-end stub behind — the cell on the far side of it now has three land
 neighbors — so the isolated-cell cleanup loop runs again afterwards. That loop cannot re-open a
@@ -238,12 +280,14 @@ anything new to fire on.
 """
 function smooth_bathymetry_gaps!(
     bottom_height;
+    open_boundary_land_cells = 0,
     max_island_cells = 0,
     close_narrow_passages = false,
     spike_ratio = 0,
     minimum_cell_fraction = 0,
     max_slope_factor = 0,
     minimum_depth = 0,
+    edges = nothing,
 )
     cpu_bottom_height = on_architecture(CPU(), bottom_height)
     h = Array(interior(cpu_bottom_height, :, :, 1))
@@ -251,6 +295,14 @@ function smooth_bathymetry_gaps!(
     h = fill_secondary_diagonal_pairs(fill_diagonal_pairs(h))
     for _ = 1:BATHYMETRY_GAP_FILL_PASSES
         h = fill_isolated_land_cells(remove_isolated_sea_cells(h))
+    end
+
+    if open_boundary_land_cells > 0
+        wet_before = count(<(0), h)
+        for edge in lateral_edges(edges)
+            h = clear_open_boundary_land(h, Val(edge); cells = open_boundary_land_cells)
+        end
+        @info "Flooded $(count(<(0), h) - wet_before) land cells within $open_boundary_land_cells cells of the open boundary"
     end
 
     if max_island_cells > 0
@@ -270,18 +322,122 @@ function smooth_bathymetry_gaps!(
 
     spike_ratio > 0 && (h = fill_shallow_spikes(h; ratio = spike_ratio))
 
-    if minimum_cell_fraction > 0
-        z_faces = vertical_faces(bottom_height.grid)
-        snapped = snap_partial_bottom_cells(h, z_faces; minimum_cell_fraction, minimum_depth)
-        @info "Raised $(count(!=(0), snapped - h)) columns off a bottom cell thinner than $minimum_cell_fraction of its layer"
-        h = snapped
-    end
+    z_faces = minimum_cell_fraction > 0 ? vertical_faces(bottom_height.grid) : nothing
 
-    max_slope_factor > 0 && (h = limit_bottom_slope(h; max_slope_factor, minimum_depth))
+    minimum_cell_fraction > 0 &&
+        (h = snap_and_report(h, z_faces, minimum_cell_fraction, minimum_depth, "before slope limiting"))
+
+    if max_slope_factor > 0
+        h = limit_bottom_slope(h; max_slope_factor, minimum_depth)
+        # Slope limiting moves depths without regard for where the vertical faces are, so it puts
+        # back the very slivers the snap above removed — and the tighter the limit, the more of
+        # them. Snapping again is what makes the two stages compose instead of one undoing the
+        # other; see the docstring for what it costs.
+        minimum_cell_fraction > 0 &&
+            (h = snap_and_report(h, z_faces, minimum_cell_fraction, minimum_depth, "after slope limiting"))
+    end
 
     set!(bottom_height, h)
     return bottom_height
 end
+
+"""
+    snap_and_report(h, z_faces, minimum_cell_fraction, minimum_depth, when)
+
+`snap_partial_bottom_cells`, plus the log line saying how many columns it moved and `when` it ran.
+
+A named helper because the stage runs twice — once before slope limiting and once after — and the
+two counts together are what tells a reader how much of the first pass the limiter undid.
+"""
+function snap_and_report(h, z_faces, minimum_cell_fraction, minimum_depth, when)
+    snapped = snap_partial_bottom_cells(h, z_faces; minimum_cell_fraction, minimum_depth)
+    @info "Raised $(count(!=(0), snapped - h)) columns off a bottom cell thinner than $minimum_cell_fraction of its layer ($when)"
+    return snapped
+end
+
+"""
+    clear_open_boundary_land(h, edge::Val; cells)
+
+Flood every land cell within `cells` rows of one open lateral boundary, giving each the mean depth
+of its wet neighbours.
+
+A coastline that runs into an open boundary is the worst place in the domain for one to be. The
+boundary condition there has to reconcile a radiation scheme, a prescribed exterior state and a wall
+within a cell or two of each other, and a headland poking through the boundary row splits the
+prescribed inflow around an obstacle the exterior dataset never saw. Clearing a band of it leaves the
+open edge a clean, uninterrupted channel, which is the geometry every open-boundary scheme is derived
+for.
+
+The cost is that the newly wet cells have no exterior profile of their own — the prepared boundary
+file marks them dry, and `FjordSim.Forcing.fill_boundary_gaps!` fills them from the nearest wet cell
+along the boundary. That is the same treatment a boundary column already gets wherever the model and
+the source disagree about the coastline, so the trade is a few laterally interpolated columns against
+a headland in the boundary row. Keep `cells` small enough that it stays a few.
+
+Depths are assigned by repeated relaxation rather than in one pass: each round fills the cells that
+have at least one wet neighbour *now*, so a cell in the middle of a cleared headland inherits from
+the coast through the cells between it, and the band ramps rather than stepping. A cell no round can
+reach is left as land, which can only happen if the band holds a land component touching nothing wet.
+
+# Arguments
+- `h`: bottom height, `h < 0` sea.
+- `edge`: `Val(:south)`, `Val(:north)`, `Val(:west)` or `Val(:east)`.
+- `cells`: how many rows in from that edge to clear.
+"""
+function clear_open_boundary_land(h, edge::Val; cells)
+    Nx, Ny = size(h)
+    cleared = copy(h)
+    band = open_boundary_band(edge, Nx, Ny, cells)
+
+    pending = [(i, j) for j in band[2], i in band[1] if h[i, j] >= 0]
+    isempty(pending) && return cleared
+
+    # One round per row of the band is enough for the innermost cell to reach the coast, and the
+    # loop breaks as soon as a round fills nothing, so the bound only caps a band that cannot fill.
+    for _ = 1:(cells+1)
+        isempty(pending) && break
+
+        filled = Tuple{Int,Int}[]
+        depths = eltype(h)[]
+        for (i, j) in pending
+            neighbours = eltype(h)[]
+            for (di, dj) in ((1, 0), (-1, 0), (0, 1), (0, -1))
+                ii, jj = i + di, j + dj
+                (1 <= ii <= Nx && 1 <= jj <= Ny) || continue
+                cleared[ii, jj] < 0 && push!(neighbours, cleared[ii, jj])
+            end
+            isempty(neighbours) && continue
+            push!(filled, (i, j))
+            push!(depths, mean(neighbours))
+        end
+        isempty(filled) && break
+
+        # Written after the whole round is computed, so every cell in one round sees the same
+        # field and the fill does not depend on the order the band is walked.
+        for (n, cell) in enumerate(filled)
+            cleared[cell...] = depths[n]
+        end
+        pending = filter(cell -> cleared[cell...] >= 0, pending)
+    end
+
+    return cleared
+end
+
+"""
+    open_boundary_band(edge::Val, Nx, Ny, cells)
+
+The `(i_range, j_range)` of the `cells` rows nearest one lateral edge, clamped to the domain.
+
+One method per edge, so the four are independent statements rather than branches, and an edge that
+is not one of `LATERAL_EDGES` raises rather than silently selecting nothing.
+"""
+open_boundary_band(::Val{:south}, Nx, Ny, cells) = (1:Nx, 1:min(cells, Ny))
+open_boundary_band(::Val{:north}, Nx, Ny, cells) = (1:Nx, max(1, Ny - cells + 1):Ny)
+open_boundary_band(::Val{:west}, Nx, Ny, cells) = (1:min(cells, Nx), 1:Ny)
+open_boundary_band(::Val{:east}, Nx, Ny, cells) = (max(1, Nx - cells + 1):Nx, 1:Ny)
+
+open_boundary_band(::Val{edge}, Nx, Ny, cells) where {edge} =
+    throw(ArgumentError("open_edge must be one of $LATERAL_EDGES, got :$edge"))
 
 """
     fill_shallow_spikes(h; ratio, min_neighbours = SPIKE_MIN_WET_NEIGHBOURS)
@@ -322,6 +478,37 @@ function fill_shallow_spikes(h; ratio, min_neighbours = SPIKE_MIN_WET_NEIGHBOURS
 end
 
 """
+    snap_to_face(FT, face)
+
+`face` as an `FT`, rounded *away* from the water: the smallest `FT` value at or above it.
+
+`FT` here is `BATHYMETRY_ELTYPE`, the precision the *file* stores, not the precision the pipeline
+computes in — and that distinction is the whole point. `smooth_bathymetry_gaps!` works in the grid's
+float type, usually `Float64`, where `face_above` lands on the face exactly; the narrowing to
+`Float32` happens later, in `write_bathymetry_file`, on a value the snap has already stopped looking
+at. So a snap that is exact when it is made can be undone by the write.
+
+It is undone whenever a face is not representable in `Float32`. Four of `oslofjorden`'s are not —
+−10.8, −7.9, −3.7 and −2.2 all narrow to a hair *below* the face they name. The stored column then
+ends an infinitesimal distance under the face, so the layer beneath is its bottom cell at about
+5 × 10⁻⁸ of full thickness: the pipeline writes out, in the worst possible form, exactly the sliver
+it removed. Measured on `oslofjorden`, 1265 columns, 2.9 % of the domain, every one of them at those
+four faces.
+
+Rounding up ends the column a nanometre *above* the face instead, which survives the narrowing and
+reads back as a full bottom cell. The error introduced is at the seventh significant figure of a
+depth in metres.
+
+The old 18-level `z_faces` were every one exactly representable in `Float32`, which is why this never
+bit before, and why it is stated here rather than left as a silent guard: the next setup to write a
+face like −10.8 would hit it again.
+"""
+@inline function snap_to_face(FT, face)
+    rounded = convert(FT, face)
+    return rounded < face ? nextfloat(rounded) : rounded
+end
+
+"""
     limit_bottom_slope(h; max_slope_factor, minimum_depth = 0, max_passes = SLOPE_LIMIT_MAX_PASSES)
 
 Limit the bathymetry's steepness so that no two adjacent sea cells differ by more than
@@ -353,7 +540,9 @@ function limit_bottom_slope(
     depth = map(value -> value < 0 ? -value : convert(eltype(h), NaN), h)
     Nx, Ny = size(h)
 
-    for _ = 1:max_passes
+    passes = 0
+    for pass = 1:max_passes
+        passes = pass
         steepest = zero(eltype(h))
 
         for i = 1:Nx, j = 1:Ny
@@ -379,7 +568,48 @@ function limit_bottom_slope(
         steepest <= max_slope_factor && break
     end
 
+    # The loop's own test is measured before each pass's fixes and compares exactly, so a field whose
+    # steepest pair has been driven *onto* the limit can still round marginally above it in `Float32`
+    # and never register a clean pass. Report what the field actually achieved rather than what the
+    # loop concluded, and say so when the cap was what stopped it.
+    achieved = steepest_slope(depth)
+    if passes == max_passes
+        @info "limit_bottom_slope stopped at the $max_passes-pass cap with steepest slope $achieved (limit $max_slope_factor)"
+        achieved > max_slope_factor * (1 + SLOPE_LIMIT_TOLERANCE) && @warn(
+            "Bathymetry slope limiting did not converge: steepest slope is $achieved against a " *
+            "limit of $max_slope_factor. Raise `max_passes` or loosen `max_slope_factor`."
+        )
+    else
+        @info "limit_bottom_slope converged in $passes passes with steepest slope $achieved (limit $max_slope_factor)"
+    end
+
     return map((original, d) -> isnan(d) ? original : -d, h, depth)
+end
+
+"""
+    steepest_slope(depth)
+
+The largest `r = |d1 - d2| / (d1 + d2)` over adjacent wet pairs of a `depth` field whose land is
+`NaN`. What `limit_bottom_slope` actually achieved, as opposed to what it measured on its way there.
+"""
+function steepest_slope(depth)
+    Nx, Ny = size(depth)
+    steepest = zero(eltype(depth))
+
+    for i = 1:Nx, j = 1:Ny
+        isnan(depth[i, j]) && continue
+
+        for (di, dj) in ((1, 0), (0, 1))
+            ii, jj = i + di, j + dj
+            (ii <= Nx && jj <= Ny) || continue
+            isnan(depth[ii, jj]) && continue
+
+            here, there = depth[i, j], depth[ii, jj]
+            steepest = max(steepest, abs(here - there) / (here + there))
+        end
+    end
+
+    return steepest
 end
 
 """
@@ -408,15 +638,22 @@ for 33.2 psu and 8.1 °C and the cell was inflowing 70% of the time — the nudg
 throughout and simply could not keep up. Across the domain the tracer overshoots were six times
 over-represented in bottom cells with at most one lateral neighbour.
 
-Refining `z_faces` is the obvious alternative and it does not work: a finer grid gives the seabed
-more faces to cross, so the count of laterally isolated bottom cells *rises* — measured, 165 for the
-18-level grid against 235 to 280 for stretched 20 to 24-level ones. It is the sliver that has to go,
-not the layer that has to shrink.
+Refining `z_faces` is the obvious alternative and it does not substitute: a finer grid gives the
+seabed more faces to cross, so the count of laterally isolated bottom cells *rises* — measured on
+`oslofjorden`, 3.9% of columns on the 18-level grid against 5.0% on the 24-level one that replaced
+it. It is the sliver that has to go, not the layer that has to shrink. The two are complementary,
+and the finer grid makes this stage matter slightly more rather than less.
+
+Called **twice** by `smooth_bathymetry_gaps!`, once each side of slope limiting; see there for why.
+
+The value written is `snap_to_face(BATHYMETRY_ELTYPE, face_above)`, not `face_above` itself, because
+the snap has to survive being narrowed to the file's precision — see `snap_to_face`.
 
 Two guards. A column is left alone when the face above is the surface or when snapping to it would
 breach `minimum_depth`, so the stage never dries a cell out or undercuts the depth floor; such a
 column keeps its sliver and `PartialCellBottom` floors it as before. On `oslofjorden` neither guard
-fires.
+fires, and with both passes in place `PartialCellBottom`'s clamp does not fire anywhere in the
+finished field.
 """
 function snap_partial_bottom_cells(h, z_faces; minimum_cell_fraction, minimum_depth = 0)
     snapped = copy(h)
@@ -434,7 +671,7 @@ function snap_partial_bottom_cells(h, z_faces; minimum_cell_fraction, minimum_de
         fraction < minimum_cell_fraction || continue
         (face_above < 0 && -face_above >= minimum_depth) || continue
 
-        snapped[i, j] = oftype(h[i, j], face_above)
+        snapped[i, j] = oftype(h[i, j], snap_to_face(BATHYMETRY_ELTYPE, face_above))
     end
 
     return snapped

@@ -9,6 +9,7 @@ export AbstractGridConfig,
     AbstractSimulationConfig,
     AbstractCoupledSimulationConfig,
     AbstractFreeSurfaceConfig,
+    AbstractClosureConfig,
     AbstractBoundaryConditionConfig,
     AbstractBoundaryConditionSetConfig,
     AbstractWriterConfig,
@@ -17,6 +18,7 @@ export AbstractGridConfig,
     FjordConfig,
     domain_grid,
     simulation_grid,
+    model_closure,
     bathymetry_path,
     forcing_path,
     forcing_directory,
@@ -28,6 +30,9 @@ export AbstractGridConfig,
     results_path,
     plot_path,
     open_edges,
+    LATERAL_EDGES,
+    validate_open_edge,
+    lateral_edges,
     run_tag,
     coverage_window
 
@@ -356,7 +361,10 @@ model assembly is a new subtype rather than an edit to an existing method body.
 
 # Methods a subtype provides
 - `coupled_simulation(model, grid; forcing, boundary_conditions, initial_conditions, atmosphere,
-  radiation, stop_time, initial_time_step)`: build and return the coupled `Simulation`. Required.
+  radiation, boundary_config, stop_time, initial_time_step)`: build and return the coupled
+  `Simulation`. Required. `boundary_config` is the setup's `AbstractBoundaryDataConfig` (or
+  `nothing`), passed for the same reason `boundary_condition_sides` receives it — so a nested config
+  that acts on the open edges reads them from the one place they are stated.
 - `model_tracers(model)`: the tracer names the model carries, as a tuple of `Symbol`s. Required —
   `build_simulation` needs them before the model exists, to pick which forcing terms to build,
   which lateral tracer boundaries to open and which state variables to read back.
@@ -382,6 +390,41 @@ cfl = ...)` needs the grid, which does not exist until `coupled_simulation` is c
 `FjordSim.Simulations.SplitExplicitFreeSurfaceConfig` is the built-in implementation.
 """
 abstract type AbstractFreeSurfaceConfig end
+
+"""
+    AbstractClosureConfig
+
+Supertype for *closure* configurations. A concrete subtype names a turbulence closure's knobs, and
+its `model_closure(config, grid, boundary_config)` method builds the closure — or closure tuple —
+that `coupled_simulation` passes to `HydrostaticFreeSurfaceModel`.
+
+The `closure` field of a coupled-simulation config holds either a pre-built Oceananigans closure
+(the usual case, and what every setup wrote before this supertype existed) or one of these. Which
+one it is is resolved by dispatch on `model_closure`, the way `initial_conditions` is resolved by
+`FjordSim.Simulations.resolve_initial_conditions` — three methods rather than a branch, and an
+identity fallback so a pre-built closure passes through untouched and no existing setup changes.
+
+It exists because a closure can need what only exists at build time. `FjordSim.Simulations.BoundarySponge`
+is the built-in implementation and needs two such things: the grid, for the domain extent and cell
+size its ramp is expressed in, and the *open edges*, which are stated once on the
+`AbstractBoundaryDataConfig` and read back with `open_edges` — so a setup that opens a second edge
+cannot end up sponging only the first.
+
+# Methods a subtype provides
+- `model_closure(config, grid, boundary_config)`: build the closure. Required.
+"""
+abstract type AbstractClosureConfig end
+
+"""
+    model_closure(closure, grid, boundary_config)
+
+The closure `coupled_simulation` gives `HydrostaticFreeSurfaceModel`.
+
+The fallback is the identity, so anything a setup already writes — a single Oceananigans closure, or
+a tuple of them — passes through unchanged. An `AbstractClosureConfig` overloads it to build one
+from the grid and the setup's open-boundary data config.
+"""
+model_closure(closure, grid, boundary_config) = closure
 
 """
     AbstractBoundaryConditionConfig
@@ -559,6 +602,54 @@ holds however many boundaries a setup opens.
 boundary_data_path(config::AbstractBoundaryDataConfig) = joinpath(config.data_root, config.output_file)
 
 """
+The four lateral boundaries a regional domain can be open on, in the order every error message
+lists them.
+
+Stated here, beside `open_edges`, because every module that reasons about an edge is included after
+this one and none of them can see each other: `Bathymetry` clears land along the open ones, `Forcing`
+restores their velocity face rows and regrids along them, and every `Val{edge}` dispatch in
+`BoundaryConditions` falls back to an `ArgumentError` naming this tuple. It has already been a
+per-module copy twice — with identical contents, an identical membership test and an identical error
+string each time — which is what settled the question of where it belongs.
+"""
+const LATERAL_EDGES = (:south, :north, :west, :east)
+
+"""
+    validate_open_edge(edge)
+
+Return `edge` if it names a lateral boundary, else throw. Checked up front so a typo fails
+before any regridding rather than deep inside the variable loop.
+
+Checked here rather than in each pipeline so one typo produces one error message wherever it is
+written — in a boundary data config's `open_edges`, or in the `edges` a prepare step is handed.
+"""
+function validate_open_edge(edge)
+    edge in LATERAL_EDGES ||
+        throw(ArgumentError("open_edge must be one of $LATERAL_EDGES, got :$edge"))
+    return edge
+end
+
+"""
+    lateral_edges(edges)
+
+Normalize whatever a caller names its open edges as into a validated `Vector{Symbol}`: one `Symbol`,
+an iterable of them, or `nothing` for none.
+
+Every consumer iterates, so a domain open on one edge, on all four, or on none is the same code path
+rather than a scalar case and a plural one. Duplicates are rejected — a repeated edge would prepare
+and write the same variables twice, and mean nothing the second time.
+"""
+lateral_edges(::Nothing) = Symbol[]
+lateral_edges(edge::Symbol) = [validate_open_edge(edge)]
+
+function lateral_edges(edges)
+    normalized = Symbol[validate_open_edge(edge) for edge in edges]
+    allunique(normalized) ||
+        throw(ArgumentError("open_edges names an edge more than once: $normalized"))
+    return normalized
+end
+
+"""
     open_edges(config)
 
 Which lateral boundaries the domain is open on, as named by an `AbstractBoundaryDataConfig` — a
@@ -567,7 +658,7 @@ therefore all closed walls.
 
 Always a collection, never a bare `Symbol`, so a domain open on one edge, on all four, or on none is
 one code path in every consumer rather than a scalar case and a plural one. A built-in config's
-keyword constructor accepts either shape and normalizes with `FjordSim.Forcing.lateral_edges`.
+keyword constructor accepts either shape and normalizes with `lateral_edges`.
 
 Declared here rather than beside the pipelines that read it because all of them do: `Forcing` needs
 it for `water_mask` and is included first, both boundary steps regrid and subset along the edges, and

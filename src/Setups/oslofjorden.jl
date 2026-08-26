@@ -34,13 +34,24 @@ function oslofjorden()
         # which build_simulation reads the model grid through — both dispatching on this config's
         # type. Implemented here by wrapping LatitudeLongitudeGrid / ImmersedBoundaryGrid.
         grid_config = EvenGrid(
-            size      = (240, 520, 18),
+            size      = (240, 520, 24),
             halo      = (7, 7, 7),
             longitude = (10.2, 11.02),
             latitude  = (59.0, 59.93),
+            # A geometric stretch, ratio 1.25 capped at 33.5 m, from a 1 m surface cell to a
+            # deepest face at -400 m — the deepest sounding is 395.1 m, so nothing is clipped and
+            # nothing is wasted. The predecessor's 18 levels ran to -450 m, where the first layer
+            # held no water at all, and reached the seabed in 25 m and 50 m steps: the median
+            # column's floor sat in a 25 m layer and 61% of columns were floored in a layer thicker
+            # than 20 m, so the deepest 25 m of a column was one cell with no vertical structure.
+            # That is where the tracer extremes of the 2020 run sat — 96% of them in a bottom cell,
+            # almost all at the two 25 m layers. Here the median floor layer is 9 m, 24% of columns
+            # exceed 20 m, and no two adjacent layers differ by more than a factor 1.33 (it was
+            # 2.50, at the 25 m to 10 m step).
             z_faces   = [
-                -450.0, -400.0, -350.0, -300.0, -250.0, -200.0, -150.0, -100.0,
-                -75.0, -50.0, -25.0, -15.0, -10.0, -7.5, -5.0, -3.0, -2.0, -1.0, 0.0,
+                -400.0, -366.5, -333.0, -299.5, -266.0, -232.5, -199.0, -165.5,
+                -132.0, -105.0, -83.0, -66.0, -52.0, -41.0, -32.0, -25.0,
+                -19.0, -14.5, -10.8, -7.9, -5.5, -3.7, -2.2, -1.0, 0.0,
             ],
         ),
         # DybdedataConfig overloads bathymetry_dataset (required), plus regrid_options and
@@ -57,11 +68,25 @@ function oslofjorden()
             interpolation_passes  = 1,
             major_basins          = 1,
             minimum_depth         = 2.0,
+            # Flood land within five rows of the open southern edge, so the boundary condition is
+            # not reconciling a radiation scheme, a prescribed exterior state and a headland within
+            # a couple of cells of each other. On this domain the band is nearly clear already and
+            # it moves seven cells, none in the boundary row itself — cheap insurance rather than a
+            # correction. The open edges come from `boundary_config` below.
+            open_boundary_land_cells = 5,
+            # Six and no more. Every remaining interior land component is 7 cells or larger with a
+            # minimum width of 2 to 4 cells — compact skerries, not the one-cell ridges this stage
+            # exists to remove. Raising it would delete real topography.
             max_island_cells      = 6,
             close_narrow_passages = true,
             spike_ratio           = 0.5,
             minimum_cell_fraction = 0.2,
-            max_slope_factor      = 0.5,
+            # 0.25, not the 0.5 this used to be. Measured on this bathymetry, tightening the
+            # limit costs almost nothing: the Drøbak sill goes from 65.2 m to 64.6 m, the deepest
+            # point is untouched at 395.1 m and water volume changes by 0.000%, while adjacent
+            # pairs steeper than r = 0.3 go from 4620 to none. The worry that a tight limit
+            # flattens a genuine sill does not survive contact with this domain.
+            max_slope_factor      = 0.25,
             geonorge_cache        = true,
             regrid_cache          = false,
         ),
@@ -88,7 +113,16 @@ function oslofjorden()
                 # A river is relaxed into the surface level alone, so the column under it has to
                 # carry the exchange that freshening drives. Four outlets had snapped onto the
                 # 2 m `minimum_depth` floor — two 1 m cells — and ran to 64 psu underneath.
-                minimum_levels = 4,
+                #
+                # Six, not the four that fixed it on the 18-level grid. A *count* of levels means a
+                # different depth on every vertical grid, and on the 24-level one four levels is a
+                # column of 3.7 to 5.5 m — so seven of the nineteen outlets sat right on the floor
+                # in 4.1 to 5.5 m of water. One of them, (220, 93) at 4.78 m, ran its bottom cell
+                # away without bound and killed the run at day 11.5 by driving salinity past the
+                # -32 psu at which TEOS10's `√(Sᴬ + 32)` throws. Six levels is 7.9 to 10.8 m and
+                # relocates all seven by one to eight cells; seven levels is not reachable — four of
+                # them have no coastal cell that deep within the search radius.
+                minimum_levels = 5,
             ),
         ),
         # The exterior state along the open southern edge, from the *hourly* NorKyst collection: a
@@ -141,11 +175,34 @@ function oslofjorden()
             # model hooks build_simulation calls, dispatching on this config's type.
             model              = CoupledHydrostaticSimulation(
                 buoyancy           = SeawaterBuoyancy(FT, equation_of_state = TEOS10EquationOfState(FT)),
-                closure            = (
-                    CATKEVerticalDiffusivity(minimum_tke = 7e-6),
-                    HorizontalScalarBiharmonicDiffusivity(ν = 1e5, κ = 1e4),
+                # A BoundarySponge rather than a bare closure tuple: it adds a harmonic viscosity
+                # and diffusivity ramping to zero over 16 cells (~3.2 km) inward from whichever
+                # edges `boundary_config` opens, and passes `base` through untouched everywhere
+                # else. Without it nothing damped what the open boundary radiates — the 2020 run
+                # carried velocities of 0.4 m/s std and 2 m/s peak on the boundary row against
+                # 0.13 and 0.43 in the interior, and grid-scale salinity roughness 70x the interior
+                # value, which accumulated for 50 days in the near-boundary bottom cells and then
+                # ran away. Viscous rather than a tracer relaxation band, so it cannot fight the
+                # open boundary's own nudging towards the same data.
+                #
+                # 30 m² s⁻¹ is set by explicit-diffusion stability, not by taste: Δt ≤ Δx²/4ν is
+                # 310 s on this 193 m cell, comfortably clear of `max_time_step` below. Raising it
+                # much past 50 would cap the time step instead of the CFL doing it.
+                closure            = BoundarySponge(
+                    base = (
+                        CATKEVerticalDiffusivity(minimum_tke = 7e-6),
+                        HorizontalScalarBiharmonicDiffusivity(ν = 1e5, κ = 1e4),
+                    ),
+                    width_cells = 16,
+                    viscosity   = 30.0,
+                    diffusivity = 15.0,
                 ),
-                tracer_advection   = (T = WENO(), S = WENO()),
+                # One scheme for every tracer, not a NamedTuple naming T and S. Oceananigans gives
+                # any tracer a NamedTuple omits the `Centered()` default, and CATKE contributes an
+                # `e` the setup never names — so `e` was being advected by an unbounded centered
+                # scheme, which makes the vertical diffusivity noisy exactly where the bottom cells
+                # were failing. A scalar covers whatever the closure adds, now and later.
+                tracer_advection   = WENO(),
                 momentum_advection = WENOVectorInvariant(FT),
                 tracers            = (:T, :S),
                 coriolis           = HydrostaticSphericalCoriolis(FT),
@@ -171,7 +228,13 @@ function oslofjorden()
                 AirSeaFluxes(),
                 QuadraticBottomDrag(coefficient = 0.003),
                 OpenLateralBoundaryFromData(
-                    inflow_timescale  = 1day,
+                    # 3 hours, not the 1 day this was. At the time steps this run actually takes
+                    # (~10 s), a one-day timescale relaxes by 1.2e-4 per step against an advective
+                    # rate into the boundary cell of ~2.5e-3 s⁻¹ — 200x weaker, which is why the
+                    # nudging never caught the drift it was there to catch. Both numbers are
+                    # tuning knobs: too strong an inflow nudge over-constrains an open boundary
+                    # and reflects.
+                    inflow_timescale  = 3hours,
                     outflow_timescale = 360days,
                 ),
             ),
@@ -183,11 +246,38 @@ function oslofjorden()
                 SnapshotWriter(
                     name               = :ocean,
                     output_file        = "snapshots_ocean.nc",
-                    variables          = (:T, :S, :u, :v),
+                    # `e` is CATKE's TKE tracer, in for diagnosis rather than for science: the
+                    # 2026-08-25 run died at day 11.5 on a TEOS10 `sqrt(Sᴬ + 32)` DomainError —
+                    # one cell below -32 psu — and the file carried nothing that could show what
+                    # led there. `e` drives the vertical diffusivity, so it is the field most
+                    # likely to hold the precursor.
+                    #
+                    # `η` belongs here too and cannot go here. Oceananigans' NetCDF writer cannot
+                    # write a `(Center, Center, Nothing)` *user output* at all: the free surface
+                    # asks for a singleton `z_aaf = [0.0]` while the grid's own vertical coordinate
+                    # is already `z_aaf` with the 25 faces, and the writer raises rather than
+                    # reconciling them. Measured: it fails with the 3D fields, in a file of its own,
+                    # and with `include_grid_metrics = false`. `bottom_height` is the same location
+                    # and *is* written, because grid metrics take a different path — so this is an
+                    # upstream bug in the user-output path, not a configuration mistake.
+                    variables          = (:T, :S, :u, :v, :e),
                     interval           = 3hour,
                     overwrite_existing = true,
                 ),
-                CheckpointWriter(interval = 30days, cleanup = true),
+                # `η` in JLD2 because it cannot go in the NetCDF file: Oceananigans' NetCDF writer
+                # cannot emit a `(Center, Center, Nothing)` user output at all — the free surface
+                # asks for a singleton `z_aaf = [0.0]` against the grid's own 25-face `z_aaf`, and
+                # it fails beside the 3D fields, alone in its own file, and with grid metrics off.
+                # It is what the Flather boundary and the barotropic solver actually exchange, so
+                # it is worth a second file rather than going unwritten. See `FieldSnapshotWriter`.
+                FieldSnapshotWriter(
+                    name               = :surface,
+                    output_file        = "snapshots_surface.jld2",
+                    variables          = (:η,),
+                    interval           = 3hour,
+                    overwrite_existing = true,
+                ),
+                CheckpointWriter(interval = 12hours, cleanup = true),
             ),
             # Overloads attach_callback! — what the run reports while it runs. `report` is the
             # function itself, so a model whose tracers omit :T (which `progress` reads) names its

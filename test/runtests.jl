@@ -66,6 +66,9 @@ include("utilities.jl")
             :boundary_data_directory,
             :NorKystBoundariesConfig,
             :AbstractBoundaryDataConfig,
+            :AbstractClosureConfig,
+            :model_closure,
+            :BoundarySponge,
             :ProjectedSourceGrid,
             :RiverLocation,
             :geodatabase_path,
@@ -82,6 +85,7 @@ include("utilities.jl")
             :simulation_grid,
             :forcing_date_range,
             :ProgressCallback,
+            :FieldSnapshotWriter,
             :attach_callback!,
             :coupled_simulation,
             :recursive_merge,
@@ -364,6 +368,95 @@ include("utilities.jl")
             @test_throws ErrorException boundary_condition_sides(
                 open_boundary, grid, NamedTuple(), boundaries_config, (:T, :not_prepared), boundaries,
             )
+        end
+    end
+
+    @testset "boundary sponge" begin
+        sponge_ramp = FjordSim.Simulations.sponge_ramp
+        sponge_strength = FjordSim.Simulations.sponge_strength
+        sponge_parameters = FjordSim.Simulations.sponge_parameters
+
+        # One at the edge, zero at the width, and a vanishing derivative at both ends — a ramp that
+        # reached zero with a kink would itself be something the open boundary reflects off.
+        @test sponge_ramp(0, 16) == 1
+        @test sponge_ramp(4, 16) == 0.75^2
+        @test sponge_ramp(16, 16) == 0
+        @test sponge_ramp(32, 16) == 0          # clamped, never negative
+        @test sponge_ramp(15, 16) < 0.01        # flat as it meets the interior
+
+        base = (VerticalScalarDiffusivity(ν = 1e-4),)
+        grid = LatitudeLongitudeGrid(
+            CPU();
+            size = (10, 20, 2),
+            halo = (1, 1, 1),
+            longitude = (10.0, 11.0),
+            latitude = (59.0, 60.0),
+            z = [-10.0, -5.0, 0.0],
+        )
+        sponge = BoundarySponge(base = base, width_cells = 4, viscosity = 30.0, diffusivity = 15.0)
+
+        parameters = sponge_parameters(sponge, grid, [:south])
+        @test parameters.Δφ ≈ 1 / 20
+        @test parameters.Δλ ≈ 1 / 10
+        @test (parameters.south, parameters.north, parameters.west, parameters.east) ==
+              (1.0, 0.0, 0.0, 0.0)
+        # Every entry is a Float64, edge switches included, so the tuple stays concretely typed and
+        # the kernel has no branch in it.
+        @test all(v -> v isa Float64, values(parameters))
+
+        # Only the open edge sponges. The closed ones are switched off by their multiplier, not by
+        # a branch, so a point in the far corner is still exactly zero.
+        @test sponge_strength(10.5, 59.0, parameters) == 1.0
+        @test sponge_strength(10.5, 60.0, parameters) == 0.0
+        @test sponge_strength(10.0, 59.5, parameters) == 0.0
+
+        # Opening a second edge is one config change and nothing else: the strength is the largest
+        # ramp over the edges, so a corner belongs to whichever it is nearer.
+        two = sponge_parameters(sponge, grid, [:south, :west])
+        @test sponge_strength(10.0, 59.5, two) == 1.0
+        @test sponge_strength(10.0, 59.0, two) == 1.0
+
+        # `model_closure` is the hook, and its fallback is the identity — which is what keeps every
+        # setup that names a plain Oceananigans closure working untouched.
+        @test model_closure(base, grid, nothing) === base
+        @test model_closure(base[1], grid, nothing) === base[1]
+
+        # A sponge with no open edge is the base closure, not a base closure plus a zero sponge.
+        @test model_closure(sponge, grid, nothing) === base
+
+        mktempdir() do tmp
+            boundaries_config = test_boundaries_config(data_root = tmp)
+            built = model_closure(sponge, grid, boundaries_config)
+            @test length(built) == length(base) + 1
+            @test built[1:length(base)] == base
+            @test last(built) isa Oceananigans.TurbulenceClosures.ScalarDiffusivity
+
+            # A base that is a single closure rather than a tuple appends the same way.
+            single = BoundarySponge(
+                base = base[1], width_cells = 4, viscosity = 30.0, diffusivity = 15.0,
+            )
+            @test length(model_closure(single, grid, boundaries_config)) == 2
+
+            # The coefficient has to be reachable through Oceananigans' *own* dispatch, not just
+            # callable. `ScalarDiffusivity` only threads `parameters` through in its discrete form;
+            # asked for the continuous one it stores the bare function and calls it as
+            # `ν(λ, φ, z, t)`, so a parameterized method never matches — and inside a GPU kernel that
+            # `MethodError` surfaces as an `InvalidIRError` pointing at an unrelated frame. Going
+            # through `νᶜᶜᶜ` here is what makes that a test failure instead of a compile failure an
+            # hour into a run.
+            built = model_closure(sponge, grid, boundaries_config)
+            νᶜᶜᶜ = Oceananigans.TurbulenceClosures.νᶜᶜᶜ
+            κᶜᶜᶜ = Oceananigans.TurbulenceClosures.κᶜᶜᶜ
+            clock = Oceananigans.TimeSteppers.Clock(grid)
+            location = (Center(), Center(), Center())
+
+            # j = 1 is the open edge, so the ramp is at full strength there and zero well inside.
+            edge_ν = νᶜᶜᶜ(1, 1, 1, grid, location, last(built).ν, clock, nothing)
+            edge_κ = κᶜᶜᶜ(1, 1, 1, grid, location, last(built).κ, clock, nothing)
+            @test edge_ν > 0.5 * sponge.viscosity
+            @test edge_κ > 0.5 * sponge.diffusivity
+            @test edge_κ < edge_ν                    # κ is the weaker of the two
+            @test νᶜᶜᶜ(1, 20, 1, grid, location, last(built).ν, clock, nothing) == 0
         end
     end
 
@@ -1562,11 +1655,12 @@ end
             end
         end
 
-        # All three stages are opt-in: the default keeps the topological cleanup and nothing else,
-        # which is what leaves every other source's bathymetry unchanged. Asserted on configs built
-        # here rather than on the built-in setups', whose numbers are a per-fjord choice.
+        # Every optional stage is opt-in: the default keeps the topological cleanup and nothing
+        # else, which is what leaves every other source's bathymetry unchanged. Asserted on configs
+        # built here rather than on the built-in setups', whose numbers are a per-fjord choice.
         smoothing_options = FjordSim.Bathymetry.smoothing_options
         @test smoothing_options(test_bathymetry_config()) == (
+            open_boundary_land_cells = 0,
             max_island_cells = 0,
             close_narrow_passages = false,
             spike_ratio = 0.0,
@@ -1575,6 +1669,7 @@ end
             minimum_depth = 0.0,
         )
         @test smoothing_options(test_bathymetry_config(
+            open_boundary_land_cells = 5,
             max_island_cells = 6,
             close_narrow_passages = true,
             spike_ratio = 0.5,
@@ -1582,6 +1677,7 @@ end
             max_slope_factor = 0.4,
             minimum_depth = 2.0,
         )) == (
+            open_boundary_land_cells = 5,
             max_island_cells = 6,
             close_narrow_passages = true,
             spike_ratio = 0.5,
@@ -1663,6 +1759,146 @@ end
         set!(island_field, Float32.(island))
         FjordSim.Bathymetry.smooth_bathymetry_gaps!(island_field; max_island_cells = 3)
         @test all(<(0), Array(interior(island_field, :, :, 1)))
+
+        # --- clear_open_boundary_land ---
+        clear_open_boundary_land = FjordSim.Bathymetry.clear_open_boundary_land
+
+        # A headland reaching into the southern rows, plus an interior island the stage must leave
+        # alone: it acts on a band, not on land in general.
+        headland = fill(-20.0, 9, 9)
+        headland[4:6, 1:3] .= 0.0
+        headland[7, 7] = 0.0
+
+        cleared = clear_open_boundary_land(headland, Val(:south); cells = 3)
+        @test all(<(0), cleared[:, 1:3])         # the whole band is water
+        @test cleared[7, 7] >= 0                 # the interior island survives
+        @test all(==(-20.0), cleared[4:6, 1:3])  # flooded to the depth reaching them
+
+        # Only the named edge is touched, and each edge is its own method. One land patch per edge,
+        # each entirely inside its own band, so what each call leaves alone is unambiguous.
+        corners = fill(-20.0, 9, 9)
+        corners[5, 1] = 0.0     # south band
+        corners[5, 9] = 0.0     # north band
+        corners[1, 5] = 0.0     # west band
+        corners[9, 5] = 0.0     # east band
+        for (edge, cleared_cell, kept) in (
+            (:south, (5, 1), ((5, 9), (1, 5), (9, 5))),
+            (:north, (5, 9), ((5, 1), (1, 5), (9, 5))),
+            (:west, (1, 5), ((5, 1), (5, 9), (9, 5))),
+            (:east, (9, 5), ((5, 1), (5, 9), (1, 5))),
+        )
+            out = clear_open_boundary_land(corners, Val(edge); cells = 2)
+            @test out[cleared_cell...] < 0
+            @test all(cell -> out[cell...] >= 0, kept)
+        end
+        @test_throws ArgumentError clear_open_boundary_land(headland, Val(:up); cells = 3)
+
+        # The fill relaxes rather than filling in one pass: a cell deep inside a cleared headland
+        # has no wet neighbour to start with and inherits through the cells in front of it. Here the
+        # only water is one cell beyond the band, so every filled cell traces back to it and the
+        # innermost one needs the last round the loop allows.
+        channel = zeros(3, 4)
+        channel[2, 4] = -10.0
+        filled_channel = clear_open_boundary_land(channel, Val(:south); cells = 3)
+        @test all(<(0), filled_channel[:, 1:3])   # the whole band filled...
+        @test all(==(-10.0), filled_channel[:, 1:3])  # ...all of it from the one wet cell
+        @test filled_channel[2, 4] == -10.0       # and the source itself is untouched
+
+        # Wired into the pipeline, opt-in, and a no-op when the setup names no open edge.
+        band_grid = LatitudeLongitudeGrid(
+            CPU();
+            size = (9, 9, 1),
+            halo = (1, 1, 1),
+            longitude = (10.0, 11.0),
+            latitude = (59.0, 60.0),
+            z = [-10.0, 0.0],
+        )
+        band_field = Field{Center, Center, Nothing}(band_grid)
+        band = fill(-20.0f0, 9, 9)
+        band[4:6, 1:3] .= 0.0f0
+
+        set!(band_field, band)
+        FjordSim.Bathymetry.smooth_bathymetry_gaps!(band_field)
+        @test any(>=(0), Array(interior(band_field, :, :, 1))[:, 1:3])
+
+        set!(band_field, band)
+        FjordSim.Bathymetry.smooth_bathymetry_gaps!(band_field; open_boundary_land_cells = 3)
+        @test any(>=(0), Array(interior(band_field, :, :, 1))[:, 1:3])  # no edges named: no-op
+
+        set!(band_field, band)
+        FjordSim.Bathymetry.smooth_bathymetry_gaps!(
+            band_field;
+            open_boundary_land_cells = 3,
+            edges = :south,
+        )
+        @test all(<(0), Array(interior(band_field, :, :, 1))[:, 1:3])
+
+        # Several open edges clear together, which is what makes the stage work for a domain in the
+        # open ocean rather than only for one with a single opening.
+        set!(band_field, band)
+        FjordSim.Bathymetry.smooth_bathymetry_gaps!(
+            band_field;
+            open_boundary_land_cells = 3,
+            edges = (:south, :west),
+        )
+        both = Array(interior(band_field, :, :, 1))
+        @test all(<(0), both[:, 1:3])
+        @test all(<(0), both[1:3, :])
+    end
+
+    @testset "partial bottom cell snapping" begin
+        snap_partial_bottom_cells = FjordSim.Bathymetry.snap_partial_bottom_cells
+        snap_to_face = FjordSim.Bathymetry.snap_to_face
+
+        # A face that is not representable in the stored precision must round *away* from the water,
+        # never into it. -10.8 narrowed to Float32 is a hair below -10.8, and a column ending there
+        # makes the layer beneath a bottom cell of ~5e-8 of its thickness — the very sliver the stage
+        # exists to remove, in its worst form.
+        @test Float64(Float32(-10.8)) < -10.8              # the hazard is real
+        @test Float64(snap_to_face(Float32, -10.8)) >= -10.8
+        @test snap_to_face(Float32, -10.8) === nextfloat(Float32(-10.8))
+        @test snap_to_face(Float32, -14.5) === -14.5f0     # an exact face is left alone
+        @test snap_to_face(Float64, -10.8) === -10.8       # and so is any face in full precision
+
+        # End to end, and specifically through the narrowing: the pipeline computes in the grid's
+        # float type but the file stores `BATHYMETRY_ELTYPE`, so what has to survive is the
+        # *round-trip*. A Float64 snap that lands exactly on -10.8 does not.
+        faces = [-20.0, -14.5, -10.8, -7.9, -3.7, 0.0]
+        h = [-14.6 -10.9; -8.0 -3.8]                       # Float64, each a hair below a face
+        snapped = snap_partial_bottom_cells(h, faces; minimum_cell_fraction = 0.2, minimum_depth = 2.0)
+
+        for idx in eachindex(snapped)
+            stored = Float64(FjordSim.Bathymetry.BATHYMETRY_ELTYPE(snapped[idx]))
+            k = findfirst(n -> faces[n+1] > stored, 1:length(faces)-1)
+            @test k !== nothing
+            fraction = (faces[k+1] - stored) / (faces[k+1] - faces[k])
+            @test fraction > 0.99                          # a full cell, not a fresh sliver
+        end
+
+        # The two guards stay total: a sliver in the topmost layer cannot be dried out, and one that
+        # would breach `minimum_depth` is left for `PartialCellBottom` to floor as before.
+        shallow = Float32[-0.05 -2.05]
+        kept = snap_partial_bottom_cells(
+            shallow, [-20.0, -2.0, 0.0]; minimum_cell_fraction = 0.2, minimum_depth = 5.0,
+        )
+        @test kept == shallow
+    end
+
+    @testset "slope limiting convergence" begin
+        limit_bottom_slope = FjordSim.Bathymetry.limit_bottom_slope
+        steepest_slope = FjordSim.Bathymetry.steepest_slope
+
+        # A step the limiter has to work at: r = |100 - 2| / 102 = 0.96 against a limit of 0.2.
+        step = [-2.0 -2.0 -2.0; -2.0 -100.0 -2.0; -2.0 -2.0 -2.0]
+        limited = limit_bottom_slope(step; max_slope_factor = 0.2)
+        depths = map(v -> v < 0 ? -v : NaN, limited)
+        @test steepest_slope(depths) <= 0.2 * (1 + FjordSim.Bathymetry.SLOPE_LIMIT_TOLERANCE)
+
+        # steepest_slope reads the field rather than the loop's own running maximum, and ignores
+        # land: a pair straddling a land cell is not adjacent.
+        split = [1.0 -10.0 NaN; NaN NaN NaN; 1.0 -1000.0 NaN]
+        @test steepest_slope(map(v -> v < 0 ? -v : NaN, [-10.0 0.0 -1000.0])) == zero(Float64)
+        @test steepest_slope([10.0 30.0]) == 0.5
     end
 
     @testset "point sampling" begin
@@ -2980,6 +3216,59 @@ end
 end
 
 @testset "Simulations" begin
+    @testset "field snapshot writer" begin
+        # The JLD2 writer exists for what NetCDF will not take. Its config validates like the NetCDF
+        # one, so the checks that matter are the shared ones.
+        writer = FieldSnapshotWriter(
+            name = :surface,
+            output_file = "snapshots_surface.jld2",
+            variables = (:η,),
+            interval = 3hour,
+            overwrite_existing = true,
+        )
+        @test writer.variables === (:η,)
+        @test writer.interval == 3hour
+        @test_throws ArgumentError FieldSnapshotWriter(
+            name = :surface, output_file = "s.jld2", variables = (:η,),
+            interval = 0, overwrite_existing = true,
+        )
+        @test_throws ArgumentError FieldSnapshotWriter(
+            name = :surface, output_file = "s.jld2", variables = (),
+            interval = 3hour, overwrite_existing = true,
+        )
+
+        # It names a file, so `results_path` resolves one; and it is not a checkpointer, so a setup
+        # naming only this one still gets `checkpoint_at_end = false`.
+        @test FjordSim.Simulations.output_path_trait(writer) isa
+              FjordSim.Simulations.NamesOutputFile
+        @test FjordSim.Simulations.checkpoint_trait(writer) isa
+              FjordSim.Simulations.NotCheckpointing
+
+        # `snapshot_outputs` is shared with `SnapshotWriter` — the same resolution and the same error
+        # for a name the model lacks, whatever the file format.
+        mktempdir() do tmp
+            # An immersed grid needs one halo point more than a bare one, and the model checks it.
+            (; grid) = immersed_test_grid(
+                joinpath(tmp, "bathymetry.nc"); size = (4, 4, 3), halo = (3, 3, 3),
+            )
+            model = HydrostaticFreeSurfaceModel(
+                grid;
+                tracers = (:T, :S),
+                buoyancy = SeawaterBuoyancy(),
+                free_surface = SplitExplicitFreeSurface(grid, cfl = 0.7),
+            )
+            outputs = FjordSim.Simulations.snapshot_outputs(writer, model)
+            @test keys(outputs) == (:η,)
+            @test_throws ArgumentError FjordSim.Simulations.snapshot_outputs(
+                FieldSnapshotWriter(
+                    name = :surface, output_file = "s.jld2", variables = (:nope,),
+                    interval = 3hour, overwrite_existing = true,
+                ),
+                model,
+            )
+        end
+    end
+
     @testset "config" begin
         simulation_forcing_path = FjordSim.Simulations.simulation_forcing_path
         checkpoints = FjordSim.Simulations.checkpoints

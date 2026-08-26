@@ -4,7 +4,9 @@ export SimulationConfig,
     CoupledHydrostaticSimulation,
     SplitExplicitFreeSurfaceConfig,
     free_surface,
+    BoundarySponge,
     SnapshotWriter,
+    FieldSnapshotWriter,
     CheckpointWriter,
     ProgressCallback,
     AdaptiveTimeStep,
@@ -24,14 +26,17 @@ using Oceananigans
 using Oceananigans: fields
 using Oceananigans.Utils: prettytime
 using Oceananigans.TimeSteppers: reset!, update_state!
+using Oceananigans.Grids: x_domain, y_domain, node
 using NumericalEarth
 using Dates: DateTime, Second
 using NCDatasets
 
+using ..Configs
 using ..Configs:
     AbstractSimulationConfig,
     AbstractCoupledSimulationConfig,
     AbstractFreeSurfaceConfig,
+    AbstractClosureConfig,
     AbstractWriterConfig,
     AbstractCallbackConfig,
     AbstractTimeSteppingConfig,
@@ -43,7 +48,9 @@ using ..Configs:
     river_forcing_path,
     results_path,
     run_tag,
-    simulation_grid
+    simulation_grid,
+    open_edges,
+    model_closure
 using ..Utils: progress, cell_advection_timescale_coupled_model
 using ..Atmospheres: prescribed_atmosphere, prescribed_radiation, atmosphere_date_range
 using ..Forcing:
@@ -77,6 +84,202 @@ Build the `SplitExplicitFreeSurface` `coupled_simulation` passes to `Hydrostatic
 """
 free_surface(config::SplitExplicitFreeSurfaceConfig, grid) =
     SplitExplicitFreeSurface(grid, cfl = config.cfl)
+
+"""
+    BoundarySponge(; base, width_cells, viscosity, diffusivity)
+
+The one built-in `AbstractClosureConfig`: `base`, plus a harmonic horizontal viscosity and
+diffusivity that ramp to zero inward from every open lateral edge.
+
+An open lateral boundary radiates as well as admits, and a radiation condition diagnosing its own
+phase speed against a tide, a wind and a river plume leaves grid-scale noise on the boundary row
+that the interior has to absorb. Without a sponge nothing absorbs it: the biharmonic viscosity a
+setup names for the interior damps the grid scale but is not what removes a metre-per-second
+boundary response, and the open-boundary nudging pulls the boundary row towards the exterior data
+rather than smoothing along it. What that noise does, given time, is accumulate in the poorly
+ventilated bottom cells nearest the boundary until their density anomaly drives its own
+circulation.
+
+A *viscous* sponge rather than a tracer relaxation band, deliberately: a band relaxing T and S a few
+cells inside the domain fights the boundary condition, which is nudging the same variables at the
+boundary itself towards the same data. Viscosity and diffusivity only smooth; they name no target
+and so cannot disagree with one.
+
+# Fields
+- `base`: the closure, or tuple of closures, the sponge is added to. Passed through untouched.
+- `width_cells`: how far the ramp reaches, in grid cells.
+- `viscosity`, `diffusivity`: `ν` and `κ` in m² s⁻¹ *at* the open edge, falling to zero at
+  `width_cells`.
+
+`viscosity` is bounded by explicit horizontal-diffusion stability, not by taste: the time step must
+satisfy `Δt ≤ Δx² / 4ν`, which on a 193 m cell is 310 s at `ν = 30` and 155 s at `ν = 60`. A value
+that pushes that bound under the time-stepping config's `max_time_step` caps the run's time step
+instead of the CFL doing it, so raise it only alongside that number.
+
+The edges are **not** a field. They come from the setup's `AbstractBoundaryDataConfig` through
+`open_edges`, which is where a domain's open boundaries are stated, so a setup that later opens a
+second edge sponges both without a second edit. A setup naming no boundary config has no open edge,
+and `model_closure` then returns `base` unchanged.
+
+# The alternative, and what it would buy
+
+The other standard shape for this is a *restoring* sponge: a `Relaxation` forcing over a mask near
+the boundary, pulling each field towards a prescribed exterior state. NumericalEarth's
+`DatasetRestoring` is the ready-made version, and a regional Arctic configuration using it nudges
+`T` and `S` at `1/1day` but `u` and `v` at `1/20minutes` over a Gaussian mask four cells wide — that
+is, velocities some seventy times harder than tracers, on the reasoning that it is the *momentum*
+field near the boundary that has to stay matched to what is prescribed.
+
+That asymmetry is worth taking seriously, because it is the same conclusion the Oslofjord diagnosis
+reached from the other end: the boundary row's velocity was 3–7x the interior's, and the tracer
+extremes followed from it rather than the reverse. It is why `viscosity` is set above `diffusivity`
+here rather than equal to it.
+
+FjordSim cannot simply adopt the restoring form, and the reason is worth knowing before anyone tries.
+A relaxation forcing needs a *target* in the sponge band, and the exterior state this setup prepares
+exists only **at** the boundary row — `boundary_series` returns reduced `FieldTimeSeries`, one cell
+thick. The only three-dimensional target available is `forcing.nc`, whose lambdas
+`prepare_forcing` deliberately writes as zero; reinstating a band there for `u` and `v` alone would
+be the faithful translation, and would *not* run into the objection that killed the old tracer band,
+since that band fought the open boundary's own tracer nudging and a velocity band does not touch
+tracers. It is the obvious next thing to try if this sponge proves too blunt.
+"""
+struct BoundarySponge{C} <: AbstractClosureConfig
+    base::C
+    width_cells::Int
+    viscosity::Float64
+    diffusivity::Float64
+end
+
+BoundarySponge(; base, width_cells, viscosity, diffusivity) =
+    BoundarySponge(base, Int(width_cells), Float64(viscosity), Float64(diffusivity))
+
+"""
+    sponge_ramp(distance_cells, width_cells)
+
+The sponge's shape: one at the open edge, zero at `width_cells` and beyond.
+
+Squared rather than linear so the derivative vanishes at the inner end too. A ramp that reaches zero
+with a kink is itself a discontinuity in the momentum equation, which is the sort of thing an open
+boundary reflects off.
+
+Called inside a kernel, so: no branches, and a literal zero in the `max`.
+"""
+@inline sponge_ramp(distance_cells, width_cells) = max(0, 1 - distance_cells / width_cells)^2
+
+"""
+    sponge_strength(λ, φ, parameters)
+
+How strong the sponge is at one point, as a fraction of its edge value: the largest ramp over the
+four lateral edges.
+
+Each edge contributes `on * ramp(distance)`, where `on` is 1.0 for an open edge and 0.0 for a closed
+one — a multiplier rather than a branch, so the four edges are one straight-line expression whatever
+subset the setup opened. Distances are in cells, which is what makes one `width_cells` mean the same
+thing on both axes of a grid whose degrees are not square.
+"""
+@inline function sponge_strength(λ, φ, p)
+    south = p.south * sponge_ramp((φ - p.φ_south) / p.Δφ, p.width)
+    north = p.north * sponge_ramp((p.φ_north - φ) / p.Δφ, p.width)
+    west = p.west * sponge_ramp((λ - p.λ_west) / p.Δλ, p.width)
+    east = p.east * sponge_ramp((p.λ_east - λ) / p.Δλ, p.width)
+    return max(max(south, north), max(west, east))
+end
+
+"""
+    sponge_viscosity(i, j, k, grid, ℓx, ℓy, ℓz, clock, fields, p)
+    sponge_diffusivity(i, j, k, grid, ℓx, ℓy, ℓz, clock, fields, p)
+
+The sponge's `ν` and `κ` at one node, in Oceananigans' **discrete** diffusivity form.
+
+Discrete rather than continuous, and not by preference: `ScalarDiffusivity` only threads
+`parameters` through when `discrete_form = true`. With `discrete_form = false` it stores the bare
+function and calls it as `ν(λ, φ, z, t)` — four arguments, `parameters` silently dropped, despite
+the constructor accepting them. A five-argument method then never matches, and because the call is
+inside a GPU kernel the `MethodError` surfaces as `InvalidIRError: unsupported call to an unknown
+function (call to jl_f_throw_methoderror)` from a frame elsewhere in the tendency kernel — which
+says nothing about the closure at all. The discrete form is the path that actually carries
+`parameters`, so it is the one to use.
+
+`ℓx, ℓy, ℓz` are the location Oceananigans wants the coefficient at, which differs between the
+viscosity's four staggered flavours; `node` is what turns them into coordinates. The vertical node
+is unused — the sponge is a horizontal ramp at every depth.
+"""
+@inline function sponge_viscosity(i, j, k, grid, ℓx, ℓy, ℓz, clock, fields, p)
+    λ, φ, _ = node(i, j, k, grid, ℓx, ℓy, ℓz)
+    return p.ν * sponge_strength(λ, φ, p)
+end
+
+@inline function sponge_diffusivity(i, j, k, grid, ℓx, ℓy, ℓz, clock, fields, p)
+    λ, φ, _ = node(i, j, k, grid, ℓx, ℓy, ℓz)
+    return p.κ * sponge_strength(λ, φ, p)
+end
+
+"""
+    sponge_parameters(config::BoundarySponge, grid, edges)
+
+The `NamedTuple` the two coefficient functions read: the domain's extent, its cell size, the ramp
+width, the two coefficients, and one `1.0`/`0.0` multiplier per lateral edge.
+
+Every entry is a `Float64`, including the edge switches, so the tuple is concretely typed and the
+kernel branch-free. The cell sizes are the nominal `Δλ` and `Δφ` of the underlying grid, which is
+what `width_cells` counts.
+"""
+function sponge_parameters(config::BoundarySponge, grid, edges)
+    λ_west, λ_east = x_domain(grid)
+    φ_south, φ_north = y_domain(grid)
+    Nx, Ny, _ = size(grid)
+
+    return (;
+        λ_west = Float64(λ_west),
+        λ_east = Float64(λ_east),
+        φ_south = Float64(φ_south),
+        φ_north = Float64(φ_north),
+        Δλ = Float64(λ_east - λ_west) / Nx,
+        Δφ = Float64(φ_north - φ_south) / Ny,
+        width = Float64(config.width_cells),
+        ν = config.viscosity,
+        κ = config.diffusivity,
+        south = (:south in edges) * 1.0,
+        north = (:north in edges) * 1.0,
+        west = (:west in edges) * 1.0,
+        east = (:east in edges) * 1.0,
+    )
+end
+
+"""
+    model_closure(config::BoundarySponge, grid, boundary_config)
+
+Append the sponge to `config.base`, or return `base` unchanged when the domain has no open edge.
+
+The sponge is a `HorizontalScalarDiffusivity` whose `ν` and `κ` are functions of the grid's own
+coordinates, so it needs no field, no allocation and no architecture — the same function runs on CPU
+and GPU. `discrete_form = true` because that is the only form `ScalarDiffusivity` passes
+`parameters` to; see `sponge_viscosity`.
+"""
+function Configs.model_closure(config::BoundarySponge, grid, boundary_config)
+    edges = open_edges(boundary_config)
+    isempty(edges) && return config.base
+
+    parameters = sponge_parameters(config, grid, edges)
+    sponge = HorizontalScalarDiffusivity(;
+        ν = sponge_viscosity,
+        κ = sponge_diffusivity,
+        discrete_form = true,
+        parameters = parameters,
+    )
+
+    return (closure_tuple(config.base)..., sponge)
+end
+
+"""
+    closure_tuple(closure)
+
+`closure` as a tuple, so a base that is a single closure and a base that is already a tuple append
+the same way.
+"""
+closure_tuple(closure::Tuple) = closure
+closure_tuple(closure) = (closure,)
 
 """
     CoupledHydrostaticSimulation(; buoyancy, closure, tracer_advection, momentum_advection,
@@ -282,6 +485,51 @@ function SnapshotWriter(; name, output_file, variables, interval, overwrite_exis
         throw(ArgumentError("Snapshot writer :$name names no `variables` to write."))
 
     return SnapshotWriter(
+        Symbol(name),
+        String(output_file),
+        Tuple(Symbol(variable) for variable in variables),
+        Float64(interval),
+        Bool(overwrite_existing),
+    )
+end
+
+"""
+    FieldSnapshotWriter(; name, output_file, variables, interval, overwrite_existing)
+
+The same idea as `SnapshotWriter`, written to JLD2 instead of NetCDF.
+
+It exists for the fields NetCDF cannot take. Oceananigans' NetCDF writer cannot emit a
+`(Center, Center, Nothing)` *user output* at all — the free surface `η` asks for a singleton
+`z_aaf = [0.0]` while the grid's own vertical coordinate already owns that name with the real faces,
+and the writer raises rather than reconciling them. Measured: it fails beside the 3D fields, in a
+file of its own, and with `include_grid_metrics = false`. `bottom_height` is the same location and
+*is* written, because grid metrics take a different path, so this is an upstream defect in the
+user-output path rather than something a setup can configure around. JLD2 serializes the array and
+has no dimension table to collide with.
+
+Use it for `η` and for anything else z-reduced; keep the 3D fields in `SnapshotWriter`, whose NetCDF
+output is what every downstream reader here expects.
+
+The file layout is Oceananigans', not FjordSim's: `timeseries/<name>/<iteration>` holds one
+`Float32` array per record, `timeseries/t` the model times in seconds, and the writer stores no grid.
+`with_halos = false`, so an array is exactly the interior — `(Nx, Ny, 1)` for `η`.
+"""
+struct FieldSnapshotWriter{V<:Tuple{Vararg{Symbol}}} <: AbstractWriterConfig
+    name::Symbol
+    output_file::String
+    variables::V
+    interval::Float64
+    overwrite_existing::Bool
+end
+
+function FieldSnapshotWriter(; name, output_file, variables, interval, overwrite_existing)
+    interval > 0 || throw(
+        ArgumentError("A field snapshot writer's `interval` must be positive, got $interval."),
+    )
+    isempty(variables) &&
+        throw(ArgumentError("Field snapshot writer :$name names no `variables` to write."))
+
+    return FieldSnapshotWriter(
         Symbol(name),
         String(output_file),
         Tuple(Symbol(variable) for variable in variables),
@@ -881,6 +1129,7 @@ struct NamesNoOutputFile <: OutputPathTrait end
 
 output_path_trait(::AbstractWriterConfig) = NamesNoOutputFile()
 output_path_trait(::SnapshotWriter) = NamesOutputFile()
+output_path_trait(::FieldSnapshotWriter) = NamesOutputFile()
 
 """
     reported_paths(writer, config, loop)
@@ -1008,7 +1257,10 @@ end
 """
     snapshot_outputs(writer, ocean_model)
 
-The fields `writer.variables` names, as the `NamedTuple` `NetCDFWriter` consumes.
+The fields `writer.variables` names, as the `NamedTuple` an output writer consumes.
+
+Shared by `SnapshotWriter` and `FieldSnapshotWriter`: which names a model has, and the error naming
+the ones it does not, are the same question whatever the file format.
 
 Resolved through `Oceananigans.fields`, the model's own flattened view of its velocities, free
 surface, tracers and auxiliary fields — so a setup that adds a biogeochemical tracer, or names `w`,
@@ -1020,7 +1272,7 @@ on. The asymmetry is deliberate and worth keeping: that function serves two kind
 variable sets legitimately differ and which no config named, while here the setup wrote the name
 down. An over-eager error costs a typo fix; a silently dropped variable costs a whole run.
 """
-function snapshot_outputs(writer::SnapshotWriter, ocean_model)
+function snapshot_outputs(writer::Union{SnapshotWriter,FieldSnapshotWriter}, ocean_model)
     available = fields(ocean_model)
     unknown = filter(name -> !haskey(available, name), writer.variables)
 
@@ -1069,6 +1321,44 @@ function attach_writer!(simulation, writer::SnapshotWriter, config::AbstractSimu
         schedule = TimeInterval(writer.interval),
         overwrite_existing = writer.overwrite_existing,
         global_attributes = Dict(RESULTS_START_DATE_ATTRIBUTE => string(config.start_date)),
+    )
+
+    return simulation
+end
+
+"""
+    attach_writer!(simulation, writer::FieldSnapshotWriter, config, loop)
+
+Attach a `JLD2Writer` to the *ocean* simulation, beside the NetCDF snapshots.
+
+Same shape as the `SnapshotWriter` method — same output resolution through `snapshot_outputs`, same
+replace-and-close of a writer already under this name, same per-loop filename — and differs only in
+the writer it builds. `with_halos = false` so a stored array is the interior alone.
+
+`snapshot_outputs` is shared rather than duplicated: which names a model has, and the error naming
+the ones it does not, are the same question whatever the file format.
+"""
+function attach_writer!(
+    simulation,
+    writer::FieldSnapshotWriter,
+    config::AbstractSimulationConfig,
+    loop,
+)
+    ocean_sim = simulation.model.ocean
+
+    haskey(ocean_sim.output_writers, writer.name) &&
+        close(pop!(ocean_sim.output_writers, writer.name))
+
+    filepath = loop_output_path(writer, config, loop)
+    mkpath(dirname(filepath))
+
+    ocean_sim.output_writers[writer.name] = JLD2Writer(
+        ocean_sim.model,
+        snapshot_outputs(writer, ocean_sim.model);
+        filename = filepath,
+        schedule = TimeInterval(writer.interval),
+        overwrite_existing = writer.overwrite_existing,
+        with_halos = false,
     )
 
     return simulation
@@ -1304,6 +1594,7 @@ function build_simulation(config::FjordConfig)
             architecture;
             reference_date = start_date,
         ),
+        boundary_config = config.boundary_config,
         stop_time = stop_time,
         initial_time_step = initial_time_step(simulation_config.time_stepping),
     )
@@ -1415,7 +1706,7 @@ end
 
 """
     coupled_simulation(model, grid; forcing, boundary_conditions, initial_conditions,
-                       atmosphere, radiation, stop_time, initial_time_step)
+                       atmosphere, radiation, boundary_config, stop_time, initial_time_step)
 
 Assemble the coupled `Simulation` a model config describes, on `grid`, and return it without
 running it.
@@ -1426,9 +1717,15 @@ different kind of model is a new `AbstractCoupledSimulationConfig` subtype and a
 neither `build_simulation` nor anything above it changes.
 
 The method below builds a `HydrostaticFreeSurfaceModel` inside a NumericalEarth `OceanSeaIceModel`.
-`model.free_surface`'s own `free_surface(config, grid)` hook builds the free-surface object here
-rather than it arriving prebuilt, because `SplitExplicitFreeSurface` needs the grid, which is
-exactly what this function is given and the config is not.
+Two of its components are resolved here rather than arriving prebuilt, and for the same reason:
+`model.free_surface`'s `free_surface(config, grid)` hook, because `SplitExplicitFreeSurface` needs
+the grid, and `model.closure` through `model_closure`, because a closure may need the grid *and* the
+open edges. `model_closure`'s fallback is the identity, so a plain Oceananigans closure — which is
+what most setups write — passes through untouched.
+
+`boundary_config` is the setup's `AbstractBoundaryDataConfig`, or `nothing`. It is passed rather than
+read, for the same reason `boundary_condition_sides` takes it: the edges are stated once, on that
+config, and a second statement of them could only disagree.
 """
 function coupled_simulation(
     model::CoupledHydrostaticSimulation,
@@ -1438,6 +1735,7 @@ function coupled_simulation(
     initial_conditions,
     atmosphere,
     radiation,
+    boundary_config,
     stop_time,
     initial_time_step,
 )
@@ -1448,7 +1746,7 @@ function coupled_simulation(
     ocean_model = HydrostaticFreeSurfaceModel(
         grid;
         buoyancy = model.buoyancy,
-        closure = model.closure,
+        closure = model_closure(model.closure, grid, boundary_config),
         tracer_advection = model.tracer_advection,
         momentum_advection = model.momentum_advection,
         tracers = model.tracers,

@@ -27,15 +27,32 @@ end
 
 const WALL_TIME = Ref(time_ns())
 
+"""
+    progress(sim)
+
+The default `ProgressCallback` report: iteration, model time, time step, the per-component velocity
+maxima and the temperature range.
+
+Every reduction is taken on the `Field`, not on `interior(field)`. That is the whole difference
+between a useful report and a misleading one: a reduction over a `Field` on an `ImmersedBoundaryGrid`
+excludes the immersed periphery for free (`Oceananigans.ImmersedBoundaries.NotImmersed`), while
+`interior` hands back a bare array and throws that away. Oceananigans writes `zero(eltype)` into
+every immersed peripheral tracer cell at the top of each `update_state!`, and on a fjord grid most of
+the block is land — so the array form reported the land mask as the minimum temperature, for the
+whole run. It also keeps the reduction on the GPU rather than indexing a `CuArray` cell by cell.
+
+Reaches `sim.model.ocean.model.tracers.T`, so a model whose tracers omit `:T` needs a `report` of its
+own on its `ProgressCallback` rather than this one.
+"""
 function progress(sim)
     ocean = sim.model.ocean
     u, v, w = ocean.model.velocities
     T = ocean.model.tracers.T
 
-    Tmax = maximum(interior(T))
-    Tmin = minimum(interior(T))
+    Tmin = minimum(T)
+    Tmax = maximum(T)
 
-    umax = (maximum(abs, interior(u)), maximum(abs, interior(v)), maximum(abs, interior(w)))
+    umax = (maximum(abs, u), maximum(abs, v), maximum(abs, w))
 
     step_time = 1e-9 * (time_ns() - WALL_TIME[])
 
@@ -43,8 +60,8 @@ function progress(sim)
     msg *= @sprintf(
         ", max|u|: (%.2e, %.2e, %.2e) m s⁻¹, extrema(T): (%.2f, %.2f) ᵒC, wall time: %s",
         umax...,
-        Tmax,
         Tmin,
+        Tmax,
         prettytime(step_time)
     )
 

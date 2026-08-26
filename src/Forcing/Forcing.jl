@@ -34,7 +34,10 @@ using ..Configs:
     coverage_window,
     domain_grid,
     open_edges,
-    simulation_grid
+    simulation_grid,
+    LATERAL_EDGES,
+    validate_open_edge,
+    lateral_edges
 using ..Plotting: plot_forcing, plot_boundaries
 using ..Atmospheres: rotate_to_east_north
 
@@ -58,9 +61,6 @@ export forcing_from_file,
     river_minimum_levels,
     RiverLocation,
     OF800RiversConfig,
-    LATERAL_EDGES,
-    validate_open_edge,
-    lateral_edges,
     download_boundaries,
     prepare_boundaries,
     boundary_series,
@@ -388,17 +388,6 @@ forcing_date_range(::Nothing, filepath) = nothing
 
 const FORCING_DEFLATE_LEVEL = 5
 
-"""
-The four lateral boundaries a regional domain can be open on, in the order every error message
-lists them.
-
-Defined here rather than in `BoundaryConditions` because that module is included after this one and
-both need it: `validate_open_edge` checks each edge a boundary data config names before any
-regridding, and every `Val{edge}` dispatch in the boundary conditions falls back to an
-`ArgumentError` naming this tuple. There used to be one copy per module, with identical contents, an
-identical membership test and an identical error string.
-"""
-const LATERAL_EDGES = (:south, :north, :west, :east)
 # Longest run of missing days interpolated without a separate warning, matching the default of
 # `NumericalEarth.DataWrangling.fill_gaps!`.
 const FORCING_MAX_GAP = 6
@@ -492,42 +481,6 @@ download_forcing(config::FjordConfig) =
     download_forcing(domain_grid(config.grid_config, CPU()), config.forcing_config)
 
 download_forcing(target_grid, ::Nothing) = nothing
-
-"""
-    validate_open_edge(edge)
-
-Return `edge` if it names a lateral boundary, else throw. Checked up front so a typo fails
-before any regridding rather than deep inside the variable loop.
-
-`LATERAL_EDGES` lives in `BoundaryConditions`, which is included after this module, so the tuple is
-stated here and that module imports it — previously each held its own copy under a different name,
-with an identical membership test and an identical error string.
-"""
-function validate_open_edge(edge)
-    edge in LATERAL_EDGES ||
-        throw(ArgumentError("open_edge must be one of $LATERAL_EDGES, got :$edge"))
-    return edge
-end
-
-"""
-    lateral_edges(edges)
-
-Normalize whatever a caller names its open edges as into a validated `Vector{Symbol}`: one `Symbol`,
-an iterable of them, or `nothing` for none.
-
-Every consumer iterates, so a domain open on one edge, on all four, or on none is the same code path
-rather than a scalar case and a plural one. Duplicates are rejected — a repeated edge would prepare
-and write the same variables twice, and mean nothing the second time.
-"""
-lateral_edges(::Nothing) = Symbol[]
-lateral_edges(edge::Symbol) = [validate_open_edge(edge)]
-
-function lateral_edges(edges)
-    normalized = Symbol[validate_open_edge(edge) for edge in edges]
-    allunique(normalized) ||
-        throw(ArgumentError("open_edges names an edge more than once: $normalized"))
-    return normalized
-end
 
 """
     ProjectedSourceGrid

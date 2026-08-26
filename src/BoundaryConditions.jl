@@ -27,8 +27,11 @@ using NumericalEarth.Oceans:
     u_immersed_bottom_drag,
     v_immersed_bottom_drag,
     build_tracer_top_bc
-using ..Configs: AbstractBoundaryConditionConfig, AbstractBoundaryConditionSetConfig, open_edges
-using ..Forcing: LATERAL_EDGES
+using ..Configs:
+    AbstractBoundaryConditionConfig,
+    AbstractBoundaryConditionSetConfig,
+    open_edges,
+    LATERAL_EDGES
 using ..Utils: recursive_merge
 
 """
