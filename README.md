@@ -33,9 +33,12 @@ simulation without one is impractically slow. Preparing the input data is fine o
 ## Quick start: Oslofjorden
 
 `oslofjorden()` in `src/Setups/oslofjorden.jl` is the reference setup: Geonorge bathymetry,
-NorKyst-800m forcing with OF800 rivers, hourly NorKyst open-boundary data along the southern edge,
+NorKyst-800m forcing with NVE rivers, hourly NorKyst open-boundary data along the southern edge,
 and NORA3 atmosphere. 
 Please note: It may take several hours to download the data.
+
+`add_rivers` also needs a free NVE HydAPI key — sign up at https://hydapi.nve.no/Users and set it
+as `NVE_API_KEY` in your environment before running that step.
 
 Preparing the data and running it is nine commands, in this order:
 

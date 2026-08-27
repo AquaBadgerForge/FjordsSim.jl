@@ -7,10 +7,16 @@ and NORA3 atmosphere, on a 240 x 520 x 24 grid covering 10.2-11.02°E, 59.0-59.9
 The rivers are **discovered**, not stated: `minimum_discharge = 0.5` has `add_rivers` read NVE's
 ELVIS river network and REGINE catchments for this domain and place every mouth at or above that
 size — 21 of them, carrying 99.6 % of the domain's 1179 m³/s — so no river coordinate appears in
-this file. The `outlets` list is eight overrides that attach gauges and plume depths to mouths
-discovery has already found. Only the gauge half needs a credential, an NVE HydAPI key in
-`NVE_API_KEY` (free at https://hydapi.nve.no/Users); the map services are open, and nothing else
-here needs one either.
+this file. All 21 are forced whether or not they appear below: an outlet discovery finds already
+gets a plume and a catchment-normal size on its own, with or without an override. The `outlets`
+list is eight overrides, keyed by `vassdragsnr`, and their almost-universal job is attaching a real
+HydAPI gauge — `discharge_station`, sometimes `temperature_station` — to a mouth discovery already
+found, so it is forced by an observed series instead of by its catchment normal; changing
+`plume_depth` or splitting a discharge with `discharge_fraction` is the exception three of the
+eight need (Glomma's two mouths, Drammenselva), not what the list is for. The other thirteen
+discovered mouths run freshwater-only, sized by their own catchment. Only the gauge half needs a
+credential, an NVE HydAPI key in `NVE_API_KEY` (free at https://hydapi.nve.no/Users); the map
+services are open, and nothing else here needs one either.
 
 The river config gets the same `data_root` as the rest of the setup, so the cached NVE responses
 land alongside it rather than being shared from elsewhere, and it writes `forcing_rivers_nve.nc`
@@ -161,9 +167,14 @@ function oslofjorden()
                 # their own rate — a spread one shared timescale cannot express at all.
                 minimum_relaxation_timescale = 600.0,
                 # Overrides, keyed by the `vassdragsnr` of each mouth's terminal ELVIS segment.
-                # They add gauges and plume depths; they never add a river, and an override
-                # matching no discovered mouth is an error. The eleven mouths named nowhere below
-                # — Aulivassdraget, Årosvassdraget, Hølenelva, Alna, Istreelva, Askerelva,
+                # They never add a river — a mouth discovery finds is forced with or without one —
+                # and an override matching no discovered mouth is an error. An override's usual job
+                # is attaching a gauge (`discharge_station`, sometimes `temperature_station`) to a
+                # mouth that would otherwise run on its catchment normal alone; only three of the
+                # eight below also change `plume_depth` or `discharge_fraction`, which they need for
+                # geometry reasons (a river bed rather than an estuary, a split mouth), not because
+                # that is what an override is for. The eleven mouths named nowhere below —
+                # Aulivassdraget, Årosvassdraget, Hølenelva, Alna, Istreelva, Askerelva,
                 # Årungelva, Sageneelva, Borreelva, Selvikelva and Ljanselva — run freshwater-only
                 # at 5 m with λ from their catchment normal, which is the whole point of
                 # discovery: a river with no gauge still scales by its own size.
