@@ -1,7 +1,7 @@
 using FjordSim
 using FjordSim.Bathymetry: write_bathymetry_file
 using FjordSim.Configs: open_edges
-using Dates: DateTime, Hour
+using Dates: Date, DateTime, Hour
 using Test
 using ArchGDAL
 using NCDatasets
@@ -28,6 +28,8 @@ include("utilities.jl")
             :DybdedataConfig,
             :NorKystConfig,
             :OF800RiversConfig,
+            :NVERiversConfig,
+            :NVERiver,
             :forcing_from_file,
             :simulation_forcing,
             :forcing_path,
@@ -43,6 +45,7 @@ include("utilities.jl")
             :interpolation_architecture,
             :plot_bathymetry,
             :plot_forcing,
+            :plot_rivers,
             :plot_boundaries,
             :download_boundaries,
             :prepare_boundaries,
@@ -57,6 +60,8 @@ include("utilities.jl")
             :river_series,
             :river_search_radius,
             :river_minimum_levels,
+            :river_plume_depth,
+            :river_lambdas,
             :boundary_time_steps,
             :boundary_source_grid,
             :boundary_variable_names,
@@ -832,7 +837,7 @@ end
             ),
             simulation_config = MinimalSimulation(data_root, DateTime(2021, 3, 4, 5), 7200.0),
         )
-        rivers = MinimalRivers(data_root, "column_rivers.nc", 3600.0, 10)
+        rivers = MinimalRivers(data_root, "column_rivers.nc", "column_rivers.png", 3600.0, 10)
 
         @test config.grid_config isa AbstractGridConfig
         @test config.bathymetry_config isa AbstractBathymetryConfig
@@ -869,6 +874,9 @@ end
         @test forcing_path(config.forcing_config) == joinpath(data_root, "column_forcing.nc")
         @test plot_path(config.forcing_config) == joinpath(data_root, "column_forcing.png")
         @test river_forcing_path(rivers) == joinpath(data_root, "column_rivers.nc")
+        # A river config resolves its plot the same way the other four supertypes do, so a new
+        # source inherits `plot_rivers`' output path without a method of its own.
+        @test plot_path(rivers) == joinpath(data_root, "column_rivers.png")
         @test atmosphere_path(config.atmosphere_config) == joinpath(data_root, "column_atmosphere.nc")
         @test atmosphere_directory(config.atmosphere_config) == joinpath(data_root, "column_source")
         @test plot_path(config.atmosphere_config) == joinpath(data_root, "column_atmosphere.png")
@@ -2311,6 +2319,535 @@ end
         end
     end
 
+    @testset "NVE rivers config" begin
+        forcing = FjordSim.Forcing
+
+        # Glomma is the reason an outlet names two stations: discharge at Solbergfoss and
+        # temperature 40 km downstream at Sarpfossen, with no station carrying both.
+        glomma = NVERiver(
+            id = 1,
+            name = "Glomma",
+            longitude = 10.9709,
+            latitude = 59.1859,
+            discharge_station = "2.605.0",
+            temperature_station = "2.1087.0",
+            plume_depth = Inf,
+        )
+        # A small river taking only its location and its size: no temperature it can be trusted on,
+        # and a stated mean discharge instead of a series.
+        akerselva = NVERiver(
+            id = 2,
+            name = "Akerselva",
+            longitude = 10.7604,
+            latitude = 59.9010,
+            mean_discharge = 3.0,
+        )
+        rivers = NVERiversConfig(
+            data_root = "/data/oslofjord",
+            outlets = [glomma, akerselva],
+            years = [2020],
+        )
+
+        @test rivers isa AbstractRiverConfig
+        @test all(isconcretetype, fieldtypes(typeof(rivers)))
+        @test all(isconcretetype, fieldtypes(NVERiver))
+
+        # The default output file differs from `OF800RiversConfig`'s, so both sources can be
+        # prepared under one `data_root` without one overwriting the other.
+        @test river_forcing_path(rivers) == "/data/oslofjord/forcing_rivers_nve.nc"
+        @test river_forcing_path(rivers) != river_forcing_path(OF800RiversConfig(data_root = "/data/oslofjord"))
+
+        @test river_search_radius(rivers) == 10
+        # Zero, unlike the value `oslofjorden()` gives OF800: a plume is the better answer to a
+        # shallow outlet than relocating it.
+        @test river_minimum_levels(rivers) == 0
+        @test rivers.relaxation_timescale == 3600.0
+
+        # `river_locations` reads no file, so it works before anything is downloaded — which is what
+        # lets the two per-river hooks index back through it.
+        locations = river_locations(rivers)
+        @test [location.id for location in locations] == [1, 2]
+        @test [location.name for location in locations] == ["Glomma", "Akerselva"]
+        @test (locations[1].longitude, locations[1].latitude) == (10.9709, 59.1859)
+
+        # The plume depth is per river, which is the whole point: Glomma's cell is inside a river
+        # bed and takes the column, Akerselva's takes the surface cell alone.
+        @test river_plume_depth(rivers, locations[1]) == Inf
+        @test river_plume_depth(rivers, locations[2]) == 0.0
+        @test_throws ErrorException forcing.nve_outlet(rivers, 99)
+
+        # Only the series an outlet names are fetched, so an unnamed station costs no request.
+        @test forcing.nve_outlet_series(glomma) ==
+              [(forcing.NVE_WATER_TEMPERATURE, "2.1087.0"), (forcing.NVE_DISCHARGE, "2.605.0")]
+        @test isempty(forcing.nve_outlet_series(akerselva))
+        @test forcing.nve_stations(rivers) == ["2.1087.0", "2.605.0"]
+
+        # Daily is the resolution the pipeline wants, since `river_series` matches by calendar date.
+        @test rivers.resolution_time == forcing.NVE_DAILY_RESOLUTION == 1440
+        url = forcing.nve_observations_url(rivers, "2.605.0", forcing.NVE_DISCHARGE, 2020)
+        @test occursin("StationId=2.605.0", url)
+        @test occursin("Parameter=1001", url)
+        @test occursin("ResolutionTime=1440", url)
+        # An ISO-8601 interval is mandatory: omitting it returns only the single latest record.
+        @test occursin("ReferenceTime=2020-01-01/2021-01-01", url)
+
+        # No salinity parameter exists in HydAPI, so S is a constant rather than a series.
+        @test rivers.constants == Dict("S" => 0.0)
+
+        mktempdir() do tmp
+            keyed = NVERiversConfig(
+                data_root = tmp, outlets = [glomma], years = [2020], api_key = "stated",
+            )
+            @test forcing.nve_api_key(keyed) == "stated"
+
+            # A stated key wins over the environment; with neither, the error names the variable and
+            # where to get a key, rather than surfacing as an HTTP 401 with an empty body.
+            unkeyed = NVERiversConfig(data_root = tmp, outlets = [glomma], years = [2020])
+            withenv(forcing.NVE_API_KEY_VARIABLE => "from-env") do
+                @test forcing.nve_api_key(unkeyed) == "from-env"
+                @test forcing.nve_api_key(keyed) == "stated"
+            end
+            withenv(forcing.NVE_API_KEY_VARIABLE => nothing) do
+                @test_throws ErrorException forcing.nve_api_key(unkeyed)
+            end
+
+            # A real response, cached the way `download_rivers` caches it. Note the 11:00 UTC stamp
+            # on a daily mean — HydAPI's convention, and why matching is by calendar date — and the
+            # `null` value on an otherwise gap-free axis.
+            response = """
+            {"currentLink":"…","apiVersion":"1.0","license":"https://data.norge.no/nlod/en",
+             "itemCount":1,
+             "data":[{"stationId":"2.1087.0","parameter":1003,"parameterName":"Vanntemperatur",
+               "unit":"°C","serieVersionNo":1,"method":"Mean","observationCount":3,
+               "observations":[
+                 {"time":"2020-01-01T11:00:00Z","value":4.5,"correction":0,"quality":1},
+                 {"time":"2020-01-02T11:00:00Z","value":null,"correction":0,"quality":1},
+                 {"time":"2020-01-03T11:00:00Z","value":6.5,"correction":0,"quality":1}]}]}
+            """
+            path = forcing.nve_observations_path(
+                rivers, "2.1087.0", forcing.NVE_WATER_TEMPERATURE, 2020,
+            )
+            @test endswith(path, "observations_2.1087.0_1003_2020.json")
+
+            cached = NVERiversConfig(
+                data_root = tmp, outlets = [glomma], years = [2020], api_key = "stated",
+            )
+            mkpath(forcing.nve_download_directory(cached))
+            write(
+                forcing.nve_observations_path(
+                    cached, "2.1087.0", forcing.NVE_WATER_TEMPERATURE, 2020,
+                ),
+                response,
+            )
+
+            # A `null` value is dropped rather than carried as a marker, so two dates survive of
+            # three records.
+            records = forcing.nve_daily_values(
+                forcing.nve_observations_path(
+                    cached, "2.1087.0", forcing.NVE_WATER_TEMPERATURE, 2020,
+                ),
+            )
+            @test sort(collect(keys(records))) == [Date(2020, 1, 1), Date(2020, 1, 3)]
+            @test records[Date(2020, 1, 1)] == 4.5
+
+            # A series that exists but holds nothing in the requested window comes back as a
+            # perfectly successful HTTP 200 carrying zero observations — Sarpsfoss answers exactly
+            # that for 2020 — so a status code cannot detect it and `download_rivers` counts instead.
+            empty_response = """
+            {"apiVersion":"1.0","itemCount":1,
+             "data":[{"stationId":"2.31.0","parameter":1003,"unit":"°C",
+               "observationCount":0,"observations":[]}]}
+            """
+            empty_file = joinpath(tmp, "empty_window.json")
+            write(empty_file, empty_response)
+            @test forcing.nve_observation_count(empty_file) == 0
+            @test isempty(forcing.nve_daily_values(empty_file))
+
+            populated = joinpath(tmp, "populated.json")
+            write(populated, response)
+            @test forcing.nve_observation_count(populated) == 3   # including the `null` one
+            @test length(forcing.nve_daily_values(populated)) == 2
+
+            # A file with no `data` array at all counts as empty rather than throwing.
+            @test forcing.nve_observation_count(joinpath(tmp, "absent.json")) == 0
+
+            # A JSON body starts `{`, so the shared download validator passes it — the check exists
+            # for an HTML page served with HTTP 200, which starts `<`.
+            json_file = joinpath(tmp, "response.json")
+            write(json_file, response)
+            @test forcing.validate_river_download(json_file, "https://example.invalid") == json_file
+
+            # `river_series` matches by calendar date and fills the one-day hole from its nearest
+            # neighbour, so a single missing observation is noise rather than a step with no forcing.
+            times = [DateTime(2020, 1, 1, 12), DateTime(2020, 1, 2, 12), DateTime(2020, 1, 3, 12)]
+            series = @test_logs (:warn, r"Filled 1 of 3") river_series(cached, times)
+            @test sort(collect(keys(series))) == ["S", "T"]
+            @test series["T"][1, 1] == 4.5f0
+            @test series["T"][1, 3] == 6.5f0
+            @test isfinite(series["T"][1, 2])          # filled, not left as a hole
+            @test series["T"][1, 2] ∈ (4.5f0, 6.5f0)
+            # S is the constant, at every river and every step, because a river is fresh.
+            @test all(iszero, series["S"])
+            @test size(series["S"]) == (1, 3)
+
+            # A date no response covers stays NaN and is inert: the file's `_FillValue` reads back as
+            # the -999.0 sentinel every `ForcingFromFile` branch gates on.
+            far = river_series(cached, [DateTime(2021, 6, 1)])
+            @test all(isnan, far["T"])
+
+            # An outlet naming no temperature station is the documented escape for an untrustworthy
+            # sensor, and yields a NaN row rather than an error.
+            quiet = NVERiversConfig(
+                data_root = tmp, outlets = [akerselva], years = [2020], api_key = "stated",
+            )
+            @test all(isnan, river_series(quiet, times)["T"])
+            @test all(iszero, river_series(quiet, times)["S"])
+
+            # A missing cache names the step that fills it rather than failing on a JSON read.
+            absent = NVERiversConfig(
+                data_root = tmp, outlets = [glomma], years = [2019], api_key = "stated",
+            )
+            @test_throws ErrorException river_series(absent, times)
+
+            # Q̄ precedence: a stated `mean_discharge` wins, and it is what makes a small river with
+            # no series still scale by its size.
+            @test forcing.nve_mean_discharge(quiet, akerselva)[1] == 3.0
+            @test forcing.nve_mean_discharge(quiet, akerselva)[2] == "the config"
+
+            # A named discharge station whose year was never downloaded is an error naming the step
+            # that fills the cache, not a silent fallback — `river_lambdas` only runs after
+            # `download_rivers`, so a missing file means the download did not happen.
+            @test_throws ErrorException forcing.nve_mean_discharge(cached, glomma)
+        end
+
+        mktempdir() do tmp
+            (; grid) = land_column_test_grid(joinpath(tmp, "bathymetry.nc"))
+            location = FjordSim.Forcing.RiverLocation(2, "Akerselva", 10.0, 59.0)
+            surface_cell = FjordSim.Forcing.RiverCell(location, 1, 2, 0.0, 2:2)
+            column_cell = FjordSim.Forcing.RiverCell(location, 1, 2, 0.0, 1:2)
+
+            # λ = Q̄ / V, with V the plume volume — so the same river given a deeper plume is nudged
+            # proportionally more gently, because the freshwater is spread through more water.
+            # This grid's cells are ~11 km across, so the raw Q̄/V is around 5e-9 s⁻¹ and a 100 s
+            # floor leaves it far below the cap — the raw rate, but still a timescale the λ-regime
+            # guard accepts.
+            sized = NVERiversConfig(
+                data_root = tmp, outlets = [akerselva], years = [2020], api_key = "stated",
+                minimum_relaxation_timescale = 100.0,
+            )
+            surface_lambda = only(river_lambdas(sized, [surface_cell], grid))
+            column_lambda = only(river_lambdas(sized, [column_cell], grid))
+            @test surface_lambda ≈ 2 * column_lambda rtol = 1e-5
+            volume = FjordSim.Forcing.volume
+            @test surface_lambda ≈
+                  Float32(3.0 / volume(1, 2, 2, grid, Center(), Center(), Center())) rtol = 1e-5
+
+            # The cap is not optional: the physically correct coefficient reaches λ·Δt > 1 for a
+            # large river in a small cell, and `ForcingFromFile` reads λ > 1 as an x-flux outright.
+            # This grid's cells are ~11 km across, so the cap is made to bind by raising the floor
+            # on τ rather than by inventing an unphysical discharge.
+            capped = NVERiversConfig(
+                data_root = tmp, outlets = [akerselva], years = [2020], api_key = "stated",
+                minimum_relaxation_timescale = 1.0e9,
+            )
+            @test surface_lambda > Float32(1 / 1.0e9)   # the raw rate would exceed the cap
+            @test only(river_lambdas(capped, [surface_cell], grid)) == Float32(1 / 1.0e9)
+
+            # Whatever the cap, λ stays strictly inside the relaxation regime: `ForcingFromFile`
+            # reads λ > 1 as an x-flux and λ < -1 as a y-flux.
+            for config in (sized, capped)
+                @test all(0 .< river_lambdas(config, [surface_cell, column_cell], grid) .< 1)
+            end
+
+            # A timescale of a second or less would put λ outside the relaxation regime, where
+            # `ForcingFromFile` reads it as an x-flux — a silent change of forcing term. That is
+            # rejected rather than left for the cap to enforce.
+            for field in (:minimum_relaxation_timescale, :relaxation_timescale)
+                unstable = NVERiversConfig(
+                    data_root = tmp, outlets = [akerselva], years = [2020], api_key = "stated",
+                    ; (field => 1.0,)...,
+                )
+                @test_throws ErrorException river_lambdas(unstable, [surface_cell], grid)
+            end
+
+            # With no size known at all, the config's own timescale is used and the river is named.
+            sizeless = NVERiversConfig(
+                data_root = tmp,
+                outlets = [NVERiver(id = 2, name = "Akerselva", longitude = 10.0, latitude = 59.0)],
+                years = [2020],
+                api_key = "stated",
+            )
+            @test @test_logs (:warn, r"No discharge for river 2") only(
+                river_lambdas(sizeless, [surface_cell], grid),
+            ) == Float32(1 / 3600)
+        end
+    end
+
+    @testset "NVE outlet discovery" begin
+        forcing = FjordSim.Forcing
+        seconds_per_year = forcing.NVE_SECONDS_PER_YEAR
+        runoff(discharge) = discharge * seconds_per_year / 1e6
+
+        # A hand-built ELVIS network, in the reduced form `nve_download_network` caches. No network
+        # access: the map services are exercised only through the parsing and derivation below.
+        #
+        #   001.Z  a two-segment chain, so only its downstream end is a mouth
+        #   002.Z  a single small segment, below the threshold in one of the cases
+        #   003.Z  two mouths in one catchment — the distributary case
+        #   004.Z  a mouth outside the domain, which `margin` is what makes possible
+        #   999.Z  a mouth whose catchment REGINE does not call sea-draining
+        segment(start, stop, catchment, number, strahler) = Dict{String,Any}(
+            "start" => collect(start),
+            "stop" => collect(stop),
+            "vnrnfelt" => catchment,
+            "vassdragsnr" => number,
+            "strahler" => strahler,
+        )
+        segments = [
+            segment((10.1, 59.1), (10.2, 59.2), "001.Z", "001.A", 5),
+            segment((10.2, 59.2), (10.3, 59.3), "001.Z", "001.B", 6),
+            segment((10.5, 59.5), (10.6, 59.6), "002.Z", "002.A", 3),
+            segment((10.7, 59.7), (10.75, 59.75), "003.Z", "003.A", 4),
+            segment((10.8, 59.7), (10.85, 59.75), "003.Z", "003.B", 2),
+            segment((11.5, 59.5), (11.6, 59.6), "004.Z", "004.A", 4),
+            segment((10.4, 59.4), (10.45, 59.45), "999.Z", "999.A", 3),
+        ]
+        catchments = Dict{String,Any}(
+            "001.Z" => Dict{String,Any}("name" => "Storelva", "qnormal_mm3aar" => runoff(100.0)),
+            "002.Z" => Dict{String,Any}("name" => "Lilleelva", "qnormal_mm3aar" => runoff(1.0)),
+            "003.Z" => Dict{String,Any}("name" => "Toelva", "qnormal_mm3aar" => runoff(10.0)),
+            "004.Z" => Dict{String,Any}("name" => "Utenfor", "qnormal_mm3aar" => runoff(10.0)),
+        )
+        domain = (10.0, 59.0, 11.0, 60.0)
+
+        fixture(tmp; kwargs...) = begin
+            config = NVERiversConfig(;
+                data_root = tmp, outlets = NVERiver[], years = [2020], kwargs...,
+            )
+            forcing.nve_write_cache(forcing.nve_catchment_path(config), domain, "catchments", catchments)
+            forcing.nve_write_cache(forcing.nve_network_path(config), domain, "segments", segments)
+            config
+        end
+
+        # `Q̄` from a catchment's normal annual runoff, and the guard on a catchment that has none.
+        @test forcing.nve_catchment_discharge(catchments["001.Z"]) ≈ 100.0
+        @test isnothing(forcing.nve_catchment_discharge(Dict{String,Any}()))
+        @test isnothing(forcing.nve_catchment_discharge(Dict{String,Any}("qnormal_mm3aar" => 0)))
+
+        # A segment's two ends, from either GeoJSON line shape. The parts of a `MultiLineString`
+        # are consecutive, so flattening them still leaves the feature's own two ends first and
+        # last — which is why it is flattened rather than rejected.
+        line = Dict{String,Any}(
+            "geometry" => Dict{String,Any}(
+                "type" => "LineString",
+                "coordinates" => [[10.0, 59.0], [10.5, 59.5], [11.0, 60.0]],
+            ),
+        )
+        multi = Dict{String,Any}(
+            "geometry" => Dict{String,Any}(
+                "type" => "MultiLineString",
+                "coordinates" => [[[10.0, 59.0], [10.5, 59.5]], [[10.5, 59.5], [11.0, 60.0]]],
+            ),
+        )
+        @test forcing.nve_segment_endpoints(line) == ((10.0, 59.0), (11.0, 60.0))
+        @test forcing.nve_segment_endpoints(multi) == ((10.0, 59.0), (11.0, 60.0))
+        @test isnothing(forcing.nve_segment_endpoints(Dict{String,Any}()))
+
+        # The query box is the domain grown on every side; the filter box is the domain itself.
+        @test forcing.nve_grown_domain(domain, 0.25) == (9.75, 58.75, 11.25, 60.25)
+
+        mktempdir() do tmp
+            # With no `minimum_discharge` nothing is discovered and nothing is read — which is what
+            # keeps a config that states its own outlets working exactly as it did.
+            stated = NVERiversConfig(
+                data_root = tmp,
+                outlets = [NVERiver(id = 7, name = "Manual", longitude = 10.5, latitude = 59.5)],
+                years = [2020],
+            )
+            @test forcing.nve_outlets(stated) == stated.outlets
+            @test [location.id for location in river_locations(stated)] == [7]
+        end
+
+        mktempdir() do tmp
+            config = fixture(tmp; minimum_discharge = 0.5, default_plume_depth = 5.0)
+
+            # 003.Z reaches the sea twice inside the domain, which is warned about rather than
+            # silently halved: a real distributary is exactly what a setup would want to override.
+            outlets = @test_logs (:warn, r"reaches the sea at 2 places") match_mode = :any forcing.nve_outlets(config)
+
+            # Three mouths: the chain's downstream end, the higher-Strahler of 003.Z's two, and the
+            # small one. 004.Z is outside the domain and 999.Z has no sea-draining catchment.
+            @test [outlet.vassdragsnr for outlet in outlets] == ["001.B", "003.A", "002.A"]
+            # Ids are the discharge rank, so an id also says how large a river is.
+            @test [outlet.id for outlet in outlets] == [1, 2, 3]
+            @test [outlet.name for outlet in outlets] == ["Storelva", "Toelva", "Lilleelva"]
+            @test [outlet.catchment_discharge for outlet in outlets] ≈ [100.0, 10.0, 1.0]
+            # The mouth is the segment's downstream end, not its start.
+            @test (outlets[1].longitude, outlets[1].latitude) == (10.3, 59.3)
+            @test (outlets[2].longitude, outlets[2].latitude) == (10.75, 59.75)
+            # A discovered outlet takes the config's default plume depth and no gauge at all: a
+            # river with no station still scales by its own size, through `catchment_discharge`.
+            @test all(outlet.plume_depth == 5.0 for outlet in outlets)
+            @test all(isempty(outlet.discharge_station) for outlet in outlets)
+            @test isnan(outlets[1].mean_discharge)
+
+            # Memoised, so a derivation shared by every hook happens once rather than once per cell.
+            @test forcing.nve_outlets(config) === config.discovered
+            @test [location.name for location in river_locations(config)] ==
+                  ["Storelva", "Toelva", "Lilleelva"]
+
+            # The catchment normal is rule 3, and `discharge_fraction` scales whatever answered.
+            discharge, source = forcing.nve_mean_discharge(config, outlets[1])
+            @test discharge ≈ 100.0
+            @test occursin("REGINE", source)
+            halved = forcing.nve_river_with_id(
+                NVERiver(
+                    vassdragsnr = "001.B", name = "Half", longitude = 10.3, latitude = 59.3,
+                    discharge_fraction = 0.25, catchment_discharge = 100.0,
+                ),
+                1,
+            )
+            scaled, scaled_source = forcing.nve_mean_discharge(config, halved)
+            @test scaled ≈ 25.0
+            @test occursin("scaled by 0.25", scaled_source)
+        end
+
+        mktempdir() do tmp
+            # A higher threshold drops the small river, and the ranks close up behind it.
+            config = fixture(tmp; minimum_discharge = 5.0)
+            outlets = @test_logs (:warn,) match_mode = :any forcing.nve_outlets(config)
+            @test [outlet.vassdragsnr for outlet in outlets] == ["001.B", "003.A"]
+            @test [outlet.id for outlet in outlets] == [1, 2]
+        end
+
+        mktempdir() do tmp
+            # Two rivers of exactly equal size, which is not a contrived case — Borreelva and
+            # Selvikelva are both 0.67 m³/s on the Oslofjord domain. `terminals` is a `Dict`, so
+            # discharge alone would let them swap ids between runs, and an id is what a log line, a
+            # plot legend and `nve_outlet` all identify a river by.
+            tied_segments = [
+                segment((10.1, 59.1), (10.2, 59.2), "010.Z", "010.B", 4),
+                segment((10.3, 59.1), (10.4, 59.2), "020.Z", "020.A", 4),
+            ]
+            tied_catchments = Dict{String,Any}(
+                "010.Z" => Dict{String,Any}("name" => "Bekk B", "qnormal_mm3aar" => runoff(2.0)),
+                "020.Z" => Dict{String,Any}("name" => "Bekk A", "qnormal_mm3aar" => runoff(2.0)),
+            )
+            config = NVERiversConfig(
+                data_root = tmp, outlets = NVERiver[], years = [2020], minimum_discharge = 0.5,
+            )
+            forcing.nve_write_cache(
+                forcing.nve_catchment_path(config), domain, "catchments", tied_catchments,
+            )
+            forcing.nve_write_cache(
+                forcing.nve_network_path(config), domain, "segments", tied_segments,
+            )
+            @test [outlet.vassdragsnr for outlet in forcing.nve_outlets(config)] ==
+                  ["010.B", "020.A"]
+        end
+
+        mktempdir() do tmp
+            # An override replaces only what it states. Everything it leaves unset — the name, the
+            # mouth, the rank — keeps what discovery derived, and `catchment_discharge` is never
+            # overridden because it is what NVE says the catchment is.
+            config = fixture(
+                tmp;
+                minimum_discharge = 0.5,
+                default_plume_depth = 5.0,
+                outlets = [
+                    NVERiver(
+                        vassdragsnr = "001.B", name = "Storelva (east)",
+                        discharge_station = "1.1.0", temperature_station = "1.2.0",
+                        discharge_fraction = 2 // 3, plume_depth = Inf,
+                    ),
+                    NVERiver(vassdragsnr = "002.A", discharge_station = "2.1.0"),
+                ],
+            )
+            outlets = @test_logs (:warn,) match_mode = :any forcing.nve_outlets(config)
+
+            @test outlets[1].name == "Storelva (east)"
+            @test (outlets[1].longitude, outlets[1].latitude) == (10.3, 59.3)
+            @test outlets[1].id == 1
+            @test outlets[1].discharge_station == "1.1.0"
+            @test outlets[1].plume_depth == Inf
+            @test outlets[1].catchment_discharge ≈ 100.0
+            # Unset fields keep the derivation: NVE's name, the default plume, no temperature.
+            @test outlets[3].name == "Lilleelva"
+            @test outlets[3].plume_depth == 5.0
+            @test isempty(outlets[3].temperature_station)
+            # An untouched mouth is left exactly as discovered.
+            @test outlets[2].name == "Toelva"
+            @test isempty(outlets[2].discharge_station)
+
+            @test forcing.nve_stations(config) == ["1.2.0", "1.1.0", "2.1.0"]
+        end
+
+        # Three ways an override list is wrong, all errors rather than warnings: each would
+        # otherwise be a plausible-looking wrong answer no later stage can notice.
+        mktempdir() do tmp
+            config = fixture(
+                tmp; minimum_discharge = 0.5,
+                outlets = [NVERiver(vassdragsnr = "999.X", name = "Nowhere")],
+            )
+            @test_throws ErrorException forcing.nve_outlets(config)
+        end
+        mktempdir() do tmp
+            config = fixture(
+                tmp; minimum_discharge = 0.5,
+                outlets = [
+                    NVERiver(vassdragsnr = "001.B", name = "One"),
+                    NVERiver(vassdragsnr = "001.B", name = "Two"),
+                ],
+            )
+            @test_throws ErrorException forcing.nve_outlets(config)
+        end
+        mktempdir() do tmp
+            # A manually stated outlet in a config that discovers: it names no `vassdragsnr`, so
+            # there is nothing for it to override and it would otherwise vanish silently.
+            config = fixture(
+                tmp; minimum_discharge = 0.5,
+                outlets = [NVERiver(id = 9, name = "Manual", longitude = 10.5, latitude = 59.5)],
+            )
+            @test_throws ErrorException forcing.nve_outlets(config)
+        end
+        mktempdir() do tmp
+            # An override id that collides with a rank, which would make `nve_outlet` hand a hook
+            # the wrong river for every `RiverLocation` it looks back up.
+            config = fixture(
+                tmp; minimum_discharge = 0.5,
+                outlets = [NVERiver(vassdragsnr = "002.A", id = 1)],
+            )
+            @test_throws ErrorException forcing.nve_outlets(config)
+        end
+        mktempdir() do tmp
+            # No mouth reaches the threshold: an error naming how many catchments were there,
+            # rather than an empty river list that `add_rivers` would report as "0 of 0 placed".
+            config = fixture(tmp; minimum_discharge = 1000.0)
+            @test_throws ErrorException forcing.nve_outlets(config)
+        end
+
+        # A manually stated outlet has to carry the fields that make it one; an override does not.
+        @test_throws ArgumentError NVERiver(name = "No coordinates")
+        @test_throws ArgumentError NVERiver(longitude = 10.0, latitude = 59.0)
+        @test NVERiver(vassdragsnr = "001.B") isa NVERiver
+
+        mktempdir() do tmp
+            # The cache records the domain it was fetched for, so a grid change re-downloads
+            # instead of silently reusing another domain's river network.
+            config = fixture(tmp; minimum_discharge = 0.5)
+            @test forcing.nve_cache_covers(forcing.nve_network_path(config), domain)
+            @test !forcing.nve_cache_covers(forcing.nve_network_path(config), (0.0, 0.0, 1.0, 1.0))
+            @test !forcing.nve_cache_covers(joinpath(tmp, "absent.json"), domain)
+
+            # Reading a cache that was never written names the step that writes it.
+            missing_config = NVERiversConfig(
+                data_root = joinpath(tmp, "empty"), outlets = NVERiver[], years = [2020],
+                minimum_discharge = 0.5,
+            )
+            @test_throws ErrorException forcing.nve_outlets(missing_config)
+        end
+    end
+
     @testset "boundary preparation helpers" begin
         boundary_dimension_names = FjordSim.Forcing.boundary_dimension_names
         boundary_location = FjordSim.Forcing.boundary_location
@@ -2699,7 +3236,7 @@ end
                 FjordSim.Forcing.RiverLocation(2, "open water", longitudes[4], latitudes[2]),
                 FjordSim.Forcing.RiverLocation(3, "outside", 20.0, latitudes[2]),
             ]
-            cells = river_cells(grid, locations, 10, 0)
+            cells = river_cells(grid, locations, 10, 0, zeros(length(locations)))
             @test length(cells) == 2
             @test [cell.location.id for cell in cells] == [1, 2]
             @test (cells[1].i, cells[1].j, cells[1].distance) == (1, 2, 1.0)
@@ -2709,10 +3246,10 @@ end
             # An outlet sitting exactly on the outermost node counts as outside, matching the
             # reference's strict bounds test.
             edge = FjordSim.Forcing.RiverLocation(4, "on the edge", longitudes[1], latitudes[2])
-            @test isempty(river_cells(grid, [edge], 10, 0))
+            @test isempty(river_cells(grid, [edge], 10, 0, [0.0]))
 
             # With no reach, the on-land outlet is dropped too rather than written into land.
-            @test isempty(river_cells(grid, [locations[1]], 0, 0))
+            @test isempty(river_cells(grid, [locations[1]], 0, 0, [0.0]))
 
             # A river is relaxed into the surface level alone, so the column beneath it is what has
             # to carry the exchange that freshening drives — one cell cannot, and runs to 64 psu.
@@ -2728,7 +3265,9 @@ end
 
             # Demanding more levels than any column has drops every outlet rather than placing one
             # in a column that cannot carry it.
-            @test isempty(river_cells(grid, locations, 10, maximum(levels) + 1))
+            @test isempty(
+                river_cells(grid, locations, 10, maximum(levels) + 1, zeros(length(locations))),
+            )
         end
     end
 
@@ -2789,6 +3328,40 @@ end
             NCDataset(forcing_path(forcing_config)) do original
                 @test all(original["T"][:, :, :, :] .== 1.0f0)
                 @test all(original["T_lambda"][:, :, :, :] .== 2.0f-5)
+            end
+
+            # The same river with a plume deep enough to reach the bottom writes *both* levels.
+            # The grid's faces are [-20, -10, 0], so 15 m covers the whole two-cell column while
+            # the surface-only run above covered one — and that is the whole difference between
+            # relaxing a river bed and relaxing the top of an estuary it does not have.
+            plume_rivers = StubRivers(
+                tmp,
+                "forcing_rivers_plume.nc",
+                3600.0,
+                10,
+                [FjordSim.Forcing.RiverLocation(7, "test river", longitudes[2], latitudes[2])],
+                Dict("T" => Float32[3.0 4.0], "S" => Float32[0.0 0.0]),
+                false;
+                plume_depth = 15.0,
+            )
+            plume_config = test_forcing_config(data_root = tmp, rivers = plume_rivers)
+            plume_result = add_rivers(grid, plume_config)
+            @test plume_result.cells[1].levels == 1:2
+
+            NCDataset(plume_result.output_file) do written
+                # Both levels of the river column now carry the river values and lambda...
+                for level = 1:2
+                    @test written["T"][1, 2, level, :] == Float32[3.0, 4.0]
+                    @test written["S"][1, 2, level, :] == Float32[0.0, 0.0]
+                    @test all(written["T_lambda"][1, 2, level, :] .≈ Float32(1 / 3600))
+                end
+
+                # ...while a neighbouring column is untouched at every level, so a plume widens the
+                # write vertically and not horizontally.
+                for level = 1:2
+                    @test written["T"][1, 3, level, :] == Float32[1.0, 1.0]
+                    @test all(written["T_lambda"][1, 3, level, :] .== 2.0f-5)
+                end
             end
         end
     end
@@ -2868,6 +3441,122 @@ end
             # that writes it — a forgotten `prepare_forcing` must not silently become a river-only run.
             plain = test_forcing_config(data_root = tmp, rivers = rivers(standalone = false))
             @test_throws ErrorException add_rivers(grid, plain; coverage)
+
+            # A standalone file prefills exactly the levels its rivers reach, rather than only the
+            # surface, so `write_rivers` never patches a chunk that was never written.
+            deep = StubRivers(
+                tmp,
+                "forcing_rivers_plume.nc",
+                3600.0,
+                10,
+                [location],
+                Dict("T" => Float32[3.0 4.0]),
+                true;
+                plume_depth = 15.0,
+            )
+            deep_result = add_rivers(
+                grid, test_forcing_config(data_root = tmp, rivers = deep); coverage,
+            )
+            @test deep_result.cells[1].levels == 1:2
+
+            NCDataset(deep_result.output_file) do written
+                for level = 1:2
+                    @test written["T"][1, 2, level, :] == Float32[3.0, 4.0]
+                    @test all(written["T_lambda"][1, 2, level, :] .≈ Float32(1 / 3600))
+                    # A non-river cell of a prefilled level is still empty, so the prefill adds
+                    # levels to patch without adding forcing anywhere.
+                    @test all(ismissing, written["T"][1, 3, level, :])
+                    @test all(iszero, written["T_lambda"][1, 3, level, :])
+                end
+            end
+        end
+    end
+
+    @testset "river plume levels" begin
+        plume_levels = FjordSim.Forcing.plume_levels
+        column_wet_levels = FjordSim.Forcing.column_wet_levels
+        river_level_range = FjordSim.Forcing.river_level_range
+
+        # `oslofjorden`'s real 24 faces, so the table in the plume docstring is checked against the
+        # grid it was measured on rather than a synthetic one.
+        faces = [
+            -400.0, -366.5, -333.0, -299.5, -266.0, -232.5, -199.0, -165.5,
+            -132.0, -105.0, -83.0, -66.0, -52.0, -41.0, -32.0, -25.0,
+            -19.0, -14.5, -10.8, -7.9, -5.5, -3.7, -2.2, -1.0, 0.0,
+        ]
+        Nz = length(faces) - 1
+        @test Nz == 24
+
+        # Zero is the default and means the surface cell alone — exactly what the pipeline wrote
+        # before plumes existed, which is what keeps every existing river source unchanged.
+        @test plume_levels(faces, Nz, 0.0) == 24:24
+
+        # A cell joins the plume when its *top* face is within the depth, so 5 m reaches the cell
+        # whose top is at -3.7 m and stops at the one whose top is at -5.5 m: four cells, 5.5 m.
+        @test plume_levels(faces, Nz, 5.0) == 21:24
+        @test -faces[21] == 5.5
+        @test plume_levels(faces, Nz, 10.0) == 19:24
+        @test -faces[19] == 10.8
+
+        # `Inf` is the whole wet column and never reaches into rock: a column with three wet cells
+        # gets three, not all 24.
+        @test plume_levels(faces, Nz, Inf) == 1:24
+        @test plume_levels(faces, 3, Inf) == 22:24
+        # ...and the clip binds a finite depth too, so a deep plume in a shallow column is the column.
+        @test plume_levels(faces, 2, 10.0) == 23:24
+
+        # The surface cell is always in the range, whatever the depth, so a river is never written
+        # nowhere — including in a column with a single wet cell.
+        for depth in (0.0, 0.5, 1.0, 5.0, Inf)
+            @test last(plume_levels(faces, Nz, depth)) == Nz
+            @test plume_levels(faces, 1, depth) == 24:24
+        end
+
+        mktempdir() do tmp
+            (; grid) = land_column_test_grid(joinpath(tmp, "bathymetry.nc"))
+
+            # `column_wet_levels` is `coastal_water_mask`'s own body, so the two must agree about
+            # what is wet — that is what keeps "water" meaning the same thing here as it does when
+            # `prepare_forcing` writes the file.
+            surface, levels = column_wet_levels(grid)
+            @test size(surface) == (5, 4)
+            @test surface == FjordSim.Forcing.coastal_water_mask(grid, 0)
+            @test all(levels[2, :] .== 0)   # the land column
+            @test all(levels[1, :] .== 2)   # a wet column, both levels
+
+            # A river's range is bounded by the water actually in its column.
+            @test plume_levels(Array(Oceananigans.Grids.znodes(grid, Face())), levels[1, 1], Inf) ==
+                  1:2
+        end
+
+        # The union of several rivers' ranges is contiguous, because every range ends at the
+        # surface — which is what lets `write_rivers` sweep it in one pass.
+        location(id) = FjordSim.Forcing.RiverLocation(id, "r$id", 10.0, 59.0)
+        cells = [
+            FjordSim.Forcing.RiverCell(location(1), 1, 1, 0.0, 24:24),
+            FjordSim.Forcing.RiverCell(location(2), 2, 2, 0.0, 21:24),
+        ]
+        @test river_level_range(cells) == 21:24
+        @test river_level_range(cells[1:1]) == 24:24
+    end
+
+    @testset "river lambdas" begin
+        river_lambdas = FjordSim.Forcing.river_lambdas
+
+        mktempdir() do tmp
+            (; grid) = land_column_test_grid(joinpath(tmp, "bathymetry.nc"))
+            location = FjordSim.Forcing.RiverLocation(1, "r", 10.0, 59.0)
+            cells = [FjordSim.Forcing.RiverCell(location, 1, 2, 0.0, 1:2)]
+
+            # The supertype fallback is the single value the pipeline wrote before the hook existed,
+            # so a river config that ignores it is unaffected by the hook's arrival.
+            rivers = StubRivers(tmp, "unused.nc", 3600.0, 10, [location], Dict{String,Matrix{Float32}}())
+            @test river_lambdas(rivers, cells, grid) == [Float32(1 / 3600)]
+            @test eltype(river_lambdas(rivers, cells, grid)) === Float32
+
+            # It is one entry per cell, in cells order — `write_rivers` indexes it positionally.
+            two = [cells[1], FjordSim.Forcing.RiverCell(location, 3, 2, 0.0, 2:2)]
+            @test length(river_lambdas(rivers, two, grid)) == 2
         end
     end
 end

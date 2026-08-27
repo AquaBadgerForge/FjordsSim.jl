@@ -1,11 +1,22 @@
 """
     oslofjorden()
 
-The Oslofjord setup: Geonorge Sjøkart Dybdedata bathymetry, NorKyst-800m forcing with OF800
-rivers, and NORA3 atmosphere, on a 240 x 520 x 18 grid covering 10.2-11.02°E, 59.0-59.93°N.
+The Oslofjord setup: Geonorge Sjøkart Dybdedata bathymetry, NorKyst-800m forcing with NVE rivers,
+and NORA3 atmosphere, on a 240 x 520 x 24 grid covering 10.2-11.02°E, 59.0-59.93°N.
 
-The river config gets the same `data_root` as the rest of the setup, so the river data downloads
-alongside it rather than being shared from elsewhere.
+The rivers are **discovered**, not stated: `minimum_discharge = 0.5` has `add_rivers` read NVE's
+ELVIS river network and REGINE catchments for this domain and place every mouth at or above that
+size — 21 of them, carrying 99.6 % of the domain's 1179 m³/s — so no river coordinate appears in
+this file. The `outlets` list is eight overrides that attach gauges and plume depths to mouths
+discovery has already found. Only the gauge half needs a credential, an NVE HydAPI key in
+`NVE_API_KEY` (free at https://hydapi.nve.no/Users); the map services are open, and nothing else
+here needs one either.
+
+The river config gets the same `data_root` as the rest of the setup, so the cached NVE responses
+land alongside it rather than being shared from elsewhere, and it writes `forcing_rivers_nve.nc`
+rather than `forcing_rivers.nc` so the OF800 file this setup used to produce is left intact for
+comparison. `simulation_forcing_path` returns whichever file the named river config points at, so
+that is the one the run reads.
 
 It also names a `simulation_config`, so `run_simulation` works once the preparation steps have
 run. Nothing about the run has a default, so every knob is stated here and nowhere else — split
@@ -103,26 +114,116 @@ function oslofjorden()
             architecture     = :auto,
             parameters       = ["temperature", "salinity", "u_eastward", "v_northward"],
             years            = [2020],
-            rivers           = OF800RiversConfig(
-                data_root = data_root,
-                # OF800RiversConfig overloads river_locations, river_series and download_rivers
-                # (all required, hooks add_rivers and download_rivers call), plus
-                # river_minimum_levels (optional — the unoverloaded default is 0, accepting any
-                # water cell). All dispatch on this config's type.
+            # NVERiversConfig overloads river_locations, river_series and download_rivers (all
+            # required, hooks add_rivers calls), plus river_minimum_levels, river_plume_depth and
+            # river_lambdas (all optional). All dispatch on this config's type. It replaced
+            # OF800RiversConfig, which read a fixed published artifact: this one queries NVE, so
+            # the window follows `years` and every value has provenance. The HydAPI half needs an
+            # API key — `NVE_API_KEY`, free at https://hydapi.nve.no/Users.
+            #
+            # `standalone = false`, so `add_rivers` patches a copy of the NorKyst forcing above
+            # rather than writing a river-only file; `initial_conditions = FromForcing()` below
+            # therefore still has a 3D ocean state to read.
+            rivers           = NVERiversConfig(
+                data_root  = data_root,
+                # Not `forcing_rivers.nc`: the OF800 file of that name is left intact so the two
+                # sources can be compared. `simulation_forcing_path` returns whichever the named
+                # river config points at, so this is the file the run reads.
+                output_file = "forcing_rivers_nve.nc",
+                plot_file   = "forcing_rivers_nve.png",
+                years       = [2020],
+                # Every outlet below is *discovered* from NVE's ELVIS river network and sized by
+                # its REGINE catchment, so this setup states no river coordinate at all. It used
+                # to state nine, copied from the OF800 dataset's outlet table, and measured
+                # against NVE's own mouths they were wrong in ways nothing checked: Mosseleva 7 km
+                # and Gjersjøelva 6 km from their rivers, Drammenselva 602 m from the nearest
+                # water in a column at the 2 m `minimum_depth` floor, Glomma on a shelf beside
+                # both of its beds rather than in either, and Glomma's whole western arm missing.
                 #
-                # A river is relaxed into the surface level alone, so the column under it has to
-                # carry the exchange that freshening drives. Four outlets had snapped onto the
-                # 2 m `minimum_depth` floor — two 1 m cells — and ran to 64 psu underneath.
-                #
-                # Six, not the four that fixed it on the 18-level grid. A *count* of levels means a
-                # different depth on every vertical grid, and on the 24-level one four levels is a
-                # column of 3.7 to 5.5 m — so seven of the nineteen outlets sat right on the floor
-                # in 4.1 to 5.5 m of water. One of them, (220, 93) at 4.78 m, ran its bottom cell
-                # away without bound and killed the run at day 11.5 by driving salinity past the
-                # -32 psu at which TEOS10's `√(Sᴬ + 32)` throws. Six levels is 7.9 to 10.8 m and
-                # relocates all seven by one to eight cells; seven levels is not reachable — four of
-                # them have no coastal cell that deep within the search radius.
-                minimum_levels = 5,
+                # 0.5 m³/s gives 21 mouths carrying 99.6 % of the domain's 1179 m³/s. Lowering it
+                # to 0.15 would add twelve more streams for the remaining 0.3 %.
+                minimum_discharge = 0.5,
+                # 5 m is a surface plume — 4 cells, 5.5 m, on this vertical grid. The two rivers
+                # whose model cell is inside a river bed rather than an estuary say `Inf` below.
+                default_plume_depth = 5.0,
+                # Zero, where the OF800 config used five. The two are alternatives, not a pair:
+                # `minimum_levels` fixes a shallow outlet by *relocating* it to a column deep
+                # enough to resolve an estuarine exchange, `river_plume_depth` by *filling* the
+                # column so there is no partial cell left to concentrate salt in. Every outlet
+                # has a plume, so relocation would only move rivers away from their real mouths
+                # for a problem the plume has already solved.
+                minimum_levels = 0,
+                # 600 s is the floor on the timescale `river_lambdas` derives from discharge, and
+                # it is a stability bound rather than a preference: λ = Q̄/V is the physically
+                # correct dilution rate, but at Drammensfjord-scale cells a large river's peak
+                # discharge reaches λ·Δt > 1, and `ForcingFromFile` reads λ > 1 as an x-flux. On
+                # this grid it binds for Glomma and Drammenselva and leaves the small streams at
+                # their own rate — a spread one shared timescale cannot express at all.
+                minimum_relaxation_timescale = 600.0,
+                # Overrides, keyed by the `vassdragsnr` of each mouth's terminal ELVIS segment.
+                # They add gauges and plume depths; they never add a river, and an override
+                # matching no discovered mouth is an error. The eleven mouths named nowhere below
+                # — Aulivassdraget, Årosvassdraget, Hølenelva, Alna, Istreelva, Askerelva,
+                # Årungelva, Sageneelva, Borreelva, Selvikelva and Ljanselva — run freshwater-only
+                # at 5 m with λ from their catchment normal, which is the whole point of
+                # discovery: a river with no gauge still scales by its own size.
+                outlets = [
+                    # Glomma, Norway's largest catchment, reaching the sea through **two** mouths
+                    # at Fredrikstad: Østerelva east of Kråkerøy and Vesterelva west of it. Both
+                    # beds are resolved on this grid, cells (222, 99) and (198, 99). ELVIS files
+                    # Vesterelva under the small Seutelva catchment, so discovery finds it as a
+                    # 1.7 m³/s stream; these two overrides put Solbergfoss's observed series
+                    # across both instead, and the 2/3–1/3 split is a stated assumption — NVE's
+                    # own Nedre Glomma flood report describes the division and publishes no
+                    # fraction, and none was found elsewhere.
+                    #
+                    # Discharge at Solbergfoss and temperature 40 km downstream at Sarpfossen,
+                    # because no station carries both.
+                    #
+                    # `Inf`: both model cells are inside the river channel rather than an estuary,
+                    # so the whole wet column is river and is relaxed to S = 0. It asks for the
+                    # column that is there — 4.2 m east, 13.4 m west — not for a fixed depth.
+                    NVERiver(
+                        vassdragsnr = "002.A21", name = "Glomma (Osterelva)",
+                        discharge_station = "2.605.0", temperature_station = "2.1087.0",
+                        discharge_fraction = 2 // 3, plume_depth = Inf,
+                    ),
+                    NVERiver(
+                        vassdragsnr = "002.2A", name = "Glomma (Vesterelva)",
+                        discharge_station = "2.605.0", temperature_station = "2.1087.0",
+                        discharge_fraction = 1 // 3, plume_depth = Inf,
+                    ),
+                    # Drammenselva, the second largest input. Mjøndalen bru carries discharge and
+                    # temperature on one id at 4 m a.s.l., ~5 km above the fjord. `Inf` for the
+                    # same reason as Glomma — the cell is river bed.
+                    NVERiver(
+                        vassdragsnr = "012.A2", name = "Drammenselva",
+                        discharge_station = "12.534.0", temperature_station = "12.534.0",
+                        plume_depth = Inf,
+                    ),
+                    # Mossevassdraget at Moss dam, 693 km². No water temperature series.
+                    NVERiver(vassdragsnr = "003.A4", discharge_station = "3.23.0"),
+                    # Nordmarkvassdraget is Akerselva's catchment. Temperature deliberately
+                    # omitted: the 2020 series averages 21.2 °C and peaks at 31.1 °C, which is a
+                    # dry or sun-exposed sensor, not an Oslo river. The row comes back as NaN,
+                    # which `ForcingFromFile` reads as its land sentinel — so the river still
+                    # freshens its cells and simply does not force their temperature.
+                    NVERiver(
+                        vassdragsnr = "006.A10", name = "Akerselva",
+                        discharge_station = "6.38.0",
+                    ),
+                    # Lysakerelva. Temperature omitted for the same reason and worse: mean
+                    # 19.6 °C, max 37.2 °C in 2020.
+                    NVERiver(vassdragsnr = "007.A0", discharge_station = "7.29.0"),
+                    # Sandvikselva, 226 km², and the only small stream here whose temperature
+                    # survives inspection: mean 8.4 °C, range 1.0-20.9 °C in 2020.
+                    NVERiver(
+                        vassdragsnr = "008.A2",
+                        discharge_station = "8.2.0", temperature_station = "8.2.0",
+                    ),
+                    # Lierelva at Oppsal, 223 km² of a 310 km² catchment. No temperature series.
+                    NVERiver(vassdragsnr = "011.A0", discharge_station = "11.6.0"),
+                ],
             ),
         ),
         # The exterior state along the open southern edge, from the *hourly* NorKyst collection: a

@@ -45,6 +45,7 @@ end
 struct MinimalRivers <: AbstractRiverConfig
     data_root::String
     output_file::String
+    plot_file::String
     relaxation_timescale::Float64
     search_radius::Int
     standalone::Bool
@@ -52,8 +53,8 @@ end
 
 # `standalone` last with a default, so a site that only cares about the supertype's older fields
 # names them positionally as before.
-MinimalRivers(data_root, output_file, relaxation_timescale, search_radius) =
-    MinimalRivers(data_root, output_file, relaxation_timescale, search_radius, false)
+MinimalRivers(data_root, output_file, plot_file, relaxation_timescale, search_radius) =
+    MinimalRivers(data_root, output_file, plot_file, relaxation_timescale, search_radius, false)
 
 struct MinimalAtmosphere <: AbstractAtmosphereConfig
     data_root::String
@@ -97,18 +98,39 @@ end
 struct StubRivers <: AbstractRiverConfig
     data_root::String
     output_file::String
+    plot_file::String
     relaxation_timescale::Float64
     search_radius::Int
     locations::Vector{FjordSim.Forcing.RiverLocation}
     series::Dict{String,Matrix{Float32}}
     standalone::Bool
+    plume_depth::Float64
 end
 
-StubRivers(data_root, output_file, relaxation_timescale, search_radius, locations, series) =
-    StubRivers(data_root, output_file, relaxation_timescale, search_radius, locations, series, false)
+# `plot_file` is derived from `output_file` rather than named, since no caller cares what it is —
+# only that `plot_path` resolves, which `add_rivers`' plotting step needs.
+StubRivers(
+    data_root,
+    output_file,
+    relaxation_timescale,
+    search_radius,
+    locations,
+    series,
+    standalone = false;
+    plume_depth = 0.0,
+) = StubRivers(
+    data_root, output_file, first(splitext(output_file)) * ".png", relaxation_timescale,
+    search_radius, locations, series, standalone, plume_depth,
+)
 
 FjordSim.Forcing.river_locations(config::StubRivers) = config.locations
 FjordSim.Forcing.river_series(config::StubRivers, times) = config.series
+
+# One depth for every river, so the round-trip can drive the plume path without a per-river table.
+# `0.0` is the default, which is the generic fallback's value, so the surface-only assertions the
+# round-trip already makes are unaffected.
+FjordSim.Forcing.river_plume_depth(config::StubRivers, ::FjordSim.Forcing.RiverLocation) =
+    config.plume_depth
 
 # New behavior for a new grid config, added without touching Grids.jl. `domain_grid` is overloaded
 # and `simulation_grid` deliberately is not, so the extensibility testset can assert both halves of

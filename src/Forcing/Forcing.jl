@@ -9,7 +9,7 @@ using Oceananigans.Grids: active_cell, peripheral_node, x_domain, y_domain
 using Oceananigans.Fields: interpolate
 using Oceananigans.Utils: launch!
 using KernelAbstractions: @kernel, @index, @Const
-using Dates: DateTime, Day, Hour, Millisecond, Second
+using Dates: Date, DateTime, Day, Hour, Millisecond, Second
 import Dates
 using Adapt
 using ArchGDAL
@@ -38,7 +38,7 @@ using ..Configs:
     LATERAL_EDGES,
     validate_open_edge,
     lateral_edges
-using ..Plotting: plot_forcing, plot_boundaries
+using ..Plotting: plot_forcing, plot_rivers, plot_boundaries
 using ..Atmospheres: rotate_to_east_north
 
 export forcing_from_file,
@@ -59,8 +59,12 @@ export forcing_from_file,
     river_series,
     river_search_radius,
     river_minimum_levels,
+    river_plume_depth,
+    river_lambdas,
     RiverLocation,
     OF800RiversConfig,
+    NVERiversConfig,
+    NVERiver,
     download_boundaries,
     prepare_boundaries,
     boundary_series,
@@ -1497,5 +1501,6 @@ include("boundaries.jl")
 include("norkyst.jl")
 include("norkyst_boundaries.jl")
 include("of800_rivers.jl")
+include("nve_rivers.jl")
 
 end # module

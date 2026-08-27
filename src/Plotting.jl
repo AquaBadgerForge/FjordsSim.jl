@@ -1,6 +1,6 @@
 module Plotting
 
-export plot_bathymetry, plot_forcing, plot_boundaries, plot_atmosphere
+export plot_bathymetry, plot_forcing, plot_rivers, plot_boundaries, plot_atmosphere
 
 using CairoMakie
 using NCDatasets
@@ -12,9 +12,11 @@ using Oceananigans.Grids: x_domain, y_domain
 using ..Configs:
     AbstractBathymetryConfig,
     AbstractForcingConfig,
+    AbstractRiverConfig,
     AbstractBoundaryDataConfig,
     AbstractAtmosphereConfig,
     forcing_path,
+    river_forcing_path,
     boundary_data_path,
     atmosphere_path,
     open_edges,
@@ -54,6 +56,28 @@ const BOUNDARY_PLOT_PANELS = (
     (name = "ubar", label = "ubar (m s⁻¹)", colormap = :balance),
     (name = "vbar", label = "vbar (m s⁻¹)", colormap = :balance),
 )
+
+# The three surface maps a rivers plot draws behind its inlet markers. `T_lambda` comes first
+# because it is the one field that shows *only* the rivers: `prepare_forcing` writes zero lambdas
+# everywhere, so every nonzero cell in it was put there by `add_rivers`.
+const RIVER_PLOT_PANELS = (
+    (name = "T_lambda", label = "Relaxation rate (s⁻¹)", colormap = :viridis),
+    (name = "T", label = "Temperature (ᵒC)", colormap = :thermal),
+    (name = "S", label = "Salinity (g kg⁻¹)", colormap = :haline),
+)
+
+# The lambda field a rivers plot draws, and the one whose land mask it has to borrow.
+const LAMBDA_PANEL_NAME = "T_lambda"
+
+# Extra figure height for the two rows below the maps — the value time series and the plume
+# sections — since neither is sized per grid cell.
+const RIVER_PLOT_DETAIL_HEIGHT = 320
+
+# Every river gets a distinguishable colour in the two line panels. `tab20` rather than the seven
+# `wong_colors` this used to be: a setup that discovers its outlets from NVE has as many rivers as
+# the domain has, which is 21 on Oslofjorden, so a seven-colour cycle repeated three times. The
+# cycle still repeats beyond twenty, which is why each line is also labelled.
+const RIVER_PLOT_COLORS = Makie.to_colormap(:tab20)
 
 # Every variable of a prepared atmosphere file, with the colormap suiting each.
 const ATMOSPHERE_PLOT_PANELS = (
@@ -177,6 +201,25 @@ function surface_slice(ds, name)
 end
 
 """
+    river_surface_slice(ds, name)
+
+`surface_slice`, but with land blanked out for a `_lambda` field.
+
+`prepare_forcing` writes zero lambdas at *every* cell, wet or dry, so a lambda field plotted on its
+own is a featureless rectangle with no coastline in it — the one panel that shows only what
+`add_rivers` wrote would be the one panel you cannot read. Its paired value field is `NaN` on land,
+so borrowing that mask puts the coastline back.
+"""
+function river_surface_slice(ds, name)
+    data = surface_slice(ds, name)
+    endswith(name, "_lambda") || return data
+
+    base = first(split(name, "_lambda"))
+    haskey(ds, base) || return data
+    return ifelse.(isnan.(surface_slice(ds, base)), NaN32, data)
+end
+
+"""
     plot_forcing(grid, config::AbstractForcingConfig)
 
 Write a diagnostic plot of the prepared forcing file at `forcing_path(config)` to
@@ -225,6 +268,137 @@ function plot_forcing(grid, config::AbstractForcingConfig)
         end
 
         Label(figure[0, :], "Prepared $(dataset_label(config)) forcing, surface level at $date", fontsize = 20)
+        save(plot_file, figure)
+    end
+
+    return plot_file
+end
+
+"""
+    plot_rivers(grid, config::AbstractRiverConfig, cells)
+
+Write a diagnostic plot of the river forcing at `river_forcing_path(config)` to `plot_path(config)`.
+Returns the plot path.
+
+Three rows, because a rivers plot has to answer three different questions and a river occupies one
+grid cell out of a hundred thousand — a heatmap alone would show nine invisible dots:
+
+- **the maps**, one per `RIVER_PLOT_PANELS` entry present in the file, at the surface level of the
+  first time step, with every placed outlet scattered on top and labelled. The markers, not the
+  heatmap, are the content; the field behind them is there for the coastline.
+- **the values**, one line per river over the whole time axis, which is what says whether the
+  series actually arrived and whether it is physically plausible. A river whose value is `NaN`
+  throughout — a source that has no temperature for it — is named in the legend and draws nothing,
+  which is the honest rendering of "not forced".
+- **the plumes**, `λ` against depth at each river cell, which is the only view that shows how far
+  down `river_plume_depth` reached. A surface-only river is a single point at the top; one given the
+  whole column is a line down to the sea floor.
+
+`cells` comes from `add_rivers`' own result rather than being recovered from the file, because a
+cell's identity — which river it is, how far it moved, which levels it owns — is what the pipeline
+knows and the file does not.
+"""
+function plot_rivers(grid, config::AbstractRiverConfig, cells)
+    forcing_file = river_forcing_path(config)
+    plot_file = prepare_plot_file(config)
+
+    NCDataset(forcing_file) do ds
+        panels = [panel for panel in RIVER_PLOT_PANELS if haskey(ds, panel.name)]
+        width, height = default_figure_size(
+            grid, FORCING_PLOT_PIXELS_PER_CELL, FORCING_PLOT_MARGIN; columns = length(panels),
+        )
+        figure = Figure(size = (width, height + RIVER_PLOT_DETAIL_HEIGHT))
+        dates = ds["time"][:]
+        depths = Array(ds["Nz"][:])
+        surface = ds.dim["Nz"]
+        river_color(n) = RIVER_PLOT_COLORS[mod1(n, length(RIVER_PLOT_COLORS))]
+
+        for (column, panel) in enumerate(panels)
+            data = river_surface_slice(ds, panel.name)
+            Nx, Ny = size(data)
+            longitude, latitude = plot_axes(grid, Nx, Ny)
+
+            axis = Axis(
+                figure[1, column];
+                xlabel = "Longitude",
+                ylabel = column == 1 ? "Latitude" : "",
+                title = panel.name,
+            )
+            finite = filter(isfinite, data)
+            colorrange = isempty(finite) || allequal(finite) ? (0, 1) : extrema(finite)
+            plot = heatmap!(
+                axis, longitude, latitude, data;
+                colormap = panel.colormap, colorrange, nan_color = :ivory,
+            )
+            # One marker per outlet, on the cell it actually landed on rather than where the
+            # dataset put it — the two differ by `cell.distance`, and it is the snapped cell that
+            # carries the forcing. Colours match the two line panels below.
+            scatter!(
+                axis,
+                [longitude[min(cell.i, Nx)] for cell in cells],
+                [latitude[min(cell.j, Ny)] for cell in cells];
+                color = [river_color(n) for n in eachindex(cells)],
+                markersize = 11,
+                strokecolor = :black,
+                strokewidth = 1,
+            )
+            Colorbar(figure[2, column], plot; label = panel.label, vertical = false)
+        end
+
+        columns = max(length(panels), 1)
+        value_name = first(panel.name for panel in panels if !endswith(panel.name, "_lambda"))
+
+        # The values each river is relaxed towards, over the whole axis, read at the surface level —
+        # which every plume includes whatever its depth.
+        value_axis = Axis(
+            figure[3, 1:max(columns - 1, 1)];
+            xlabel = "Date",
+            ylabel = "$value_name at the outlet",
+            title = "River $value_name over the prepared axis",
+        )
+        for (n, cell) in enumerate(cells)
+            series = Float32.(coalesce.(ds[value_name][cell.i, cell.j, surface, :], NaN32))
+            label = "$(cell.location.id) $(cell.location.name)"
+            if any(isfinite, series)
+                lines!(value_axis, dates, series; color = river_color(n), label)
+            else
+                # Nothing to draw, but the river still belongs in the legend: an all-`NaN` series is
+                # a river this source has no values for, and that is worth seeing rather than hiding.
+                lines!(
+                    value_axis, empty(dates), Float32[];
+                    color = river_color(n), label = "$label (no $value_name)",
+                )
+            end
+        end
+        # Two banks, because a discovered river list is long enough that one column of labels runs
+        # off the bottom of the panel it sits in.
+        axislegend(value_axis; position = :lt, labelsize = 8, nbanks = 2, framevisible = false)
+
+        # How deep each plume reaches and how hard it is nudged — the one view no map can give.
+        # `λ` is logarithmic because it spans four orders of magnitude across these rivers, which is
+        # the whole point of deriving it from discharge rather than sharing one timescale.
+        plume_axis = Axis(
+            figure[3, columns];
+            xlabel = "Relaxation rate (s⁻¹)",
+            ylabel = "Depth (m)",
+            title = "Plume extent and strength",
+            xscale = log10,
+        )
+        for (n, cell) in enumerate(cells)
+            lambdas = Float32.(coalesce.(ds[LAMBDA_PANEL_NAME][cell.i, cell.j, :, 1], NaN32))
+            levels = [level for level in cell.levels if isfinite(lambdas[level]) && lambdas[level] > 0]
+            isempty(levels) && continue
+            scatterlines!(
+                plume_axis, lambdas[levels], depths[levels]; color = river_color(n), markersize = 6,
+            )
+        end
+
+        Label(
+            figure[0, :],
+            "River forcing from $(dataset_label(config)): $(length(cells)) outlet(s), " *
+            "surface level at $(first(dates))",
+            fontsize = 20,
+        )
         save(plot_file, figure)
     end
 

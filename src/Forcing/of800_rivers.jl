@@ -52,6 +52,7 @@ ROMS river forcing NetCDF.
 Base.@kwdef mutable struct OF800RiversConfig <: AbstractRiverConfig
     data_root::String
     output_file::String = "forcing_rivers.nc"
+    plot_file::String = "forcing_rivers.png"
     locations_file::String = "OF800_rivers.csv"
     series_file::String = "of800_rivers_v9_1990_2022_RA1.nc"
     locations_url::String = OF800_LOCATIONS_URL
@@ -83,12 +84,15 @@ river_locations_path(config::OF800RiversConfig) = joinpath(config.data_root, con
 river_series_path(config::OF800RiversConfig) = joinpath(config.data_root, config.series_file)
 
 """
-    download_rivers(config::OF800RiversConfig)
+    download_rivers(target_grid, config::OF800RiversConfig)
 
 Fetch the two source files if they are not present. A file that is already there is left alone,
 so the step is cheap to re-run — the series file is ~176 MB.
+
+`target_grid` goes unused: this dataset's outlets are a column of the locations CSV, so it is told
+where its rivers are rather than having to find them in the domain.
 """
-function download_rivers(config::OF800RiversConfig)
+function download_rivers(target_grid, config::OF800RiversConfig)
     ensure_river_file(river_locations_path(config), config.locations_url)
     ensure_river_file(river_series_path(config), config.series_url)
     return config.data_root

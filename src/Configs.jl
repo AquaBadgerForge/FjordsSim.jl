@@ -182,8 +182,8 @@ Rivers are optional: a forcing config whose `rivers` field is `nothing` skips th
 entirely.
 
 # Fields a subtype provides
-- `data_root`, `output_file`: resolved by `river_forcing_path`, the rivers-augmented copy of
-  the forcing file.
+- `data_root`, `output_file`, `plot_file`: resolved by `river_forcing_path`, the rivers-augmented
+  copy of the forcing file, and by `plot_path`.
 - `relaxation_timescale`: seconds; its reciprocal is the lambda written at each river cell.
 - `search_radius`: read by the default `river_search_radius`.
 - `standalone`: whether `add_rivers` writes a forcing file carrying *only* rivers, instead of
@@ -196,12 +196,30 @@ entirely.
 - `river_locations(config)`: the river outlets, as `RiverLocation`s. Required.
 - `river_series(config, times)`: FjordSim forcing variable name => a `(river, time)` matrix of
   values, one row per `river_locations` entry. Required.
-- `download_rivers(config)`: fetch the source data. Only if it downloads.
+- `download_rivers(target_grid, config)`: fetch the source data. Only if it downloads. Takes the
+  bare domain grid, like `download_forcing` and `download_boundaries`, because a dataset that has
+  to *find* its rivers rather than being told where they are needs the domain bounds; one whose
+  outlets are stated in the config ignores it.
 - `river_search_radius(config)`: how far to look for a coastal cell, in cells. Optional,
   defaults to `config.search_radius`.
+- `river_minimum_levels(config)`: how many wet levels a column must have to receive an outlet.
+  Optional, defaults to `0` — which accepts any water cell, and, unlike `river_search_radius`,
+  reads no field, so a config written before the hook existed keeps working.
+- `river_plume_depth(config, location)`: how deep, in metres, one river's relaxation reaches.
+  Optional, defaults to `0.0` — the surface level alone. `Inf` asks for the whole wet column.
+- `river_lambdas(config, cells, target_grid)`: the relaxation coefficient at each river cell, in
+  s⁻¹. Optional, defaults to `1 / config.relaxation_timescale` everywhere. Takes the grid because
+  a coefficient derived from discharge needs the plume volume.
 
-`FjordSim.Forcing.OF800RiversConfig` is the built-in implementation, for the OF800 Oslofjord
-river dataset; `src/Forcing/of800_rivers.jl` is the template to copy for a new dataset.
+The last two are the extension points for a source whose rivers are not interchangeable: a plume
+depth per river, and a coefficient scaled by river size. Both fallbacks reproduce what the
+pipeline did before they existed, so a source that ignores them is unaffected.
+
+Two built-in implementations. `FjordSim.Forcing.OF800RiversConfig` reads the OF800 Oslofjord
+river dataset from two published files; `FjordSim.Forcing.NVERiversConfig` queries NVE's HydAPI
+for observed discharge and water temperature at named gauging stations, and needs an API key.
+Either of `src/Forcing/of800_rivers.jl` and `src/Forcing/nve_rivers.jl` is a template to copy for
+a new dataset — the second also demonstrates the two optional hooks.
 """
 abstract type AbstractRiverConfig end
 
@@ -566,6 +584,7 @@ forcing_path(config::AbstractForcingConfig) = joinpath(config.data_root, config.
 atmosphere_path(config::AbstractAtmosphereConfig) = joinpath(config.data_root, config.output_file)
 plot_path(config::AbstractBathymetryConfig) = joinpath(config.data_root, config.plot_file)
 plot_path(config::AbstractForcingConfig) = joinpath(config.data_root, config.plot_file)
+plot_path(config::AbstractRiverConfig) = joinpath(config.data_root, config.plot_file)
 plot_path(config::AbstractBoundaryDataConfig) = joinpath(config.data_root, config.plot_file)
 plot_path(config::AbstractAtmosphereConfig) = joinpath(config.data_root, config.plot_file)
 
