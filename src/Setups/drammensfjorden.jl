@@ -102,8 +102,18 @@ function drammensfjorden()
             model              = CoupledHydrostaticSimulation(
                 buoyancy           = SeawaterBuoyancy(FT, equation_of_state = TEOS10EquationOfState(FT)),
                 closure            = (
+                    # See `oslofjorden()` for what `minimum_tke` buys: CATKE takes
+                    # `w★ = sqrt(max(minimum_tke, e))`, so this floor, not the prognostic TKE, sets
+                    # κ = 0.098·e_min/N over most of the column.
                     CATKEVerticalDiffusivity(minimum_tke = 7e-6),
-                    HorizontalScalarBiharmonicDiffusivity(ν = 1e5, κ = 1e4),
+                    # 1e3 m⁴ s⁻¹, not the 1e5 `oslofjorden()` carried and this file copied: a
+                    # biharmonic coefficient is only meaningful against Δx⁴, and this grid's 94 m
+                    # cell is a factor 18 smaller in Δx⁴ than Oslofjord's 193 m one. At 1e5 the 2Δx
+                    # e-folding here was 48 s and the explicit stability limit Δx⁴/32ν₄ was 24 s,
+                    # against the ~10 s steps this setup takes — a limit `AdaptiveTimeStep` never
+                    # measures, since it sees only the advective CFL. 1e3 gives the same ~80 min
+                    # grid-scale damping Oslofjord's 2e4 does, at a 2409 s diffusive limit.
+                    HorizontalScalarBiharmonicDiffusivity(ν = 1e3, κ = 1e2),
                 ),
                 tracer_advection   = (T = WENO(), S = WENO()),
                 momentum_advection = WENOVectorInvariant(FT),

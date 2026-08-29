@@ -242,8 +242,11 @@ FjordConfig(
         model              = CoupledHydrostaticSimulation(
             buoyancy            = SeawaterBuoyancy(FT, equation_of_state = TEOS10EquationOfState(FT)),
             closure             = (
+                # Both values as `oslofjorden()` states them, and for the reasons documented there:
+                # the TKE floor is what sets κ = 0.098·e_min/N over most of the column, and ν₄ = 2e4
+                # gives this 193 m grid a 72 min 2Δx e-folding where 1e5 gave 14.5 min.
                 CATKEVerticalDiffusivity(minimum_tke = 7e-6),
-                HorizontalScalarBiharmonicDiffusivity(ν = 1e5, κ = 1e4),
+                HorizontalScalarBiharmonicDiffusivity(ν = 2e4, κ = 2e3),
             ),
             tracer_advection    = (T = WENO(), S = WENO()),
             momentum_advection  = WENOVectorInvariant(FT),

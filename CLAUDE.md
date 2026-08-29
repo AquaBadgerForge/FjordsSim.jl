@@ -2099,6 +2099,30 @@ six comments:
 
 - **`BoundarySponge`** on `closure` — the open boundary radiated noise nothing absorbed. See
   "`closure` and `BoundarySponge`" under Simulations.
+- **`HorizontalScalarBiharmonicDiffusivity(ν = 2e4, κ = 2e3)`**, down from `1e5`/`1e4` — a
+  biharmonic coefficient only means something against `Δx⁴`, and the commit that raised ν from 15
+  justified 1e5 as a "~1.7 hours" e-folding of the 2Δx mode when the discrete rate `ν₄·16/Δx⁴` makes
+  it 14.5 min on this 193 m cell, 7x stronger than intended. 2e4 restores the intended 72 min, still
+  ~1300x the value it replaced, and leaves an 8 km baroclinic eddy alone (56 h at 8Δx). Norkyst-800,
+  the ROMS system feeding this run, applies **no** explicit interior viscosity and a 10 m² s⁻¹
+  harmonic tracer diffusivity, against 0.2 m² s⁻¹ at 2Δx for `κ = 2e3` here. It also restores a
+  stability margin nothing measures: explicit biharmonic diffusion needs `Δt ≤ Δx⁴/32ν₄`, 434 s at
+  1e5 and 2170 s at 2e4, while `AdaptiveTimeStep` only ever sees the advective CFL. The same
+  correction is larger on `drammensfjorden()`, whose 94 m cell had a 24 s diffusive limit at 1e5
+  against ~10 s steps; its ν is 1e3, the Δx⁴-scaled equivalent, not a copy of Oslofjord's.
+- **`minimum_tke = 7e-6` kept, not lowered** — CATKE takes `w★ = sqrt(max(minimum_tke, e))`, and
+  measured on the 2020 run the prognostic `e` is below that floor in 85 % of wet cells (95-100 %
+  below 9 m), so the floor and not the TKE equation sets the vertical diffusivity, at the documented
+  background `κ = 0.098·e_min/N`, `ν = 0.242·e_min/N`. The domain-median `κᵤ/κᶜ` of 2.38 against
+  `Cʰⁱᵤ/Cʰⁱᶜ = 2.47` is the confirmation. The value is ROMS' `GLS_KMIN` default (7.6e-6) and does not
+  transfer cleanly — ROMS floors its length scale too (`GLS_PMIN`) where CATKE's is diagnostic — but
+  it lands in the right place for this fjord: median `κᶜ` at 94-118 m is 8-9e-5 m² s⁻¹ against
+  basin-mean density-budget values of 1.0-1.8e-4 (Bunnefjorden), 4.9-7.6e-4 (Vestfjorden) and 2.5e-3
+  just inside the Drøbak sill (Gade 1970; Staalstrøm et al. 2012, *Ocean Sci.* 8, 525). The basin
+  water is at the low end already, so lowering the floor would slow deep-water renewal, which is what
+  this domain is judged on. `Cᵇ` stays at Oceananigans' 0.28 rather than NumericalEarth's regional
+  0.01 for the same reason: it scales the near-bottom mixing length, and the high basin-mean
+  diffusivity here is attributed to exactly that boundary mixing.
 - **`tracer_advection = WENO()`**, a scalar rather than `(T = WENO(), S = WENO())` — Oceananigans
   gives any tracer a `NamedTuple` omits the `Centered()` default, and CATKE contributes an `e` the
   setup never names, so `e` was being advected by an unbounded centered scheme. A scalar covers

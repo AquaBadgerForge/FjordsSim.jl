@@ -301,9 +301,47 @@ function oslofjorden()
                 # 310 s on this 193 m cell, comfortably clear of `max_time_step` below. Raising it
                 # much past 50 would cap the time step instead of the CFL doing it.
                 closure            = BoundarySponge(
+                    # `minimum_tke` is not a safety net on this grid — it *is* the vertical
+                    # closure over most of the column. CATKE takes `w★ = sqrt(max(minimum_tke, e))`,
+                    # and measured on the 2020 run at day 20.5 the prognostic `e` sits below this
+                    # floor in 85 % of wet cells: 89 % below 6 m, 95-100 % below 9 m. So κ there is
+                    # the documented background κ = Cʰⁱᶜ·e_min/N = 0.098·e_min/N with
+                    # ν = 0.242·e_min/N, which the domain-median κᵤ/κᶜ of 2.38 against
+                    # Cʰⁱᵤ/Cʰⁱᶜ = 2.47 confirms.
+                    #
+                    # 7e-6 is ROMS' `GLS_KMIN` default (7.6e-6), and it does *not* carry over
+                    # unchanged: ROMS floors its length scale too (`GLS_PMIN`) where CATKE's is
+                    # diagnostic and unfloored, so the same TKE floor buys a much larger κ. It is
+                    # kept because it lands in the right place for *this* fjord, not because it came
+                    # from ROMS. Median κᶜ at 94-118 m is 8-9e-5 m² s⁻¹ against basin-mean values
+                    # measured here by density budget — 1.0-1.8e-4 in Bunnefjorden, 4.9-7.6e-4 in
+                    # Vestfjorden, 2.5e-3 just inside the Drøbak sill (Gade 1970; Staalstrøm et al.
+                    # 2012, Ocean Sci. 8, 525) — so the basin water is at the low end already and
+                    # lowering the floor would slow the deep-water renewal this domain is judged on.
+                    # The fjord relation is κ ∝ N^-1.5 (Stigebrandt & Aure 1989) where the floor
+                    # gives κ ∝ N^-1, so one number cannot fit both the pycnocline and the basin;
+                    # the basin is the one to fit.
+                    #
+                    # `Cᵇ` stays at Oceananigans' 0.28 rather than NumericalEarth's regional 0.01
+                    # (`default_ocean_closure`), deliberately: it scales the near-bottom mixing
+                    # length, and Stigebrandt attributed the high basin-mean diffusivity here to
+                    # exactly that boundary mixing.
                     base = (
                         CATKEVerticalDiffusivity(minimum_tke = 7e-6),
-                        HorizontalScalarBiharmonicDiffusivity(ν = 1e5, κ = 1e4),
+                        # 2e4 m⁴ s⁻¹, down from 1e5. Biharmonic damping of the 2Δx mode goes as
+                        # ν₄·16/Δx⁴, an e-folding of 14.5 min at 1e5 on this 193 m cell — the commit
+                        # that raised it from 15 aimed at "~1.7 hours" and was out by 7x. 2e4 gives
+                        # the 72 min it meant, keeps the scale selectivity that leaves an 8 km
+                        # baroclinic eddy alone (56 h at 8Δx), and is still ~1300x what it replaced.
+                        # For scale, Norkyst-800 — the ROMS system feeding this run — applies no
+                        # explicit interior viscosity at all and a 10 m² s⁻¹ harmonic tracer
+                        # diffusivity, where κ = 2e3 here is 0.2 m² s⁻¹ at 2Δx.
+                        #
+                        # It also matters for a stability limit nothing else watches: the explicit
+                        # biharmonic needs Δt ≤ Δx⁴/32ν₄, which is 434 s at 1e5 and 2170 s here, and
+                        # `AdaptiveTimeStep` measures only the advective CFL
+                        # (`cell_advection_timescale_coupled_model`).
+                        HorizontalScalarBiharmonicDiffusivity(ν = 2e4, κ = 2e3),
                     ),
                     width_cells = 16,
                     viscosity   = 30.0,
