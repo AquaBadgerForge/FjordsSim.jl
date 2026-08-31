@@ -11,7 +11,7 @@
 julia --project test/runtests.jl
 
 # Run the out-of-tree Oslofjord example config (requires GPU + data files)
-julia --project -m FjordSim run_simulation --config examples/oslofjorden.jl
+julia --project -m FjordSim run_simulation --config examples/oslofjorden_npzd.jl
 
 # Prepare bathymetry for a configured fjord (downloads the Geonorge GDB on first use)
 julia --project -m FjordSim prepare_bathymetry --config drammensfjorden

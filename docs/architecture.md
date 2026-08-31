@@ -1149,13 +1149,13 @@ modules, in `include` order from `src/FjordSim.jl`:
    would need telling that instant a second time, and two statements of it could disagree. The
    **five-argument form is a forwarding fallback** that drops it, so `AirSeaFluxes`,
    `QuadraticBottomDrag` and any out-of-tree config that carries its own exterior state implement the
-   shorter signature and never see it. That is what keeps `examples/oslofjorden.jl` — which
+   shorter signature and never see it. That is what keeps `examples/oslofjorden_npzd.jl` — which
    implements the five-argument hook — working untouched.
 
    The **fourth** argument is the setup's `boundary_config`, and was the *forcing* config while the
    boundary dataset and the open edge both hung off that one. `OpenLateralBoundaryFromData` is the only
    built-in piece that reads it, for `open_edges`. The arity did not change, so a piece that ignores the
-   argument is unaffected — both other built-ins, and `examples/oslofjorden.jl`'s
+   argument is unaffected — both other built-ins, and `examples/oslofjorden_npzd.jl`'s
    `RadiatingLateralBoundary`, which carries its own edge. A piece that *reads* it now receives an
    `AbstractBoundaryDataConfig` or `nothing`, which is a change no `MethodError` would have caught, so
    it is stated here and in the hook tables.

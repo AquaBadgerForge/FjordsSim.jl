@@ -125,7 +125,7 @@ A fjord does not have to live in FjordSim. Put the `FjordConfig` in a standalone
 expression is the config, and pass its path to `--config`:
 
 ```bash
-julia --project -m FjordSim run_simulation --config examples/oslofjorden.jl
+julia --project -m FjordSim run_simulation --config examples/oslofjorden_npzd.jl
 ```
 
 ## Some `run_simulation` details

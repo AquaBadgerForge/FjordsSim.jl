@@ -4797,8 +4797,8 @@ end
     @testset "build simulation without forcing" begin
         # A run with no interior forcing at all, but a data-driven open boundary — the combination
         # that was impossible while the boundary dataset and the open edge both hung off the forcing
-        # config, since a `nothing` forcing config took them down with it. `examples/oslofjorden.jl`
-        # is the real-world shape of this.
+        # config, since a `nothing` forcing config took them down with it.
+        # `examples/oslofjorden_npzd.jl` is the real-world shape of this.
         mktempdir() do tmp
             Nx, Ny, Nz = 16, 16, 8
             bathymetry_config = test_bathymetry_config(data_root = tmp)

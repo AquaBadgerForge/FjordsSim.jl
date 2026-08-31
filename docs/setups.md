@@ -165,9 +165,9 @@ output went. A step the setup opts out of returns `nothing` rather than raising,
 `::Nothing` methods of the lower arities; "you asked for a step this setup does not configure" is
 reported by `CLI.main`, because that is user input rather than a pipeline condition.
 
-`examples/oslofjorden.jl` is the worked example of an out-of-tree config: a variant of
+`examples/oslofjorden_npzd.jl` is the worked example of an out-of-tree config: a variant of
 `src/Setups/oslofjorden.jl` running an implicit free surface and a radiating open lateral boundary,
 which it gets by subtyping `AbstractFreeSurfaceConfig`, `AbstractBoundaryConditionConfig` and
 `AbstractGridConfig` in the file itself. It is not a runner — it is passed as
-`--config examples/oslofjorden.jl`, and it shares `oslofjorden()`'s `data_root` so the atmosphere
+`--config examples/oslofjorden_npzd.jl`, and it shares `oslofjorden()`'s `data_root` so the atmosphere
 prepare steps do not have to run twice.
