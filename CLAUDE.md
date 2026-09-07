@@ -66,7 +66,7 @@ julia --project -m FjordSim prepare_atmosphere  --config oslofjorden   # rewrite
 
 `add_rivers` is not optional here: it `cp`s the forcing file and patches the copy, so the river file
 — which is what `simulation_forcing_path` gives the simulation, `forcing_rivers_nve.nc` on
-`oslofjorden` and `forcing_rivers.nc` on `drammensfjorden` — still carries
+both `oslofjorden` and `drammensfjorden` — still carries
 the *old* axis until it is re-run. A `standalone` river config takes the window even more directly,
 building its whole time axis from it. No download step is affected; all three prepares are pure
 regrids.

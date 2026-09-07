@@ -713,7 +713,7 @@ modules, in `include` order from `src/FjordSim.jl`:
    The cap is **not** a matter of taste. `ForcingFromFile` reads `λ > 1` as an x-flux and `λ < -1` as
    a y-flux, and the relaxation term is explicit, so `λ Δt < 1` is required. Neither bound is
    comfortable at the top of the range: Drammenselva's peak 1012 m³/s into a single surface cell of
-   Drammensfjord's 94 m grid gives `λ = 0.114 s⁻¹`, i.e. `λ Δt = 1.14` at the 10 s steps that run
+   Drammensfjord's 99 m grid gives `λ = 0.102 s⁻¹`, i.e. `λ Δt = 1.02` at the 10 s steps that run
    takes — an unstable relaxation, from the physically correct coefficient. Hence
    `NVERiversConfig.minimum_relaxation_timescale`.
 

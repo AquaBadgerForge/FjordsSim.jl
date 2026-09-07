@@ -153,7 +153,7 @@ per-river discharge overloads this; `FjordSim.Forcing.NVERiversConfig` does.
 
 Two bounds matter and neither is a matter of taste. `ForcingFromFile` reads `λ > 1` as an
 **x-flux** and `λ < -1` as a y-flux, so a relaxation coefficient must stay inside `(-1, 1)`. And
-the term is explicit, so `λ Δt < 1` is required for stability — at a 94 m cell a large river's
+the term is explicit, so `λ Δt < 1` is required for stability — at a 99 m cell a large river's
 peak discharge into a single surface level reaches `λ Δt > 1` outright, which is why a source
 deriving `λ` from discharge needs to cap it.
 """

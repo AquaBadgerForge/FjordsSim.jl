@@ -15,13 +15,17 @@ Data paths are built from a per-setup `data_root` under `~/FjordSim_data/<fjord>
 the setup function with `homedir()`; the config fields naming files (`output_file`, `plot_file`,
 `geodatabase_file`, `output_directory`) are names relative to `data_root`, and setting one to an
 absolute path relocates just that file — which is how a single FileGDB copy is shared across fjords.
-A nested config carries its own `data_root` too, so it can be relocated independently, but
-`drammensfjorden()` gives its `OF800RiversConfig`, and `oslofjorden()` its `NVERiversConfig`, the
-same `data_root` as the rest of the setup — the river data downloads there rather than being shared from elsewhere, so
-each setup carries its own copy of the ~176 MB series file. The same goes for their
+A nested config carries its own `data_root` too, so it can be relocated independently, and both
+setups give their `NVERiversConfig` the same `data_root` as the rest of the setup — NVE's cached
+network and catchment responses record the domain they were fetched for under a fixed file name, so
+a shared directory would be overwritten rather than reused. The same goes for their
 `NorKystBoundariesConfig`, and there it is not merely tidiness: the downloaded band is derived from
-*that* setup's own open edge, and Drammensfjord's southern edge is 20 km north of Oslofjord's, so the
-two bands are different data. A setup wanting no rivers or no boundary data leaves the
+*that* setup's own open edge, and Drammensfjord's southern edge is 60 km north of Oslofjord's, so the
+two bands are different data. What `drammensfjorden()` *does* share, by absolute path into
+`~/FjordSim_data/oslofjorden/`, is the FileGDB, the daily NorKyst months and the NORA3 months, all
+of which Oslofjord's larger domain already covers. That containment is the precondition: a month
+missing from the shared directory is re-downloaded subset to the *smaller* box, which would then
+shrink Oslofjord's own prepare step. A setup wanting no rivers or no boundary data leaves the
 field unnamed so it defaults to `nothing`, making that step a no-op; because `rivers` is a type
 parameter of `NorKystConfig` and `boundary_config` one of `FjordConfig`, that is a construction-time
 choice in both cases and cannot be undone on an existing
@@ -99,8 +103,11 @@ six comments:
   harmonic tracer diffusivity, against 0.2 m² s⁻¹ at 2Δx for `κ = 2e3` here. It also restores a
   stability margin nothing measures: explicit biharmonic diffusion needs `Δt ≤ Δx⁴/32ν₄`, 434 s at
   1e5 and 2170 s at 2e4, while `AdaptiveTimeStep` only ever sees the advective CFL. The same
-  correction is larger on `drammensfjorden()`, whose 94 m cell had a 24 s diffusive limit at 1e5
-  against ~10 s steps; its ν is 1e3, the Δx⁴-scaled equivalent, not a copy of Oslofjord's.
+  correction is larger on `drammensfjorden()`, whose 99 m cell had a 24 s diffusive limit at 1e5
+  against ~10 s steps; its ν is 1e3, the Δx⁴-scaled equivalent, not a copy of Oslofjord's — 101 min
+  at 2Δx and a 3026 s stability limit. `BoundarySponge` is scaled the same way and for the same
+  reason: 13 m² s⁻¹ rather than 30, because explicit `Δt ≤ Δx²/4ν` is 82 s at 30 on a 99 m cell,
+  below `max_time_step`, so the sponge and not the CFL would have been setting the time step.
 - **`minimum_tke = 7e-6` kept, not lowered** — CATKE takes `w★ = sqrt(max(minimum_tke, e))`, and
   measured on the 2020 run the prognostic `e` is below that floor in 85 % of wet cells (95-100 %
   below 9 m), so the floor and not the TKE equation sets the vertical diffusivity, at the documented

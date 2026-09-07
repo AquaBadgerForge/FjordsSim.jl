@@ -18,9 +18,9 @@ using NumericalEarth: FreezingLimitedOceanTemperature
 using ..Configs: FjordConfig
 using ..Utils: progress
 using ..Grids: EvenGrid
-using ..Bathymetry: DybdedataConfig
+using ..Bathymetry: DybdedataConfig, GEONORGE_DYBDEDATA_GDB
 using ..Atmospheres: NORA3Config
-using ..Forcing: NorKystConfig, OF800RiversConfig, NVERiversConfig, NVERiver, NorKystBoundariesConfig
+using ..Forcing: NorKystConfig, NVERiversConfig, NVERiver, NorKystBoundariesConfig
 using ..BoundaryConditions:
     AirSeaFluxes, QuadraticBottomDrag, OpenLateralBoundaryFromData, MergedBoundaryConditions
 using ..Simulations:
